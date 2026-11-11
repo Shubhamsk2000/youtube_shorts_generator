@@ -1,0 +1,86 @@
+# Default settings. Override any key here; unknown keys are rejected.
+workspace_dir: workspace
+
+download:
+  max_height: 1440          # 2160 (4K) = sharpest crops but ≈2-3 GB per video; needs free disk
+  prefer_codec: vp9         # vp9 decodes much faster than av1 on CPU
+  cookies_from_browser: null  # e.g. "firefox" if YouTube asks to confirm you're not a bot
+  min_free_disk_gb: 3.0
+
+transcribe:
+  model: small.en           # base.en = ~2x faster, less accurate on loud/music content
+  compute_type: int8
+  threads: 4
+  beam_size: 5
+  vad: true
+  min_word_prob: 0.0        # words below this are dropped (0 = keep all)
+
+sentences:
+  max_words: 30             # split long run-on sentences
+  max_gap_s: 1.0            # a pause longer than this starts a new sentence
+
+select:                     # "Find moments" (Gemini free tier)
+  model: gemini-3.8-flash
+  fallback_models: [gemini-3.6-flash, gemini-3.5-flash-lite]  # used on 503 / daily quota
+  window_min: 20            # transcript sent in ~20 min windows (one call each)
+  overlap_min: 2
+  min_clip_s: 15
+  max_clip_s: 60
+  min_score: 4              # 0-10; kept low on purpose, you review the picks
+  max_clips: 25
+  offline_fallback: true    # if Gemini is down, pick moments with a heuristic
+  refine: true              # 2nd "editor" pass: compares all picks, tightens hooks, writes hook text/title/hashtags
+  use_heatmap: true         # use YouTube "Most replayed" data when the video has it
+
+preview:                    # quick review renders: low quality on purpose so they're fast
+  width: 540
+  height: 960
+  crf: 28
+  preset: ultrafast
+  max_fps: 30               # 60 fps sources previewed at 30
+
+export:                     # "Export HD" / `shorts export`: what you upload
+  dir: exports              # -> exports/<video title>/NN-title.mp4 + NN-title.txt (title, description, hashtags)
+  width: 1080
+  height: 1920
+  crf: 18                   # lower = better quality, bigger file
+  preset: faster            # x264 speed ("medium"/"slow" = smaller files, much slower)
+  max_fps: 0                # 0 = keep source fps; 30 = exports twice as fast (60 fps gameplay looks smoother though)
+  sharpen: 0.45             # light sharpening after upscaling (0 = off)
+
+audio:
+  loudness_lufs: -14        # Shorts/TikTok/Reels level, so every clip plays equally loud
+  highpass_hz: 70           # removes rumble
+
+hook:                       # on-screen hook text (written by Gemini) over the first seconds
+  enabled: true
+  duration_s: 2.8
+  position: 0.17            # vertical centre, fraction of the height
+
+pacing:                     # jump cuts over dead air between words
+  enabled: true
+  min_gap_s: 0.55           # pauses longer than this...
+  keep_gap_s: 0.2           # ...are cut down to this
+  max_gap_s: 3.0            # longer pauses kept (usually something is happening on screen)
+
+captions:                   # word-by-word, burned into the previews
+  enabled: true
+  font: Inter Black
+  size: 92                  # on a 1080x1920 canvas
+  uppercase: true
+  max_words: 3
+  max_chars: 16
+  position: 0.68            # bottom of the text at 68% of the height (clear of Shorts UI)
+  highlight_color: "#FFE600"
+  emphasis_color: "#4ADE80" # words Gemini flagged
+  offset_ms: 0              # shift captions if they feel early/late (negative = earlier)
+
+reframe:                    # 16:9 -> 9:16, shot by shot
+  enabled: true             # false = plain centre crop
+  sample_fps: 6             # face checks per second (plus the first frame of every shot)
+  min_face_h: 0.05          # ignore faces smaller than 5% of the frame height (crowds)
+  cut_threshold: 0.25       # camera-cut sensitivity (lower = more cuts)
+  static_tolerance: 0.05    # subject moves less than this -> locked crop, no motion
+  max_speed: 0.5            # max crop pan, frame widths per second
+  fit_y: 0.42               # FIT shots: where the full frame sits (keeps captions clear)
+  screen_layout: split      # facecam over gameplay: "split" = cam on top, gameplay below; "track" = old behaviour

@@ -1,0 +1,54 @@
+# --- Python env & build junk ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Downloaded models & caches (GBs, all rebuildable) ---
+.cache/
+*.onnx
+*.pt
+*.bin
+*.safetensors
+
+# --- Node / web UI ---
+node_modules/
+web/**/dist/
+*.tsbuildinfo
+
+# --- Media & pipeline output (huge; GitHub rejects files >100 MB) ---
+data/
+workspace/
+exports/
+uploading_videos/
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.m4a
+*.wav
+*.mp3
+*.ass
+*.srt
+*.part
+*.ytdl
+
+# --- Secrets (keep .env.example tracked) ---
+.env
+.env.*
+!.env.example
+cookies*.txt
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
