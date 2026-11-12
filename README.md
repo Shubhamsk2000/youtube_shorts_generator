@@ -27,6 +27,8 @@ cd web && npm install --cache ../.cache/npm && npm run build && cd ..
 .venv/bin/studio serve               # http://127.0.0.1:8000: Home, Shorts, Anime, Music, Channel
 ```
 
+Deploying to AWS and updating it after code changes: **[docs/DEPLOY.md](docs/DEPLOY.md)**.
+
 Both tools run their heavy work through ONE shared queue (one job at a time: the pipelines are CPU and RAM
 bound); the nav shows what is running. `shorts serve` and `anime serve` start the same Studio.
 

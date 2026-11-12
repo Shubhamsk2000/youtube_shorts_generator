@@ -1,0 +1,21 @@
+# Studio web app + job runner. Installed by scripts/server/setup.sh (it fills in __USER__ and __DIR__).
+# Listens on 127.0.0.1 only: reach it through an SSH tunnel (scripts/tunnel.sh), never an open port.
+[Unit]
+Description=Studio (shorts + anime edits)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/.venv/bin/studio serve --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+# a stop during a render: give ffmpeg a moment, the job shows "Paused" and resumes from its cache
+TimeoutStopSec=20
+Environment=PYTHONUNBUFFERED=1
+# keep a runaway render from taking the whole machine down
+MemoryMax=3600M
+
+[Install]
+WantedBy=multi-user.target
