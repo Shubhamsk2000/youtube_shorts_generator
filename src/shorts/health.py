@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 
 from .config import Config
-from .utils.sysinfo import available_ram_gb, free_disk_gb
+from common.sysinfo import available_ram_gb, free_disk_gb
 
 
 @dataclass

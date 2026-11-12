@@ -25,15 +25,17 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import PROJECT_ROOT, Config, ReframeCfg
+from common.paths import MODELS_DIR
+
+from ..config import Config, ReframeCfg
 from ..models import Clip, FaceSample, ReframePlan, Selection, Shot, VideoMeta, load_json, save_json
-from ..progress import Reporter
-from ..utils.ffmpeg import require
+from common.progress import Reporter
+from common.ffmpeg import require
 from .select import OUT as SELECTION
 
 REFRAME_DIR = "reframe"
 VERSION = 2
-MODEL = PROJECT_ROOT / ".cache" / "models" / "face_detection_yunet_2023mar.onnx"
+MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
 MODEL_URL = ("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
              "face_detection_yunet/face_detection_yunet_2023mar.onnx")
 MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"

@@ -9,9 +9,9 @@ from pathlib import Path
 
 from ..config import Config
 from ..models import VideoInfo, VideoMeta, load_json, save_json
-from ..progress import Reporter
-from ..utils import ffmpeg
-from ..utils.sysinfo import free_disk_gb
+from common.progress import Reporter
+from common import ffmpeg
+from common.sysinfo import free_disk_gb
 
 META = "meta.json"
 INFO = "info.json"
@@ -153,7 +153,7 @@ def _download_youtube(url: str, job: JobRef, cfg: Config, report: Reporter) -> V
                 raise DownloadError(
                     f"Not enough disk: download ≈{need / 1e9:.1f} GB, free {free:.1f} GB, "
                     f"must keep {cfg.download.min_free_disk_gb} GB free. Delete old jobs or "
-                    "lower download.max_height in config.yaml."
+                    "lower download.max_height in configs/shorts.yaml."
                 )
             report(0.0, f"Downloading {info.get('height') or '?'}p ≈{need / 1e9:.2f} GB")
             ydl.process_info(info)
@@ -171,7 +171,7 @@ def _download_youtube(url: str, job: JobRef, cfg: Config, report: Reporter) -> V
 def _clean_ytdlp_error(e: Exception) -> str:
     msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e)).removeprefix("ERROR: ").strip()
     if re.search(r"sign in|not a bot|cookies", msg, re.I):
-        msg += (" (Set download.cookies_from_browser in config.yaml, and update yt-dlp: "
+        msg += (" (Set download.cookies_from_browser in configs/shorts.yaml, and update yt-dlp: "
                 "pip install -U 'yt-dlp[default]')")
     return msg
 

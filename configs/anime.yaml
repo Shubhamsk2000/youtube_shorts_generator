@@ -1,0 +1,63 @@
+# Anime edits settings (`anime make <episode>`, `anime serve`). Override any key; unknown keys are rejected.
+# Settings saved from the web UI (channel card) go to configs/anime.local.yaml and win over this file.
+workspace_dir: data/anime/workspace
+export_dir: data/anime/exports      # -> data/anime/exports/<episode>/NN-title.mp4 + NN-title.txt
+style: clip                         # clip = one strong scene · montage = several beats · song = AMV cut to a song's beats
+
+card:                               # the tweet above the video: YOUR channel, never someone else's account
+  theme: dark                       # dark | light
+  name: Anime Edits
+  handle: "@animeedits"
+  avatar: null                      # e.g. data/anime/avatar.png (square); null = initial in a circle
+  verified: true
+  footer: date                      # date | none
+  text_size: 46
+  center_y: 0.44                    # card's vertical centre (fraction of the height)
+
+subs:
+  languages: [eng, en]              # preferred subtitle tracks
+  audio_languages: [eng, en, jpn, ja]  # English dub if the file has one, else the original voices
+  dub_captions: transcribe          # English audio: captions from the audio itself (word by word) | track
+  whisper_fallback: true            # no text subs -> Whisper translates the audio (downloads ~480 MB once)
+  whisper_model: small
+
+select:                             # Gemini (free tier), same key as the shorts app
+  model: gemini-3.8-flash
+  fallback_models: [gemini-3.6-flash, gemini-3.5-flash-lite]
+  count: 5                          # shorts per episode
+  min_clip_s: 20
+  target_clip_s: 60                 # about 1 min when the scene supports it; shorter moments stay short
+  max_clip_s: 90
+  montage_min_s: 40                 # montages are topped up with extra beats to reach this
+  montage_max_s: 60
+  watch: true                       # Gemini watches each pick (270p proxy) before it is edited
+
+music:                              # song edits: put songs in data/anime/music/ (subfolders hype/, sad/... = mood)
+  min_s: 40
+  max_s: 60
+  tag_with_gemini: true             # Gemini listens once per song to tag its mood
+
+edit:
+  auto_punch: true                  # montage: zoom punch on the loudest hit of each beat
+  punch_zoom: 0.16
+  transition_s: 0.25
+  end_freeze_s: 0                   # hold the last frame (e.g. 0.6); 0 = off
+
+captions:                           # dialogue under the card
+  enabled: true
+  font: Inter Black
+  size: 54
+
+preview:                            # quick review renders
+  width: 540
+  height: 960
+  crf: 28
+  preset: ultrafast
+  audio_bitrate: 96k
+
+export:                             # what you upload
+  width: 1080
+  height: 1920
+  crf: 18
+  preset: faster
+  max_fps: 0                        # 0 = keep the episode's frame rate

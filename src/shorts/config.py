@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from common.paths import CONFIG_DIR, resolve
 
 
 class _Strict(BaseModel):
@@ -133,7 +133,7 @@ class PreviewCfg(_Strict):
 
 
 class ExportCfg(_Strict):
-    dir: Path = Path("exports")  # finished uploads land in exports/<video title>/
+    dir: Path = Path("data/shorts/exports")  # finished uploads land in <dir>/<video title>/
     width: int = 1080
     height: int = 1920
     crf: int = 18
@@ -144,11 +144,11 @@ class ExportCfg(_Strict):
     fast: bool = False
 
     def out_dir(self) -> Path:
-        return self.dir if self.dir.is_absolute() else PROJECT_ROOT / self.dir
+        return resolve(self.dir)
 
 
 class Config(_Strict):
-    workspace_dir: Path = Path("workspace")
+    workspace_dir: Path = Path("data/shorts/workspace")
     download: DownloadCfg = DownloadCfg()
     transcribe: TranscribeCfg = TranscribeCfg()
     sentences: SentenceCfg = SentenceCfg()
@@ -162,11 +162,10 @@ class Config(_Strict):
     export: ExportCfg = ExportCfg()
 
     def workspace(self) -> Path:
-        p = self.workspace_dir
-        return p if p.is_absolute() else PROJECT_ROOT / p
+        return resolve(self.workspace_dir)
 
 
 def load_config(path: Path | None = None) -> Config:
-    path = path or PROJECT_ROOT / "config.yaml"
+    path = path or CONFIG_DIR / "shorts.yaml"
     data = yaml.safe_load(path.read_text()) if path.exists() else {}
     return Config.model_validate(data or {})

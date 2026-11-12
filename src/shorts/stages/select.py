@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ..config import Config, SelectCfg
 from ..models import Clip, ClipScores, Selection, Sentence, Transcript, VideoInfo, VideoMeta, load_json, save_json
-from ..progress import Reporter
+from common.progress import Reporter
 
 OUT = "selection.json"
 PAD_LEAD, PAD_TAIL = 0.15, 0.4  # seconds of air before/after the speech
@@ -169,7 +169,7 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, force: bool = False,
         try:
             sel = _select_llm(t, meta, cfg.select, job_dir / CACHE_DIR, report, refresh=force, info=info)
         except Exception as e:  # noqa: BLE001  (any LLM failure -> offline fallback)
-            from ..llm import LLMError
+            from common.llm import LLMError
             if not cfg.select.offline_fallback:
                 raise
             reason = str(e) if isinstance(e, LLMError) else f"{type(e).__name__}: {e}"
@@ -239,7 +239,7 @@ def _line(s: Sentence, heat) -> str:
 
 def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, report: Reporter,
                 refresh: bool = False, info: VideoInfo | None = None) -> Selection:
-    from ..llm import generate_json
+    from common.llm import generate_json
 
     heat = heat_fn(info, sc)
     channel, about = _context(meta, info)
@@ -285,7 +285,7 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
 
 def _refine(clips: list[Clip], t: Transcript, meta: VideoMeta, info: VideoInfo | None, sc: SelectCfg,
             cache_dir: Path, report: Reporter, refresh: bool, heat) -> tuple[list[Clip], dict[str, int]]:
-    from ..llm import generate_json
+    from common.llm import generate_json
 
     ss = t.sentences
     by_id = {s.id: i for i, s in enumerate(ss)}

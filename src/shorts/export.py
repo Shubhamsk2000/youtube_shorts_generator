@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .config import Config
 from .models import Clip, Selection, VideoMeta, load_json
-from .progress import Reporter
+from common.progress import Reporter
 from .stages import render
 from .stages.select import OUT as SELECTION
 

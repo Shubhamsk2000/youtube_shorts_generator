@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import Config
-from .progress import Hooks
+from common.progress import Hooks
 from .stages import captions, download, reframe, render, select, transcribe
-from .utils.lock import job_lock
+from common.lock import job_lock
 
 
 @dataclass(frozen=True)

@@ -9,10 +9,10 @@ from pathlib import Path
 
 from ..config import Config
 from ..models import Transcript, VideoMeta, Word, load_json, save_json
-from ..progress import Reporter
+from common.progress import Reporter
 from ..text import group_sentences, merge_fragments
-from ..utils import ffmpeg
-from ..utils.proc import StageProcessError, run_isolated
+from common import ffmpeg
+from common.proc import StageProcessError, run_isolated
 
 OUT = "transcript.json"
 AUDIO = "audio.wav"

@@ -1,23 +1,20 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 import typer
-from dotenv import load_dotenv
 from rich.console import Console
 
-from .config import PROJECT_ROOT, load_config
+from common.paths import setup_env
 
-load_dotenv(PROJECT_ROOT / ".env")
-# Keep model downloads (Whisper via Hugging Face) and yt-dlp's cache inside the project folder.
-os.environ.setdefault("XDG_CACHE_HOME", str(PROJECT_ROOT / ".cache"))
-os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
+from .config import load_config
+
+setup_env()
 app = typer.Typer(add_completion=False, help="Turn long YouTube videos into vertical shorts.")
 console = Console()
 
-ConfigOpt = typer.Option(None, "--config", "-c", help="Path to config.yaml")
+ConfigOpt = typer.Option(None, "--config", "-c", help="Path to a config file (default: configs/shorts.yaml)")
 
 
 @app.command()
@@ -37,7 +34,7 @@ def doctor(config: Path = ConfigOpt) -> None:
 @app.command()
 def download(source: str, config: Path = ConfigOpt, force: bool = False) -> None:
     """Download a YouTube URL (or register a local file) into the workspace."""
-    from .progress import ConsoleHooks
+    from common.progress import ConsoleHooks
     from .stages import download as dl
 
     cfg = load_config(config)
@@ -51,7 +48,7 @@ def download(source: str, config: Path = ConfigOpt, force: bool = False) -> None
 def transcribe(job: str, config: Path = ConfigOpt, force: bool = False) -> None:
     """Transcribe a downloaded job (by video id or job dir)."""
     from .models import VideoMeta, load_json
-    from .progress import ConsoleHooks
+    from common.progress import ConsoleHooks
     from .stages import transcribe as tr
 
     cfg = load_config(config)
@@ -67,7 +64,7 @@ def transcribe(job: str, config: Path = ConfigOpt, force: bool = False) -> None:
 def select(job: str, config: Path = ConfigOpt, force: bool = typer.Option(False, help="Ask Gemini again")) -> None:
     """Find moments in a transcribed job, reframe and caption them, render previews."""
     from .models import VideoMeta, load_json
-    from .progress import ConsoleHooks
+    from common.progress import ConsoleHooks
     from .stages import captions as cp
     from .stages import reframe as rf
     from .stages import render as rd
@@ -125,7 +122,7 @@ def export(job: str, config: Path = ConfigOpt,
     """Render approved clips at full quality into exports/<video>/ (with title/description/hashtags)."""
     from . import export as ex
     from .models import Selection, VideoMeta, load_json
-    from .progress import ConsoleHooks
+    from common.progress import ConsoleHooks
 
     cfg = load_config(config)
     job_dir = _job_dir(job, cfg)
@@ -145,7 +142,7 @@ def export(job: str, config: Path = ConfigOpt,
 def make(source: str, config: Path = ConfigOpt) -> None:
     """Run the full pipeline (stages implemented so far) on a URL or local file."""
     from . import pipeline
-    from .progress import ConsoleHooks
+    from common.progress import ConsoleHooks
 
     cfg = load_config(config)
     job_dir = _guard(lambda: pipeline.run(source, cfg, ConsoleHooks()))
@@ -153,14 +150,11 @@ def make(source: str, config: Path = ConfigOpt) -> None:
 
 
 @app.command()
-def serve(host: str = "127.0.0.1", port: int = 8000, config: Path = ConfigOpt) -> None:
-    """Start the web UI + API (http://127.0.0.1:8000)."""
-    import uvicorn
+def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Start the Studio web UI (both apps): http://127.0.0.1:8000."""
+    from studio.cli import serve as studio_serve
 
-    from .server import create_app
-
-    console.print(f"[bold]shorts[/] UI → http://{host}:{port}")
-    uvicorn.run(create_app(config), host=host, port=port, log_level="warning")
+    studio_serve(host=host, port=port, shorts_config=None, anime_config=None)
 
 
 def _job_dir(job: str, cfg) -> Path:
@@ -174,7 +168,7 @@ def _job_dir(job: str, cfg) -> Path:
 
 def _locked(job_dir: Path, fn):
     """Same per-job lock the pipeline uses, so the CLI and `shorts serve` never work on one job at once."""
-    from .utils.lock import job_lock
+    from common.lock import job_lock
 
     def run():
         with job_lock(job_dir):
@@ -186,10 +180,10 @@ def _guard(fn):
     """Show pipeline errors as one clean message instead of a traceback."""
     from .export import ExportError
     from .stages.download import DownloadError
-    from .utils.ffmpeg import FFmpegError
-    from .utils.lock import JobBusyError
-    from .llm import LLMError
-    from .utils.proc import StageProcessError
+    from common.ffmpeg import FFmpegError
+    from common.lock import JobBusyError
+    from common.llm import LLMError
+    from common.proc import StageProcessError
 
     try:
         return fn()

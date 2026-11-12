@@ -14,7 +14,7 @@ from pathlib import Path
 
 from ..config import CaptionCfg, Config, HookCfg
 from ..models import Clip, ReframePlan, Selection, Transcript, VideoMeta, load_json
-from ..progress import Reporter
+from common.progress import Reporter
 from . import pacing
 from .reframe import plan_path, split_panel_frac
 from .select import OUT as SELECTION

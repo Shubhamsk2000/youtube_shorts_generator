@@ -52,3 +52,4 @@ cookies*.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+configs/*.local.yaml
