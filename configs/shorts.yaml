@@ -5,6 +5,7 @@ download:
   max_height: 1440          # 2160 (4K) = sharpest crops but ≈2-3 GB per video; needs free disk
   prefer_codec: vp9         # vp9 decodes much faster than av1 on CPU
   cookies_from_browser: null  # e.g. "firefox" if YouTube asks to confirm you're not a bot
+  cookies_file: data/shorts/cookies.txt  # exported YouTube cookies; used if present (needed on servers)
   min_free_disk_gb: 3.0
 
 transcribe:

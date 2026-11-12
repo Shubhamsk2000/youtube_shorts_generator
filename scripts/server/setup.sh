@@ -21,7 +21,7 @@ say "Disk"
 root_gb=$(df -BG --output=size / | tail -1 | tr -dc '0-9')
 if (( root_gb < 25 )); then
   echo "The disk is only ${root_gb} GB. Episodes, models and renders need ~30-40 GB:"
-  echo "AWS console -> EC2 -> Volumes -> Modify (40 GB), then reboot the instance and run this again."
+  echo "Grow it to 40 GB (no reinstall): see Growing the disk in docs/DEPLOY.md, then run this again."
   exit 1
 fi
 echo "${root_gb} GB: ok"
@@ -74,7 +74,7 @@ say "Web UI"
 say "Secrets"
 if [[ ! -f .env ]]; then
   cp .env.example .env
-  echo "Created .env from the example: copy your real one from the laptop (see docs/DEPLOY.md, step 6)."
+  echo "Created .env from the example: copy your real one from the laptop (run scripts/sync-settings.sh on the laptop, docs/DEPLOY.md step 7)."
 fi
 
 say "Service"

@@ -12,6 +12,7 @@ from ..models import VideoInfo, VideoMeta, load_json, save_json
 from common.progress import Reporter
 from common import ffmpeg
 from common.sysinfo import free_disk_gb
+from common.paths import resolve
 
 META = "meta.json"
 INFO = "info.json"
@@ -59,6 +60,9 @@ def _ydl_opts(cfg: Config) -> dict:
     }
     if d.cookies_from_browser:
         opts["cookiesfrombrowser"] = (d.cookies_from_browser,)
+    cookies = resolve(d.cookies_file)
+    if cookies.is_file():
+        opts["cookiefile"] = str(cookies)
     return opts
 
 
@@ -171,8 +175,9 @@ def _download_youtube(url: str, job: JobRef, cfg: Config, report: Reporter) -> V
 def _clean_ytdlp_error(e: Exception) -> str:
     msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e)).removeprefix("ERROR: ").strip()
     if re.search(r"sign in|not a bot|cookies", msg, re.I):
-        msg += (" (Set download.cookies_from_browser in configs/shorts.yaml, and update yt-dlp: "
-                "pip install -U 'yt-dlp[default]')")
+        msg += (" (Export YouTube cookies to data/shorts/cookies.txt (on a server: scripts/sync-settings.sh "
+                "copies it), or set download.cookies_from_browser in configs/shorts.yaml; "
+                "and update yt-dlp: pip install -U 'yt-dlp[default]')")
     return msg
 
 

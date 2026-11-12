@@ -16,6 +16,7 @@ class DownloadCfg(_Strict):
     max_height: int = 2160
     prefer_codec: str = "vp9"
     cookies_from_browser: str | None = None
+    cookies_file: Path = Path("data/shorts/cookies.txt")  # used only if it exists
     min_free_disk_gb: float = 3.0
 
 

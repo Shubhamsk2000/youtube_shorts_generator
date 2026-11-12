@@ -15,6 +15,24 @@ scripts/send.sh / fetch-exports.sh ──── rsync ────────�
 Cost: about $0.085 per hour while the instance runs, ~$3 a month for a 40 GB disk. **Stop the instance when you
 are done**; a stopped instance only costs the disk.
 
+### Two terminals, two machines
+
+Look at the prompt before you type: each command belongs to one machine.
+
+| Prompt | You are on | Run there |
+|---|---|---|
+| `shubham@HP-15:~$` | your laptop | everything in `scripts/` **except** `scripts/server/`: `ssh.sh`, `tunnel.sh`, `deploy.sh`, `send.sh`, `fetch-exports.sh`, `sync-settings.sh` |
+| `ubuntu@ip-172-31-…:~$` | the AWS server | `scripts/server/setup.sh`, `scripts/server/update.sh`, `df -h`, `journalctl` |
+
+`exit` leaves the server. The laptop scripts read `.deploy.env`, which exists only on the laptop: running one of
+them on the server prints *Missing .deploy.env*.
+
+### The project folder name on the server
+
+This guide clones into `~/yt_video_gen`. If you cloned under another name (for example the repo's own name,
+`~/youtube_shorts_generator`), set `APP_DIR=` in `.deploy.env` to that name and use it wherever a command below
+says `yt_video_gen` on the server.
+
 ---
 
 ## Part 1: first-time setup (about 45 minutes, once)
@@ -31,8 +49,8 @@ AWS console → **EC2** → **Instances** → click your instance.
 1. **OS**: the *Details* tab → *Platform details* / AMI name must say **Ubuntu** (24.04). If it says Amazon
    Linux, it is easiest to start over now: *Instance state → Terminate*, then *Launch instance* with
    **Ubuntu Server 24.04 LTS**, type **c7i-flex.large**, a new key pair (download the `.pem`), storage **40 GiB gp3**.
-2. **Disk**: the *Storage* tab → the volume size. Under 30 GiB: click the volume ID → *Actions → Modify volume* →
-   **40** → Modify. Then *Instance state → Reboot* (Ubuntu grows the disk on boot).
+2. **Disk**: the *Storage* tab → the volume size. It must be at least **30 GiB, 40 recommended** (see *Disk space*
+   below; `setup.sh` stops under 25 GB). To grow it, see *Growing the disk* in Troubleshooting: no reinstall needed.
 3. **Firewall**: the *Security* tab → the security group → *Edit inbound rules*. Keep exactly **one** rule:
    type **SSH**, port 22, source **My IP**. Delete anything open to `0.0.0.0/0` other than that.
    (If your home internet IP changes later and SSH stops connecting, come back here and pick *My IP* again.)
@@ -100,14 +118,19 @@ scripts/ssh.sh 'cd yt_video_gen && bash scripts/server/setup.sh'
 starts Studio as a service that also starts on every boot. It is safe to run again. It ends with
 `Studio is running on the server`.
 
-### Step 7. Copy your secrets and channel card (1 min)
+### Step 7. Copy your secrets and channel card (laptop, 1 min)
 
-Git deliberately does not carry these. One command copies `.env` (Gemini key), your channel card settings and
-avatar, and restarts Studio so it uses them:
+Git deliberately does not carry these. One command **on the laptop** copies `.env` (Gemini key),
+`configs/anime.local.yaml` (channel card) and `data/anime/avatar.png`, and restarts Studio so it uses them:
 
 ```bash
+exit                          # if you are still on the server
+cd /media/shubham/E238D10938D0DE1B/yt_video_gen
 scripts/sync-settings.sh
 ```
+
+If it hangs: the instance isn't running, its IP changed (update `SERVER=`), or the security group's *My IP* is
+not your current network.
 
 ### Step 8. Open Studio (1 min)
 
@@ -134,8 +157,46 @@ scripts/send.sh music  ~/Music/track.mp3 --mood hype
 1. AWS console → EC2 → your instance → **Instance state → Start**. Wait ~1 minute.
 2. Copy the new **Public IPv4** into `SERVER=` in `.deploy.env`.
 3. `scripts/tunnel.sh` → http://localhost:8800 → start jobs (they keep running if you close the tunnel).
-4. When done: `scripts/fetch-exports.sh` (copies new shorts to `data/server-exports/`).
-5. **Instance state → Stop**. (Not *Terminate*: that deletes the server.)
+4. Approve the shorts you like and press **Export**.
+5. `scripts/fetch-exports.sh` on the laptop (see below).
+6. **Instance state → Stop**. (Not *Terminate*: that deletes the server.)
+
+### Getting your exports
+
+**Export** writes the final 1080×1920 videos to the **server's** disk; they stay there until you copy them down:
+
+```
+~/yt_video_gen/data/                      (on the server)
+├── shorts/exports/<video id>/            long video → shorts
+│     01_<title>.mp4, 01_<title>.txt …
+└── anime/exports/<episode>/              anime edits
+      01_<title>.mp4, 01_<title>.txt …
+```
+
+Each `.mp4` has a `.txt` beside it with the title, description and hashtags (and the song for song edits), ready to
+paste into YouTube. To copy them to the laptop (instance running):
+
+```bash
+scripts/fetch-exports.sh
+```
+
+They land in `data/server-exports/shorts/…` and `data/server-exports/anime/…` in the project. It uses **rsync**:
+only new or changed files are sent, an interrupted copy resumes when you rerun it, and nothing is deleted on
+either side.
+
+### Disk space
+
+Fixed cost before any media: Ubuntu + ffmpeg + Node ~5 GB, the Python environment (PyTorch, Whisper, OpenCV) and
+its pip cache ~5-6 GB, models ~1-2 GB, swap 2 GB: **~13 GB**. Then each anime episode is 0.3-1.5 GB plus ~1 GB of
+work files, a long YouTube video 1-3 GB with its work files. A full disk makes a running render fail, so clean
+up once your exports are on the laptop:
+
+```bash
+scripts/ssh.sh 'df -h / && du -sh yt_video_gen/data/*/*'                 # what uses the space
+scripts/ssh.sh 'rm -rf yt_video_gen/data/shorts/exports/<video id>'       # an export you already fetched
+```
+
+Finished episodes and videos: delete them in Studio (their work files are the big part).
 
 ---
 
@@ -201,7 +262,28 @@ Fix the code on the laptop, push, then `scripts/deploy.sh` brings the server bac
 | Tunnel says *address already in use* | `scripts/tunnel.sh 8801` and open http://localhost:8801 |
 | Studio page doesn't load | `scripts/ssh.sh 'systemctl status studio --no-pager; journalctl -u studio -n 50 --no-pager'` |
 | A job failed | its error shows on the job page; full log: the `journalctl` line above |
-| Disk full | `scripts/ssh.sh 'df -h / && du -sh yt_video_gen/data/*/*'`; delete finished episodes in Studio (keeps exports), or remove old `data/*/exports` after fetching |
+| Disk full | `scripts/ssh.sh 'df -h / && du -sh yt_video_gen/data/*/*'`; delete finished episodes in Studio (keeps exports), or remove old `data/*/exports` after fetching; or grow the disk (below) |
+| `setup.sh`: *The disk is only 23 GB* | a 24 GiB volume shows as ~23 GB (Ubuntu keeps ~1 GB for boot); grow it to 40 (below) |
+| *Missing .deploy.env* | you ran a laptop script on the server: `exit` first |
+
+### Growing the disk
+
+No stop, no reinstall; the files stay.
+
+1. AWS console → EC2 → your instance → *Storage* tab → click the **Volume ID** → *Actions → Modify volume* →
+   size **40** → Modify. AWS allows one change per volume **every 6 hours**, and a disk can only grow: pick the
+   final size now.
+2. Wait about a minute (state *optimizing* is fine). AWS has made the virtual disk bigger; Ubuntu's partition and
+   filesystem don't know yet. On the server:
+
+   ```bash
+   lsblk                              # disk nvme0n1 shows 40G, partition nvme0n1p1 still ~23G
+   sudo growpart /dev/nvme0n1 1       # stretch partition 1 over the disk
+   sudo resize2fs /dev/nvme0n1p1      # stretch the filesystem over the partition
+   df -h /                            # Size ~39G
+   ```
+
+   If `lsblk` shows other names (`xvda` / `xvda1`), use those. A reboot does the same automatically.
 | YouTube link fails ("confirm you're not a bot") | YouTube blocks many AWS addresses: download on the laptop and `scripts/send.sh shorts video.mp4`, then use *upload* in Studio → Shorts |
 | Gemini "daily quota" | free tier limit; jobs continue with the fallback models, or retry tomorrow |
 
