@@ -24,9 +24,10 @@ import yaml
 from .llm_providers import KINDS, LLMError, Part, ProviderCfg, Request, Retryable
 from .paths import CONFIG_DIR
 
-__all__ = ["LLMError", "Part", "generate_json", "route_info", "load_llm_config"]
+__all__ = ["LLMError", "Part", "generate_json", "route_info", "load_llm_config", "model_choices", "set_task_model"]
 
 CONFIG_FILE = CONFIG_DIR / "llm.yaml"
+LOCAL_FILE = CONFIG_DIR / "llm.local.yaml"   # model picked in the UI (overrides llm.yaml tasks)
 OVERLOAD_COOLDOWN_S = 600
 QUOTA_COOLDOWN_S = 3600
 
@@ -41,6 +42,7 @@ _lock = threading.Lock()
 class Route:
     provider: str = "gemini"
     models: list[str] = field(default_factory=list)   # empty = the calling app's own models (Gemini only)
+    picked: bool = False   # chosen in the UI: the provider's other models are kept as fallbacks
 
 
 @dataclass
@@ -56,20 +58,22 @@ _cfg_cache: dict = {"mtime": None, "cfg": None}
 
 
 def load_llm_config() -> LLMConfig:
-    """configs/llm.yaml, re-read when it changes (no restart needed)."""
-    try:
-        mtime = CONFIG_FILE.stat().st_mtime
-    except FileNotFoundError:
-        mtime = None
+    """configs/llm.yaml (+ llm.local.yaml from the UI), re-read when either changes (no restart needed)."""
+    def _mt(f: Path):
+        try:
+            return f.stat().st_mtime
+        except FileNotFoundError:
+            return None
+    mtime = (_mt(CONFIG_FILE), _mt(LOCAL_FILE))
     if _cfg_cache["cfg"] is not None and _cfg_cache["mtime"] == mtime:
         return _cfg_cache["cfg"]
     cfg = LLMConfig()
-    if mtime is not None:
-        raw = yaml.safe_load(CONFIG_FILE.read_text()) or {}
+    def route(d, picked: bool = False) -> Route:
+        d = d or {}
+        return Route(str(d.get("provider", "gemini")), [str(m) for m in d.get("models") or []], picked)
 
-        def route(d) -> Route:
-            d = d or {}
-            return Route(str(d.get("provider", "gemini")), [str(m) for m in d.get("models") or []])
+    if mtime[0] is not None:
+        raw = yaml.safe_load(CONFIG_FILE.read_text()) or {}
 
         cfg.default = route(raw.get("default"))
         cfg.media = route(raw.get("media"))
@@ -81,6 +85,9 @@ def load_llm_config() -> LLMConfig:
                 api_key_env=p.get("api_key_env"), models=[str(m) for m in p.get("models") or []],
                 min_interval_s=p.get("min_interval_s"), json_mode=p.get("json_mode", "object"),
                 extra_body=p.get("extra_body") or {}, headers=p.get("headers") or {})
+    if mtime[1] is not None:
+        local = yaml.safe_load(LOCAL_FILE.read_text()) or {}
+        cfg.tasks.update({k: route(v, picked=True) for k, v in (local.get("tasks") or {}).items() if v})
     _cfg_cache.update(mtime=mtime, cfg=cfg)
     return cfg
 
@@ -94,7 +101,10 @@ def _resolve(task: str | None, has_media: bool, caller_models: list[str]) -> tup
     if p.kind not in KINDS:
         raise LLMError(f"configs/llm.yaml: provider '{p.name}' has unknown kind '{p.kind}'")
     # the apps' own model lists are Gemini model names: only valid when Gemini answers
-    models = route.models or (caller_models if p.kind == "gemini" else []) or p.models
+    own = (caller_models if p.kind == "gemini" else []) or p.models
+    models = route.models or own
+    if route.picked:
+        models = [*route.models, *own]   # UI pick first, the rest still catch quota / overload
     if not models:
         raise LLMError(f"configs/llm.yaml: no models for provider '{p.name}' (task {task or 'default'})")
     return p, list(dict.fromkeys(models))
@@ -112,6 +122,44 @@ def route_info(task: str | None = None, has_media: bool = False, caller_models: 
         return {"provider": p.name, "kind": p.kind, "models": models, "key_set": key_ok}
     except LLMError as e:
         return {"provider": None, "error": str(e), "key_set": False}
+
+
+def model_choices(caller_models: list[str]) -> list[dict]:
+    """Every provider/model the UI can offer: Gemini with the app's models, the rest with their llm.yaml list."""
+    out = []
+    for p in load_llm_config().providers.values():
+        if p.kind not in KINDS:
+            continue
+        try:
+            p.key()
+            key_ok = True
+        except LLMError:
+            key_ok = False
+        for m in dict.fromkeys(caller_models if p.kind == "gemini" else p.models):
+            out.append({"provider": p.name, "model": m, "key_set": key_ok})
+    return out
+
+
+def picked_model(task: str) -> dict | None:
+    r = load_llm_config().tasks.get(task)
+    return {"provider": r.provider, "model": r.models[0] if r.models else None} if r and r.picked else None
+
+
+def set_task_model(tasks: list[str], provider: str | None, model: str | None) -> None:
+    """Save the UI's pick for these tasks to configs/llm.local.yaml; provider=None goes back to llm.yaml."""
+    cfg = load_llm_config()
+    if provider is not None and provider not in cfg.providers:
+        raise LLMError(f"unknown provider '{provider}'")
+    local = (yaml.safe_load(LOCAL_FILE.read_text()) or {}) if LOCAL_FILE.exists() else {}
+    t = local.setdefault("tasks", {}) or {}
+    for name in tasks:
+        if provider is None:
+            t.pop(name, None)
+        else:
+            t[name] = {"provider": provider, "models": [model] if model else []}
+    local["tasks"] = t
+    LOCAL_FILE.write_text("# Written by Studio's model picker. Delete this file to use configs/llm.yaml only.\n"
+                          + yaml.safe_dump(local, sort_keys=False))
 
 
 # ------------------------------------------------------------------ calls

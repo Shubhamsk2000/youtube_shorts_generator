@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from fastapi.responses import FileResponse
 
 from common.paths import DATA_DIR, WEB_DIR
@@ -15,6 +16,32 @@ from common.sysinfo import available_ram_gb, free_disk_gb
 from . import __version__
 
 WEB_DIST = WEB_DIR / "studio" / "dist"
+
+
+SHORTS_AI_TASKS = ["shorts.select", "shorts.refine"]
+
+
+class ModelPick(BaseModel):
+    provider: str | None = None   # None = back to configs/llm.yaml
+    model: str | None = None
+
+
+def _shorts_models(shorts_cfg: Path | None) -> list[str]:
+    from shorts.config import load_config
+    sc = load_config(shorts_cfg).select
+    return [sc.model, *sc.fallback_models]
+
+
+def _ai_route(shorts_cfg: Path | None) -> dict:
+    """Which provider/model picks shorts moments right now (configs/llm.yaml, re-read on change)."""
+    from common.llm import route_info
+    from shorts.config import load_config
+
+    try:
+        sc = load_config(shorts_cfg).select
+        return route_info("shorts.select", caller_models=[sc.model, *sc.fallback_models])
+    except Exception as e:  # noqa: BLE001  (status must never fail)
+        return {"provider": None, "error": str(e), "key_set": False}
 
 
 def create_app(shorts_cfg: Path | None = None, anime_cfg: Path | None = None) -> FastAPI:
@@ -46,7 +73,24 @@ def create_app(shorts_cfg: Path | None = None, anime_cfg: Path | None = None) ->
             "disk_free_gb": round(free_disk_gb(DATA_DIR), 1),
             "ram_available_gb": round(available_ram_gb(), 1),
             "gemini": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+            "ai": _ai_route(shorts_cfg),
         }
+
+    @app.get("/api/ai/shorts")
+    def ai_models():
+        """The model picker: what can pick shorts moments, and what does now."""
+        from common.llm import model_choices, picked_model
+        return {"choices": model_choices(_shorts_models(shorts_cfg)), "current": _ai_route(shorts_cfg),
+                "picked": picked_model(SHORTS_AI_TASKS[0])}
+
+    @app.put("/api/ai/shorts")
+    def set_ai_model(pick: ModelPick):
+        from common.llm import LLMError, set_task_model
+        try:
+            set_task_model(SHORTS_AI_TASKS, pick.provider, pick.model)
+        except LLMError as e:
+            raise HTTPException(400, str(e)) from None
+        return ai_models()
 
     @app.get("/api/recent")
     def recent(limit: int = 12):

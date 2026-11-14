@@ -9,6 +9,8 @@
 #   Gemini uses each app's own models (configs/shorts.yaml, anime.yaml),
 #   any other provider uses the `models:` listed under its entry in `providers:`.
 #
+# A model chosen in the UI is saved to configs/llm.local.yaml and wins over tasks: below.
+#
 # Task names: shorts.select, shorts.refine, anime.select, anime.watch, anime.music_mood
 
 default:
@@ -35,7 +37,8 @@ providers:
     kind: openai
     base_url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
-    models: [nvidia/nemotron-3.5-super-vl-120b-a12b]
+    # every model listed here shows up in Studio's model picker (Clips panel); the first is the default
+    models: [nvidia/nemotron-3.5-super-vl-120b-a12b, mistralai/mistral-large-4-1t-a52b, deepseek-ai/deepseek-v4.1-flash]
     min_interval_s: 2
 
   # OpenRouter: one key, many models (some free, ids ending in :free).

@@ -1,4 +1,5 @@
 import { Captions, Crop, Sparkles } from "lucide-react";
+import { ModelPicker } from "../components/ModelPicker";
 import { api, isActive, type SystemInfo } from "../api";
 import { JobCard } from "../components/JobCard";
 import { UrlForm } from "../components/UrlForm";
@@ -42,6 +43,7 @@ export function Home({ system }: { system?: SystemInfo }) {
           </p>
           <div className="fade-in mt-9 w-full">
             <UrlForm blocked={blocked} />
+            <ModelPicker className="mt-3" />
           </div>
           <ul className="mt-4 flex flex-wrap justify-center gap-x-5 gap-y-2 text-sm text-muted">
             {FEATURES.map(({ icon: Icon, label }) => (

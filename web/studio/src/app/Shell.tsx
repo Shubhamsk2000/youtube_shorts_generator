@@ -132,6 +132,16 @@ export function Footer({ status, offline }: { status?: Status; offline: boolean 
           {status && (
             <>
               <Stat ok={status.gemini} label={status.gemini ? "Gemini key set" : "Gemini key missing (.env)"} />
+              {status.ai && (
+                <Stat
+                  ok={!!status.ai.provider && status.ai.key_set}
+                  label={
+                    status.ai.provider
+                      ? `Shorts AI: ${status.ai.models?.[0] ?? "?"} (${status.ai.provider}${status.ai.key_set ? "" : ", key missing"})`
+                      : `Shorts AI: ${status.ai.error ?? "not configured"}`
+                  }
+                />
+              )}
               <Stat ok={status.disk_free_gb > 3} label={`${status.disk_free_gb} GB disk free`} />
               <Stat ok={status.ram_available_gb > 1} label={`${status.ram_available_gb} GB RAM available`} />
             </>

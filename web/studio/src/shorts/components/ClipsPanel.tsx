@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check, CircleAlert, Clock, Download, Flame, FolderOpen, LoaderCircle, RefreshCw, Sparkles, X } from "lucide-react";
 import { api, isActive, isExporting, type Clip, type ClipsData, type ExportState, type Job, type Review } from "../api";
 import { cx, fmtTime, usePoll } from "../lib";
+import { ModelPicker } from "./ModelPicker";
 import { Card, CardHeader } from "./ui";
 
 type Filter = "all" | "approved" | "pending";
@@ -31,7 +32,7 @@ export function ClipsPanel({ job, onSeek, onJob }: { job: Job; onSeek: (t: numbe
   }
 
   async function repick() {
-    if (!confirm("Ask Gemini to pick moments again? Current clips and reviews will be replaced.")) return;
+    if (!confirm("Ask the AI to pick moments again? Current clips and reviews will be replaced.")) return;
     setRepicking(true);
     try {
       onJob(await api.reselect(job.id));
@@ -147,14 +148,17 @@ export function ClipsPanel({ job, onSeek, onJob }: { job: Job; onSeek: (t: numbe
           {data.source === "gemini" ? `Picked by ${data.model} from ${data.candidates} proposals · ` : ""}
           Quick low-res previews · use Export HD for the upload-quality version
         </span>
+        <span className="flex flex-wrap items-center gap-3">
+        <ModelPicker />
         <button
           onClick={repick}
           disabled={repicking || isActive(job.status) || isExporting(job)}
           className="inline-flex items-center gap-1 rounded-md text-muted transition hover:text-fg disabled:opacity-40"
-          title="Ask Gemini again (uses the latest prompt), then reframe, caption and preview"
+          title="Ask the selected AI model again (uses the latest prompt), then reframe, caption and preview"
         >
           <RefreshCw className={cx("size-3", repicking && "animate-spin")} /> Re-pick moments
         </button>
+        </span>
       </div>
     </Card>
   );

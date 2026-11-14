@@ -6,6 +6,7 @@ source "$(dirname "$0")/_server.sh"
 cd "$ROOT"
 files=(.env)
 [[ -f configs/anime.local.yaml ]] && files+=(configs/anime.local.yaml)
+[[ -f configs/llm.local.yaml ]] && files+=(configs/llm.local.yaml)
 [[ -f data/anime/avatar.png ]] && files+=(data/anime/avatar.png)
 [[ -f data/shorts/cookies.txt ]] && files+=(data/shorts/cookies.txt)
 ssh "${SSH_OPTS[@]}" "$SERVER" "mkdir -p $APP_DIR/configs $APP_DIR/data/anime $APP_DIR/data/shorts"
