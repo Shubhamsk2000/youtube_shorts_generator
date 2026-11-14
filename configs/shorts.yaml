@@ -21,7 +21,7 @@ sentences:
   max_gap_s: 1.0            # a pause longer than this starts a new sentence
 
 select:                     # "Find moments" (Gemini free tier)
-  model: gemini-3.8-flash
+  model: nemotron-3.5-super-vl-120b-a12b
   fallback_models: [gemini-3.6-flash, gemini-3.5-flash-lite]  # used on 503 / daily quota
   window_min: 20            # transcript sent in ~20 min windows (one call each)
   overlap_min: 2
