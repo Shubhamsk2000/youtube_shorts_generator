@@ -82,3 +82,62 @@ def test_heuristic_returns_valid_clips():
 def test_merge_fragments():
     ws = [Word(text=t, start=i, end=i + 1, prob=0.9) for i, t in enumerate(["$100", ",000", "is", "50", "%", "x", ".5"])]
     assert [w.text for w in merge_fragments(ws)] == ["$100,000", "is", "50%", "x", ".5"]
+
+
+# ---------------------------------------------------------------- hook / payoff / standalone
+
+def spoken(texts: list[str], length: float = 6.0, gap: float = 0.5) -> list[Sentence]:
+    """Sentences with real per-word timing."""
+    out, t = [], 0.0
+    for i, text in enumerate(texts):
+        ws = text.split()
+        step = length / len(ws)
+        words = [Word(text=w, start=round(t + k * step, 3), end=round(t + (k + 1) * step, 3), prob=1)
+                 for k, w in enumerate(ws)]
+        out.append(Sentence(id=i, start=t, end=t + length, text=text, words=words))
+        t += length + gap
+    return out
+
+
+def test_lead_in_filler_is_cut_from_the_opening():
+    from shorts.stages.select import lead_trim
+    ss = spoken(["And now we're back at the train.", "It hits the wall at full speed."] * 6)
+    assert lead_trim(ss[0]) == 2 and lead_trim(ss[1]) == 0
+    clips, _ = validate([pick(0, 5)], ss, 200, CFG)
+    c = clips[0]
+    assert c.text.startswith("we're back") and c.hook.startswith("we're back")
+    assert ss[0].words[1].end <= c.start <= ss[0].words[2].start  # right before "we're", after "now"
+    off, _ = validate([pick(0, 5)], ss, 200, SelectCfg(trim_lead_fillers=False))
+    assert off[0].text.startswith("And now")
+
+
+def test_short_sentences_are_not_trimmed_to_nothing():
+    from shorts.stages.select import lead_trim
+    assert lead_trim(spoken(["So yeah okay."])[0]) == 0
+
+
+def test_clip_is_extended_to_its_payoff_and_trimmed_from_the_front():
+    ss = sents(40)   # 5.5 s per sentence
+    clips, _ = validate([pick(2, 5, payoff_id=8)], ss, 400, CFG)
+    assert clips[0].end_sentence == 8 and clips[0].payoff_sentence == 8
+    # payoff 14 from start 2 is > 60 s: opening lines go, the payoff stays
+    clips, _ = validate([pick(2, 5, payoff_id=14)], ss, 400, CFG)
+    c = clips[0]
+    assert c.end_sentence >= 14 and c.start_sentence > 2 and c.duration <= 60
+
+
+def test_editor_minimums_only_apply_to_final_picks():
+    ss = sents(40)
+    weak_hook = pick(0, 4, score=7, hook_score=3)
+    needs_context = pick(10, 14, score=7, standalone_score=3)
+    assert len(validate([weak_hook, needs_context], ss, 400, CFG)[0]) == 2
+    clips, rej = validate([weak_hook, needs_context], ss, 400, CFG, final=True)
+    assert not clips and rej == {"weak hook": 1, "needs context from the video": 1}
+
+
+def test_lint_flags_dangling_openings_and_trailing_transitions():
+    from shorts.stages.select import lint
+    ss = spoken(["He said it was impossible.", "Then he did it anyway!", "Next, let's try the car."] * 4)
+    c = validate([pick(0, 2, payoff_id=1)], ss, 200, CFG)[0][0]
+    warnings = " | ".join(lint(c, ss))
+    assert 'opens with "He"' in warnings and "transition" in warnings

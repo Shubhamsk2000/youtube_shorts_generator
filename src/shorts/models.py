@@ -52,13 +52,14 @@ class ClipScores(BaseModel):
     energy: float      # emotion, stakes, surprise
 
     def overall(self) -> float:
-        return round(0.3 * self.hook + 0.25 * self.standalone + 0.25 * self.payoff + 0.2 * self.energy, 1)
+        # the hook decides whether anyone watches at all; standalone + payoff decide whether they finish
+        return round(0.35 * self.hook + 0.25 * self.standalone + 0.25 * self.payoff + 0.15 * self.energy, 1)
 
 
 class Clip(BaseModel):
     id: str             # stable hash of the time range: same range -> same id across reruns
     rank: int
-    start: float        # seconds in the source (padded, snapped to sentence edges)
+    start: float        # seconds in the source (padded, snapped to sentence edges; lead-in filler words cut)
     end: float
     start_sentence: int
     end_sentence: int
@@ -73,6 +74,7 @@ class Clip(BaseModel):
     description: str = ""        # upload description
     hashtags: list[str] = []
     heat: float | None = None    # YouTube "Most replayed" level of this part, 0-1 (None = no data)
+    payoff_sentence: int | None = None  # sentence id where the payoff lands
 
     @property
     def duration(self) -> float:

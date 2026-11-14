@@ -104,8 +104,8 @@ def run(job_dir: Path, cfg: Config, *, report: Reporter | None = None) -> str:
 
 def spoken_spans(t: Transcript, clip: Clip) -> list[tuple[float, float]]:
     """(start, end) of every word in the clip, relative to the clip start (for pacing)."""
-    return [(w.start - clip.start, w.end - clip.start) for s in t.sentences
-            if clip.start_sentence <= s.id <= clip.end_sentence for w in s.words]
+    return [(max(0.0, w.start - clip.start), w.end - clip.start) for s in t.sentences
+            if clip.start_sentence <= s.id <= clip.end_sentence for w in s.words if w.end > clip.start]
 
 
 def edit_words(words: list[CapWord], keep: list[tuple[float, float]] | None, dur: float,

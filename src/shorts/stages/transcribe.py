@@ -4,6 +4,7 @@ The model runs in a child process so its ~1 GB is fully returned to the OS after
 """
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -44,7 +45,7 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, force: bool = False,
     t0 = time.monotonic()
     try:
         stats = run_isolated(_transcribe_worker, str(audio), str(out), meta.duration,
-                             cfg.model_dump(mode="json"), on_message=on_message)
+                             cfg.model_dump(mode="json"), _hints(job_dir, meta, cfg), on_message=on_message)
     except StageProcessError as e:
         raise StageProcessError(errors[0] if errors else str(e)) from e
     elapsed = time.monotonic() - t0
@@ -59,20 +60,38 @@ def _n_words(t: Transcript) -> int:
     return sum(len(s.words) for s in t.sentences)
 
 
-def _transcribe_worker(audio: str, out: str, duration: float, cfg_dict: dict, q) -> None:
+def _hints(job_dir: Path, meta: VideoMeta, cfg: Config) -> str | None:
+    """Title + channel as Whisper hotwords: names, brands and made-up words get spelled the way the video does."""
+    if not cfg.transcribe.title_hints:
+        return None
+    from .download import INFO
+    from ..models import VideoInfo
+    channel = ""
+    if (job_dir / INFO).exists():
+        try:
+            channel = load_json(VideoInfo, job_dir / INFO).channel
+        except Exception:  # noqa: BLE001
+            pass
+    # punctuated on purpose: with large-v3-turbo a punctuated hint also keeps the transcript punctuated
+    text = " ".join(f"{x.strip().rstrip('.')}." for x in (meta.title, channel) if x and x.strip())
+    return text[:200] or None
+
+
+def _transcribe_worker(audio: str, out: str, duration: float, cfg_dict: dict, hints: str | None, q) -> None:
     try:
-        _transcribe(audio, out, duration, Config.model_validate(cfg_dict), q)
+        _transcribe(audio, out, duration, Config.model_validate(cfg_dict), q, hints)
     except Exception as e:  # report cleanly to parent instead of dumping a traceback
         q.put(("error", f"{type(e).__name__}: {e}"))
         raise SystemExit(1)
 
 
-def _transcribe(audio: str, out: str, duration: float, cfg: Config, q) -> None:
+def _transcribe(audio: str, out: str, duration: float, cfg: Config, q, hints: str | None = None) -> None:
     from faster_whisper import WhisperModel  # heavy import only in the child
 
     tc = cfg.transcribe
     q.put(("progress", None, f"Loading Whisper {tc.model}…"))
-    model = WhisperModel(tc.model, device="cpu", compute_type=tc.compute_type, cpu_threads=tc.threads)
+    model = WhisperModel(tc.model, device="cpu", compute_type=tc.compute_type,
+                         cpu_threads=tc.threads or (os.cpu_count() or 4))
 
     segments, info = model.transcribe(
         audio,
@@ -82,6 +101,7 @@ def _transcribe(audio: str, out: str, duration: float, cfg: Config, q) -> None:
         vad_filter=tc.vad,
         vad_parameters={"min_silence_duration_ms": 500},
         condition_on_previous_text=False,  # avoids runaway repetition loops on music/noise
+        hotwords=hints,
     )
 
     words: list[Word] = []

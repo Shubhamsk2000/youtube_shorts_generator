@@ -9,15 +9,16 @@ download:
   min_free_disk_gb: 3.0
 
 transcribe:
-  model: small.en           # base.en = ~2x faster, less accurate on loud/music content
+  model: large-v3-turbo     # most accurate that's still faster than realtime on 2 vCPU (1.8x; small.en = 2.8x, more mistakes)
   compute_type: int8
-  threads: 4
+  threads: 0                # 0 = all CPU cores
   beam_size: 5
   vad: true
   min_word_prob: 0.0        # words below this are dropped (0 = keep all)
+  title_hints: true         # title + channel as Whisper hints: names spelled right, and turbo keeps its punctuation
 
 sentences:
-  max_words: 30             # split long run-on sentences
+  max_words: 20             # split long run-on sentences (shorter units = clip edges closer to the hook / payoff)
   max_gap_s: 1.0            # a pause longer than this starts a new sentence
 
 select:                     # "Find moments" (Gemini free tier)
@@ -28,6 +29,9 @@ select:                     # "Find moments" (Gemini free tier)
   min_clip_s: 15
   max_clip_s: 60
   min_score: 4              # 0-10; kept low on purpose, you review the picks
+  min_hook_score: 5         # after the editor pass: drop clips whose first line won't stop the scroll
+  min_standalone_score: 5   # ...or that only make sense if you watched the video
+  trim_lead_fillers: true   # open on the first real word: "And now we're back..." -> "we're back..."
   max_clips: 25
   offline_fallback: true    # if Gemini is down, pick moments with a heuristic
   refine: true              # 2nd "editor" pass: compares all picks, tightens hooks, writes hook text/title/hashtags

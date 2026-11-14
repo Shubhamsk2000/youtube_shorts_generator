@@ -21,16 +21,17 @@ class DownloadCfg(_Strict):
 
 
 class TranscribeCfg(_Strict):
-    model: str = "small.en"
+    model: str = "large-v3-turbo"
     compute_type: str = "int8"
-    threads: int = 4
+    threads: int = 0             # 0 = all CPU cores
     beam_size: int = 5
     vad: bool = True
     min_word_prob: float = 0.0
+    title_hints: bool = True   # pass the video title / channel to Whisper so names and terms are spelled right
 
 
 class SentenceCfg(_Strict):
-    max_words: int = 30
+    max_words: int = 20
     max_gap_s: float = 1.0
 
 
@@ -42,6 +43,9 @@ class SelectCfg(_Strict):
     min_clip_s: float = 15.0
     max_clip_s: float = 60.0
     min_score: float = 4.0       # deliberately low: a human reviews the picks
+    min_hook_score: float = 5.0  # after the editor pass: drop clips whose opening won't stop the scroll
+    min_standalone_score: float = 5.0  # ...or that need the rest of the video to make sense
+    trim_lead_fillers: bool = True  # start on the first real word ("And now we're back" -> "we're back")
     max_clips: int = 25
     max_overlap_s: float = 2.0   # two picks sharing more than this are duplicates
     temperature: float = 0.2
