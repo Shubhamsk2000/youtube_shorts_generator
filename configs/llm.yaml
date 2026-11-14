@@ -19,7 +19,9 @@ media:
   provider: gemini
   models: []
 
-tasks: {}
+tasks:
+  shorts.select: {provider: nvidia}   # uses providers.nvidia.models (nemotron)
+  shorts.refine: {provider: nvidia}
   # Example: send only the shorts clip picker to NVIDIA's free endpoint:
   # shorts.select: {provider: nvidia, models: [meta/llama-3.3-70b-instruct]}
 
