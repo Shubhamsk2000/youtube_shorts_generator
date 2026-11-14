@@ -149,7 +149,7 @@ export function ClipsPanel({ job, onSeek, onJob }: { job: Job; onSeek: (t: numbe
           Quick low-res previews · use Export HD for the upload-quality version
         </span>
         <span className="flex flex-wrap items-center gap-3">
-        <ModelPicker />
+        <ModelPicker up />
         <button
           onClick={repick}
           disabled={repicking || isActive(job.status) || isExporting(job)}
@@ -251,11 +251,25 @@ function ClipCard({
 
       <div className="flex flex-1 flex-col gap-2.5 p-3.5">
         <h3 className="text-sm leading-snug font-semibold text-balance">{c.title}</h3>
-        {(c.hook_text || (c.heat != null && c.heat >= 0.6)) && (
+        {(c.hook_text || c.show_hook === false || c.loop || (c.heat != null && c.heat >= 0.6)) && (
           <div className="flex flex-wrap gap-1.5">
-            {c.hook_text && (
-              <span className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[11px] font-medium" title="On-screen hook text">
-                {c.hook_text}
+            {c.show_hook === false ? (
+              <span
+                className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[11px] font-medium text-muted"
+                title="The first spoken line already states the premise, so no text banner is shown"
+              >
+                Spoken hook · no banner
+              </span>
+            ) : (
+              c.hook_text && (
+                <span className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[11px] font-medium" title="On-screen hook text">
+                  {c.hook_text}
+                </span>
+              )
+            )}
+            {c.loop && (
+              <span className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[11px] font-medium text-muted" title="The last line leads back into the first: replays without a seam">
+                Loops
               </span>
             )}
             {c.heat != null && c.heat >= 0.6 && (

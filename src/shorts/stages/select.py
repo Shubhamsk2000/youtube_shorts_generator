@@ -12,11 +12,15 @@ import re
 from pathlib import Path
 
 from ..config import Config, SelectCfg
-from ..models import Clip, ClipScores, Selection, Sentence, Transcript, VideoInfo, VideoMeta, load_json, save_json
+from ..models import (AudioSignals, Clip, ClipScores, Selection, Sentence, Transcript, VideoInfo, VideoMeta, load_json,
+                      save_json)
 from common.progress import Reporter
+from . import signals
+from .signals import Mark
 
 OUT = "selection.json"
 PAD_LEAD, PAD_TAIL = 0.15, 0.4  # seconds of air before/after the speech
+PAD_TAIL_PAYOFF = 0.8           # more air when the payoff is the last line: let the moment land
 CACHE_DIR = "llm_cache"  # keyed by model + full request, so prompt edits invalidate it
 CTX_BEFORE, CTX_AFTER = 6, 4  # sentences of context the editor pass sees (and may extend the clip into)
 
@@ -27,6 +31,11 @@ LEAD_PHRASES = [("all", "right"), ("you", "know"), ("i", "mean")]
 # a clip that opens on one of these probably points at something the viewer hasn't seen
 DANGLING = {"he", "she", "they", "him", "her", "them", "his", "their", "it", "it's", "this", "that", "that's",
             "these", "those", "there"}
+# endings that kill a Short: plugs, sponsors, "go watch the full video"
+PROMO = re.compile(
+    r"\b(check (it|them|this) out|link (is )?(in|below)|in the description|go watch|watch (our|my|the) (new|full)|"
+    r"(new|full) video|available (at|in|on|now)|sponsor(ed)?|use (my |the )?code|promo code|download (it|the app)|"
+    r"prime video|wherever you buy|retailers|shop now|merch|go to \w+\.(com|org))\b|\w\.(com|org)\b", re.I)
 TRANSITIONS = ("next", "now let's", "let's move", "moving on", "okay so", "alright so", "so now", "up next", "after that")
 
 SYSTEM = """You are the lead short-form editor for a top YouTube channel. You have cut thousands of \
@@ -38,8 +47,8 @@ PROMPT = """Video: "{title}"{channel}
 
 {lines}
 
-Find EVERY moment in this part that could work as a standalone short ({min_s:.0f}-{max_s:.0f} seconds; 20-45 s is
-the sweet spot unless a story needs longer). Be generous: a human reviews your picks, so include borderline ones
+Find EVERY moment in this part that could work as a standalone short ({min_s:.0f}-{max_s:.0f} seconds; 25-45 s is
+the sweet spot: the most-viewed Shorts on YouTube are almost all under 47 s). Be generous: a human reviews your picks, so include borderline ones
 too and let the scores say how good they are. This part is {minutes:.0f} minutes long: expect around {target}
 candidates (about one per 1-2 minutes of content); return fewer only if the content truly has nothing.
 
@@ -50,6 +59,12 @@ Build every clip as HOOK -> TENSION -> PAYOFF:
 3. end_id = the payoff line, or one or two lines after it if they carry the reaction. Never beyond that.
 
 What goes viral:
+- THE FIRST SENTENCE STATES THE PREMISE: what is happening and what is at stake, the way a title would, in under
+  3 seconds. The biggest Shorts on YouTube (billions of views) open like this: "Can you slice a bullet with a
+  katana?", "Guess the gift and you win it", "I'll give you $10,000 if you fill this with water in 2 minutes",
+  "This is how you open a $100,000 car door". The weakest ones open with lines that need context: "Have a good
+  day, Panther", "What happened?", "Jimmy, this place is legendary". Look for the sentence where someone SAYS the
+  premise or the challenge out loud, and start there.
 - THE FIRST LINE IS EVERYTHING. The viewer decides in 1-2 seconds. Start ON the hook: a bold claim, money or
   stakes, a question, conflict, a shocking statement, or the instant before something big happens.
   Never start on filler ("so", "okay", "alright", "um", "anyway", greetings, recaps, rules being explained).
@@ -57,7 +72,8 @@ What goes viral:
 - It makes sense to someone who has NOT seen the video: no unexplained "he/that/this one" in the opening, no
   "next" / "now we're back" / "for this challenge" openers that point at the rest of the video.
 - It has a payoff inside the clip: a result, a twist, a punchline, a big reaction, a reveal. End right after it
-  (a reaction to the payoff is a great last beat). Never end mid-explanation.
+  (a reaction to the payoff is a great last beat). Never end mid-explanation, and never on a plug ("go check it
+  out", "link in the description", sponsors, "go watch the full video"): those endings kill a Short.
 - Tension and stakes: competition, money on the line, someone about to win or lose, a risky decision, a fail.
 - Strong emotion is a signal: screaming, laughing, disbelief ("no way", "oh my god"), trash talk, celebration.
 - For gameplay / challenge videos the best shorts are clutch moments, near-misses, fails, eliminations,
@@ -117,7 +133,8 @@ REFINE_PROMPT = """Video: "{title}"{channel}
 {about}A first pass proposed the candidate shorts below. Each shows the transcript around the clip as
 [sentence id] (mm:ss) text; lines marked ">" are currently in the clip, "*" marks the payoff line, the others are
 context you may use. "Opens with" is exactly what the viewer hears first (filler words are already cut).
-"Check:" lines are automatic warnings: confirm or fix each one.{heat_note}
+"Missing for a cold viewer" is what the first pass thought the opening does not explain. "Check:" lines are
+automatic warnings: confirm or fix each one.{heat_note}
 
 {candidates}
 
@@ -125,12 +142,15 @@ You are now the final editor. Compare ALL candidates against each other (they co
 each one through these tests, as a viewer scrolling Shorts who has NEVER seen this video:
 - 2-second test: would the opening words alone stop the scroll? A question, a number, stakes, conflict or a bold
   claim beats any setup.
+- Premise test: does the first sentence say what is happening and what is at stake, like a title would?
 - Cold-viewer test: is every person, object and rule in the first 5 seconds understandable without the video?
 - Payoff test: does the clip deliver what its hook promises, and end within a beat of it?
 - Share test: would someone send it to a friend or replay it (surprise, laugh, outrage, "no way")?
 Then for each candidate:
-1. keep: false if it fails the cold-viewer or payoff test badly, or is a near-duplicate of a better candidate.
-   Otherwise keep it and let the scores show its weaknesses: a human reviews every pick.
+1. keep: false ONLY if it has no payoff at all or is a near-duplicate of a better candidate. Missing context is
+   NOT a reason to drop: if 3-7 on-screen words can supply what a cold viewer is missing ("His car, dropped from
+   a helicopter"), keep the clip and write that setup as hook_text. Let the scores show its weaknesses: a human
+   reviews every pick.
 2. Tighten it: move start_id LATER if the first lines are setup/filler, so the clip opens on its strongest line;
    move start_id EARLIER only if a crucial line for understanding is missing. end_id: the payoff, or right after
    its reaction; cut trailing transitions to the next segment. payoff_id: the payoff line of the final clip. Stay
@@ -139,10 +159,21 @@ Then for each candidate:
    typical one 5-6, and at most two candidates may get 9+ on any dimension. hook_score judges the NEW first line,
    standalone_score the cold-viewer test.
 4. Write the packaging:
-   - hook_text: on-screen text shown over the first 3 seconds. 3-7 words, creates a curiosity gap or states the
-     stakes, makes people stay. Not a spoiler of the payoff, no emojis, no hashtags.
-     Good: "He bet $10,000 on one throw", "Nobody expected this ending", "I can't believe he did this".
-   - title: the Shorts title, max 60 chars, curiosity + stakes, no hashtags.
+   - opening_states_premise: true if the first spoken sentence of the FINAL clip already states the premise and
+     the stakes on its own (then no text banner is needed, the captions carry it).
+   - hook_text: on-screen text shown over the first 3 seconds when the spoken opening does NOT state the premise:
+     3-7 words that do it instead. If something is missing for a cold viewer, the text SUPPLIES it: name the
+     setup and the stakes plainly ("His $40K car, dropped from a helicopter", "$100K if he beats a pro").
+     Only when nothing is missing may it tease instead ("Nobody expected this ending"). Not a spoiler of the
+     payoff, no emojis, no hashtags, and never a copy of the title: the title is read before the clip, the text is
+     read over its first seconds, so they do different jobs.
+   - loops: true if the last line of the final clip sets up or echoes its first line (a question the opening
+     answers, the same object or stakes), so the Short replays without a seam. When nothing is lost, prefer the
+     end_id that makes this true.
+   - title: the Shorts title, max 60 chars, no hashtags: the premise in as few words as possible, with the
+     concrete number or object. Shapes that win billions of views: "Flip a Coin, Win $30,000",
+     "Katana Vs Bullet", "Would You Fly To Paris For A Baguette?", "How Much Tape To Stop A Lamborghini?",
+     "$100,000,000 Car Doors".
    - description: 1-2 sentences for the upload description.
    - hashtags: 3-5 relevant hashtags (with #, include #shorts).
    - emphasis_words: 0-4 spoken words in the final clip worth highlighting.
@@ -166,6 +197,8 @@ REFINE_SCHEMA = {
                     "payoff_score": {"type": "INTEGER"},
                     "energy_score": {"type": "INTEGER"},
                     "hook_text": {"type": "STRING"},
+                    "opening_states_premise": {"type": "BOOLEAN"},
+                    "loops": {"type": "BOOLEAN"},
                     "title": {"type": "STRING"},
                     "description": {"type": "STRING"},
                     "hashtags": {"type": "ARRAY", "items": {"type": "STRING"}},
@@ -182,6 +215,11 @@ REFINE_SCHEMA = {
 
 HEAT_NOTE = ("\n🔥 = viewers rewatched this part a lot (YouTube \"Most replayed\"), 🔥🔥 = the most. "
              "That is real audience data: weigh it heavily.")
+SIGNAL_NOTE = ("\n🔊 = one of the loudest lines of the video (shouting, a big reaction). "
+               "💥 = a loud non-speech moment right after the line (crash, explosion, screaming, laughter), "
+               "💥💥 = a long one, measured from the audio. A 💥💥 is very often the payoff: prefer clips that contain "
+               "one and end the clip ON that line, so it ends on the sound. But a 💥 is only a hint: never end a clip "
+               "before it has delivered what its first line promised just to land on a sound.")
 
 
 def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, force: bool = False,
@@ -201,15 +239,16 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, force: bool = False,
         from .download import load_info
 
         info = load_info(job_dir, meta, cfg) if cfg.select.use_heatmap or cfg.select.refine else None
+        sig, marks = _audio(job_dir, t, cfg.select, force, report)
         try:
-            sel = _select_llm(t, meta, cfg.select, job_dir / CACHE_DIR, report, refresh=force, info=info)
+            sel = _select_llm(t, meta, cfg.select, job_dir / CACHE_DIR, report, refresh=force, info=info, marks=marks)
         except Exception as e:  # noqa: BLE001  (any LLM failure -> offline fallback)
             from common.llm import LLMError
             if not cfg.select.offline_fallback:
                 raise
             reason = str(e) if isinstance(e, LLMError) else f"{type(e).__name__}: {e}"
             report(None, f"Gemini failed ({reason}); using offline picks")
-            sel = select_heuristic(t, cfg.select, heat_fn=heat_fn(info, cfg.select))
+            sel = select_heuristic(t, cfg.select, heat_fn=heat_fn(info, cfg.select), sig=sig, marks=marks)
             sel.note = f"Gemini unavailable: {reason}. These are rough offline picks; Retry later for AI picks."
     save_json(sel, out)
     return sel, describe(sel)
@@ -224,6 +263,24 @@ def describe(sel: Selection, cached: bool = False) -> str:
     else:
         msg = f"{n} offline pick{'s' * (n != 1)} (Gemini unavailable)"
     return msg + (" · cached" if cached else "")
+
+
+def _audio(job_dir: Path, t: Transcript, sc: SelectCfg, force: bool,
+           report: Reporter) -> tuple[AudioSignals | None, dict[int, Mark] | None]:
+    """Loudness marks for the picker; never fails the stage."""
+    if not sc.use_audio:
+        return None, None
+    try:
+        report(None, "Reading audio levels…")
+        sig = signals.run(job_dir, t, force=force)
+        if sig is None:
+            return None, None
+        marks = signals.sentence_marks(sig, t.sentences, loud_top=sc.loud_top_fraction, burst_min_s=sc.burst_min_s)
+        report(None, f"Audio: {signals.describe(marks)}")
+        return sig, marks
+    except Exception as e:  # noqa: BLE001
+        report(None, f"Audio signals unavailable ({type(e).__name__}: {e}); picking from the transcript only")
+        return None, None
 
 
 def _has_key() -> bool:
@@ -264,16 +321,26 @@ def heat_fn(info: VideoInfo | None, sc: SelectCfg):
     return heat
 
 
-def _line(s: Sentence, heat) -> str:
+def _line(s: Sentence, heat, marks: dict[int, Mark] | None = None) -> str:
     mark = ""
     if heat:
         h = heat(s.start, s.end)
         mark = " 🔥🔥" if h >= 0.7 else " 🔥" if h >= 0.45 else ""
+    m = marks.get(s.id) if marks else None
+    if m and m.loud:
+        mark += " 🔊"
+    if m and m.burst_after_s:
+        mark += " 💥💥" if m.burst_after_s >= 2.0 else " 💥"
     return f"[{s.id}] ({_mmss(s.start)}) {s.text}{mark}"
 
 
+def _notes(heat, marks) -> str:
+    return (HEAT_NOTE if heat else "") + (SIGNAL_NOTE if marks else "")
+
+
 def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, report: Reporter,
-                refresh: bool = False, info: VideoInfo | None = None) -> Selection:
+                refresh: bool = False, info: VideoInfo | None = None,
+                marks: dict[int, Mark] | None = None) -> Selection:
     from common.llm import generate_json
 
     heat = heat_fn(info, sc)
@@ -287,7 +354,7 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
         report(i / (len(windows) + sc.refine), f"Asking Gemini about {span} ({i + 1}/{len(windows)})…")
         prompt = PROMPT.format(
             title=meta.title, channel=channel, about=about, part=i + 1, parts=len(windows), span=span,
-            heat_note=HEAT_NOTE if heat else "", lines="\n".join(_line(s, heat) for s in win),
+            heat_note=_notes(heat, marks), lines="\n".join(_line(s, heat, marks) for s in win),
             min_s=sc.min_clip_s, max_s=sc.max_clip_s, minutes=(win[-1].end - win[0].start) / 60,
             target=max(3, round((win[-1].end - win[0].start) / 90)),
         )
@@ -302,12 +369,12 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
     report(len(windows) / (len(windows) + sc.refine), f"Checking {len(raw)} proposed moments…")
     # keep some spare candidates for the editor pass to choose from
     wide = sc.model_copy(update={"max_clips": sc.max_clips + 10}) if sc.refine else sc
-    clips, rejected = validate(raw, t.sentences, meta.duration, wide, heat)
+    clips, rejected = validate(raw, t.sentences, meta.duration, wide, heat, marks=marks)
     refined = False
     if sc.refine and clips:
         report(len(windows) / (len(windows) + 1), f"Editor pass: comparing {len(clips)} candidates…")
         try:
-            clips, rej2 = _refine(clips, t, meta, info, sc, cache_dir, report, refresh, heat)
+            clips, rej2 = _refine(clips, t, meta, info, sc, cache_dir, report, refresh, heat, marks)
             calls += 1
             refined = True
             for k, v in rej2.items():
@@ -320,25 +387,16 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
 
 
 def _refine(clips: list[Clip], t: Transcript, meta: VideoMeta, info: VideoInfo | None, sc: SelectCfg,
-            cache_dir: Path, report: Reporter, refresh: bool, heat) -> tuple[list[Clip], dict[str, int]]:
+            cache_dir: Path, report: Reporter, refresh: bool, heat,
+            marks: dict[int, Mark] | None = None) -> tuple[list[Clip], dict[str, int]]:
     from common.llm import generate_json
 
     ss = t.sentences
     by_id = {s.id: i for i, s in enumerate(ss)}
-    blocks, cids = [], {}
-    for n, c in enumerate(sorted(clips, key=lambda c: c.start), 1):
-        cid = f"C{n}"
-        cids[cid] = c
-        ia, ib = by_id[c.start_sentence], by_id[c.end_sentence]
-        lo, hi = max(0, ia - CTX_BEFORE), min(len(ss) - 1, ib + CTX_AFTER)
-        lines = [("*" if ss[j].id == c.payoff_sentence else ">" if ia <= j <= ib else " ") + " " + _line(ss[j], heat)
-                 for j in range(lo, hi + 1)]
-        checks = "".join(f"\nCheck: {w}" for w in lint(c, ss))
-        blocks.append(f"### {cid} · {c.duration:.0f}s · first-pass score {c.score:g} · \"{c.title}\"\n"
-                      f"Opens with: \"{_opening(c, ss)}\"{checks}\n" + "\n".join(lines))
+    blocks, cids = candidate_blocks(clips, ss, heat, marks)
     channel, about = _context(meta, info)
     prompt = REFINE_PROMPT.format(title=meta.title, channel=channel, about=about,
-                                  heat_note=HEAT_NOTE if heat else "", candidates="\n\n".join(blocks),
+                                  heat_note=_notes(heat, marks), candidates="\n\n".join(blocks),
                                   min_s=sc.min_clip_s, max_s=sc.max_clip_s)
     data, _ = generate_json(
         prompt, REFINE_SCHEMA, models=[sc.model, *sc.fallback_models], cache_dir=cache_dir, system=SYSTEM,
@@ -353,7 +411,7 @@ def _refine(clips: list[Clip], t: Transcript, meta: VideoMeta, info: VideoInfo |
         orig = {"start_id": c.start_sentence, "end_id": c.end_sentence, "title": c.title, "hook": c.hook,
                 "reason": c.reason, "hook_score": c.scores.hook, "standalone_score": c.scores.standalone,
                 "payoff_score": c.scores.payoff, "energy_score": c.scores.energy,
-                "emphasis_words": c.emphasis_words, "payoff_id": c.payoff_sentence}
+                "emphasis_words": c.emphasis_words, "payoff_id": c.payoff_sentence, "context": c.context}
         if r is None:
             raw.append(orig)  # the editor skipped it: keep the first-pass version
             continue
@@ -373,10 +431,30 @@ def _refine(clips: list[Clip], t: Transcript, meta: VideoMeta, info: VideoInfo |
         raw.append({**orig, **{k: v for k, v in r.items() if v not in (None, "", [])},
                     "start_id": a, "end_id": b, "hook": hook,
                     "reason": r.get("reason") or c.reason})
-    clips2, rejected = validate(raw, ss, meta.duration, sc, heat, final=True)
+    clips2, rejected = validate(raw, ss, meta.duration, sc, heat, final=True, marks=marks)
     if dropped:
         rejected["dropped by editor pass"] = dropped
     return clips2, rejected
+
+
+def candidate_blocks(clips: list[Clip], ss: list[Sentence], heat=None,
+                     marks: dict[int, Mark] | None = None) -> tuple[list[str], dict[str, Clip]]:
+    """What the editor pass sees for each candidate: the clip in its context, what it opens with, what a
+    cold viewer is missing and the automatic warnings."""
+    by_id = {s.id: i for i, s in enumerate(ss)}
+    blocks, cids = [], {}
+    for n, c in enumerate(sorted(clips, key=lambda c: c.start), 1):
+        cid = f"C{n}"
+        cids[cid] = c
+        ia, ib = by_id[c.start_sentence], by_id[c.end_sentence]
+        lo, hi = max(0, ia - CTX_BEFORE), min(len(ss) - 1, ib + CTX_AFTER)
+        lines = [("*" if ss[j].id == c.payoff_sentence else ">" if ia <= j <= ib else " ") + " " + _line(ss[j], heat, marks)
+                 for j in range(lo, hi + 1)]
+        missing = f"\nMissing for a cold viewer: {c.context}" if c.context else ""
+        checks = "".join(f"\nCheck: {w}" for w in lint(c, ss))
+        blocks.append(f"### {cid} · {c.duration:.0f}s · first-pass score {c.score:g} · \"{c.title}\"\n"
+                      f"Opens with: \"{_opening(c, ss)}\"{missing}{checks}\n" + "\n".join(lines))
+    return blocks, cids
 
 
 def make_windows(sentences: list[Sentence], window_s: float, overlap_s: float) -> list[list[Sentence]]:
@@ -398,8 +476,8 @@ def make_windows(sentences: list[Sentence], window_s: float, overlap_s: float) -
 
 # ---------------------------------------------------------------- validation (pure)
 
-def validate(raw: list[dict], sentences: list[Sentence], duration: float,
-             sc: SelectCfg, heat=None, final: bool = False) -> tuple[list[Clip], dict[str, int]]:
+def validate(raw: list[dict], sentences: list[Sentence], duration: float, sc: SelectCfg, heat=None,
+             final: bool = False, marks: dict[int, Mark] | None = None) -> tuple[list[Clip], dict[str, int]]:
     """Turn LLM picks into clean clips: snap/fit length, keep the payoff in, cut lead-in filler, drop low
     scores and duplicates, rank. final=True (after the editor pass) also applies the hook/standalone minimums."""
     rejected: dict[str, int] = {}
@@ -421,7 +499,7 @@ def validate(raw: list[dict], sentences: list[Sentence], duration: float,
         ia, ib = by_id[a], by_id[b]
         payoff = _int(r.get("payoff_id"))
         ip = by_id.get(payoff) if payoff is not None else None
-        max_s = sc.max_clip_s - PAD_LEAD - PAD_TAIL  # room for the padding, so the final clip respects max_clip_s
+        max_s = sc.max_clip_s - PAD_LEAD - PAD_TAIL_PAYOFF  # room for the padding, so the final clip respects max_clip_s
         if ip is not None and ip >= ia:
             if ip > ib:   # the clip stops before its own payoff: extend it
                 ib = ip
@@ -431,13 +509,16 @@ def validate(raw: list[dict], sentences: list[Sentence], duration: float,
         else:
             ip = None
         ia, ib = fit_span(sentences, ia, ib, sc.min_clip_s, max_s)
+        if ia is not None and sc.trim_promo:
+            ib = _drop_promo_tail(sentences, ia, ib, ip, sc.min_clip_s)
         if ia is None:
             reject(f"can't fit {sc.min_clip_s:g}-{sc.max_clip_s:g}s"); continue
         scores = ClipScores(
             hook=_clamp(r.get("hook_score")), standalone=_clamp(r.get("standalone_score")),
             payoff=_clamp(r.get("payoff_score")), energy=_clamp(r.get("energy_score")),
         )
-        start, end = pad(sentences, ia, ib, duration)
+        start, end = pad(sentences, ia, ib, duration, tail=PAD_TAIL_PAYOFF if ip == ib else None)
+        end = _keep_reaction(sentences, ib, start, end, duration, sc, marks)
         if sc.trim_lead_fillers:
             k = lead_trim(sentences[ia])
             if k:
@@ -450,7 +531,8 @@ def validate(raw: list[dict], sentences: list[Sentence], duration: float,
         h = heat(start, end) if heat else None
         # viewers' replays are the strongest signal there is: lift the clips they rewatched
         bonus = sc.heat_bonus * max(0.0, (h - 0.4) / 0.6) if h is not None else 0.0
-        score = round(min(10.0, scores.overall() + bonus), 1)
+        loop = bool(r.get("loops"))
+        score = round(min(10.0, scores.overall() + bonus + (sc.loop_bonus if loop else 0.0)), 1)
         if score < sc.min_score:
             reject("score below threshold"); continue
         if final and scores.hook < sc.min_hook_score:
@@ -467,6 +549,9 @@ def validate(raw: list[dict], sentences: list[Sentence], duration: float,
             emphasis_words=[str(w) for w in (r.get("emphasis_words") or [])][:4],
             text=" ".join(opening),
             payoff_sentence=sentences[ip].id if ip is not None and ia <= ip <= ib else None,
+            show_hook=not bool(r.get("opening_states_premise")),
+            context=str(r.get("context") or "").strip()[:200],
+            loop=loop,
             hook_text=str(r.get("hook_text") or "").strip()[:80],
             description=str(r.get("description") or "").strip()[:500],
             hashtags=[_tag(x) for x in (r.get("hashtags") or []) if _tag(x)][:6],
@@ -483,6 +568,18 @@ def validate(raw: list[dict], sentences: list[Sentence], duration: float,
     for i, c in enumerate(kept, 1):
         c.rank = i
     return kept, rejected
+
+
+def _keep_reaction(sentences: list[Sentence], ib: int, start: float, end: float, duration: float,
+                   sc: SelectCfg, marks: dict[int, Mark] | None) -> float:
+    """A crash / scream / laugh right after the last line is the ending: keep it in the clip."""
+    m = marks.get(sentences[ib].id) if marks else None
+    if not m or not m.burst_after_s:
+        return end
+    nxt = sentences[ib + 1].start if ib + 1 < len(sentences) else (duration or float("inf"))
+    want = sentences[ib].end + m.burst_after_s + PAD_TAIL
+    room = start + sc.max_clip_s
+    return round(max(end, min(want, nxt, room, duration or want)), 3)
 
 
 def _norm(w: str) -> str:
@@ -524,13 +621,22 @@ def lint(c: Clip, ss: list[Sentence]) -> list[str]:
         out.append("ends on a question: is it answered inside the clip?")
     if last and last.text.lower().lstrip(" ,.").startswith(TRANSITIONS):
         out.append("last line sounds like a transition to the next segment: end earlier?")
+    if last and PROMO.search(last.text):
+        out.append("ends on a plug / promotion: end on the payoff instead")
     if c.payoff_sentence is None:
         out.append("no payoff line marked: where does it land?")
     elif c.end_sentence - c.payoff_sentence > 2:
         out.append("runs on after the payoff: end sooner?")
-    if c.duration > 50:
-        out.append(f"{c.duration:.0f}s is long for a short: does every line earn its place?")
+    if c.duration > 45:
+        out.append(f"{c.duration:.0f}s is long for a short (top Shorts are 25-45 s): does every line earn its place?")
     return out
+
+
+def _drop_promo_tail(ss: list[Sentence], ia: int, ib: int, ip: int | None, min_s: float) -> int:
+    """Cut trailing plug / sponsor lines (never the payoff, never below the minimum length)."""
+    while ib > ia and (ip is None or ib > ip) and PROMO.search(ss[ib].text) and ss[ib - 1].end - ss[ia].start >= min_s:
+        ib -= 1
+    return ib
 
 
 def _int(v) -> int | None:
@@ -605,8 +711,10 @@ _HOOK = re.compile(
 )
 
 
-def select_heuristic(t: Transcript, sc: SelectCfg, heat_fn=None) -> Selection:
-    """Score windows that start at each sentence by hook words / punctuation density. Crude but offline."""
+def select_heuristic(t: Transcript, sc: SelectCfg, heat_fn=None, sig: AudioSignals | None = None,
+                     marks: dict[int, Mark] | None = None) -> Selection:
+    """Score windows that start at each sentence by hook words / punctuation density, plus how loud the
+    audio gets in them and whether a reaction follows. Crude but offline."""
     ss = t.sentences
     raw = []
     target = min(max(sc.min_clip_s, 35.0), sc.max_clip_s)
@@ -619,9 +727,18 @@ def select_heuristic(t: Transcript, sc: SelectCfg, heat_fn=None) -> Selection:
         density = len(_HOOK.findall(span_text)) / max(1, len(span_text.split())) * 40
         h = min(10, 3 + 2.5 * hook_hits)
         e = min(10, 3 + density)
+        p = 5
+        if sig:
+            e = max(e, round(10 * signals.energy01(sig, s.start, ss[j].end)))
+        if marks:
+            if marks.get(s.id) and marks[s.id].loud:
+                h = min(10, h + 1.5)
+            if any(marks.get(x.id) and marks[x.id].burst_after_s for x in ss[i:j + 1]):
+                p = 7
         raw.append({"start_id": s.id, "end_id": ss[j].id, "title": s.text[:60], "hook": s.text,
-                    "reason": "Offline pick: hook words / punctuation in the opening line.",
-                    "hook_score": h, "standalone_score": 5, "payoff_score": 5, "energy_score": e})
+                    "reason": "Offline pick: hook words / punctuation in the opening line"
+                              + (", loud audio" if e >= 7 else "") + (", a reaction inside" if p > 5 else "") + ".",
+                    "hook_score": h, "standalone_score": 5, "payoff_score": p, "energy_score": e})
     offline = sc.model_copy(update={"max_clips": max(1, min(sc.max_clips, len(ss) // 40 + 3))})
-    clips, rejected = validate(raw, ss, t.duration, offline, heat_fn)
+    clips, rejected = validate(raw, ss, t.duration, offline, heat_fn, marks=marks)
     return Selection(source="heuristic", candidates=len(raw), rejected=rejected, clips=clips)

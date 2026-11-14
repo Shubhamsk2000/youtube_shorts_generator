@@ -28,7 +28,7 @@ from ..models import Clip, ReframePlan, Selection, Shot, VideoMeta, load_json
 from common.progress import Reporter
 from common import ffmpeg
 from .captions import ass_path
-from .pacing import edits_path, kept_duration, load_keep
+from .pacing import edits_path, kept_duration, load_edits
 from .reframe import plan_path, split_panel_frac
 from .select import OUT as SELECTION
 
@@ -45,7 +45,7 @@ def clip_file(job_dir: Path, clip: Clip, cfg: Config, rs: RenderCfg | None = Non
     rs = rs or cfg.preview
     key = json.dumps([round(clip.start, 3), round(clip.end, 3), rs.model_dump(mode="json"),
                       cfg.audio.model_dump(), _digest(plan_path(job_dir, clip)), _digest(ass_path(job_dir, clip)),
-                      _digest(edits_path(job_dir, clip)), "v3"], sort_keys=True)
+                      _digest(edits_path(job_dir, clip)), "v4"], sort_keys=True)
     return f"{clip.id}-{hashlib.sha1(key.encode()).hexdigest()[:6]}.mp4"
 
 
@@ -96,14 +96,16 @@ def render_clip(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config, rs: Render
     ass = ass if (cfg.captions.enabled or cfg.hook.enabled) and ass.exists() else None
     plan_p = plan_path(job_dir, c)
     plan = load_json(ReframePlan, plan_p) if cfg.reframe.enabled and plan_p.exists() else None
-    keep = load_keep(job_dir, c) if cfg.pacing.enabled else None
+    keep, flash = load_edits(job_dir, c)
+    keep = keep if cfg.pacing.enabled else None
+    flash = flash if cfg.cold_open.enabled else None
     src = job_dir / meta.file
     measured = None
     if two_pass_loudness:
         on_progress(0.0)
-        measured = measure_loudness(src, c, keep, cfg.audio)
+        measured = measure_loudness(src, c, keep, cfg.audio, flash)
     tmp = dst.with_name(dst.stem + ".tmp.mp4")
-    _render(src, tmp, c, meta, rs, plan, cfg.reframe, cfg.audio, keep, ass, measured, on_progress)
+    _render(src, tmp, c, meta, rs, plan, cfg.reframe, cfg.audio, keep, ass, measured, on_progress, flash)
     tmp.replace(dst)
 
 
@@ -122,13 +124,29 @@ def _pre_audio_filters(keep: list[tuple[float, float]] | None, ac: AudioCfg) -> 
     return f
 
 
-def measure_loudness(src: Path, c: Clip, keep, ac: AudioCfg) -> dict | None:
+def _audio_graph(src: Path, c: Clip, keep, flash, ac: AudioCfg, tail: list[str],
+                 in0: int) -> tuple[list[str], list[str]]:
+    """ffmpeg input args and audio filter args for a clip. in0 = index the first audio input will get.
+    With a cold open, the payoff snippet is decoded as its own input and concatenated before the (edited) clip."""
+    pre = _pre_audio_filters(keep, ac)
+    inputs = ["-ss", f"{c.start:.3f}", "-t", f"{c.duration:.3f}", "-i", str(src)]
+    if not flash:
+        return inputs, ["-map", f"{in0}:a:0?", "-af", ",".join([*pre, *tail])]
+    fa, fb = flash
+    inputs = ["-ss", f"{c.start + fa:.3f}", "-t", f"{fb - fa:.3f}", "-i", str(src), *inputs]
+    hp = [f"highpass=f={ac.highpass_hz}"] if ac.highpass_hz > 0 else []
+    graph = (f"[{in0}:a:0]{','.join(hp) or 'anull'}[fl];"
+             f"[{in0 + 1}:a:0]{','.join(pre) or 'anull'}[mn];"
+             f"[fl][mn]concat=n=2:v=0:a=1,{','.join(tail)}[aout]")
+    return inputs, ["-filter_complex", graph, "-map", "[aout]"]
+
+
+def measure_loudness(src: Path, c: Clip, keep, ac: AudioCfg, flash=None) -> dict | None:
     """First loudnorm pass: measure the clip so the second pass can normalise linearly (no pumping)."""
-    chain = ",".join([*_pre_audio_filters(keep, ac),
-                      f"loudnorm=I={ac.loudness_lufs}:TP={ac.true_peak}:LRA=11:print_format=json"])
+    tail = [f"loudnorm=I={ac.loudness_lufs}:TP={ac.true_peak}:LRA=11:print_format=json"]
+    inputs, af = _audio_graph(src.resolve(), c, keep, flash, ac, tail, in0=0)
     proc = subprocess.run(
-        [ffmpeg.require("ffmpeg"), "-hide_banner", "-nostdin", "-ss", f"{c.start:.3f}", "-t", f"{c.duration:.3f}",
-         "-i", str(src.resolve()), "-vn", "-map", "0:a:0?", "-af", chain, "-f", "null", "-"],
+        [ffmpeg.require("ffmpeg"), "-hide_banner", "-nostdin", *inputs, "-vn", *af, "-f", "null", "-"],
         capture_output=True, text=True,
     )
     m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", proc.stderr)
@@ -142,17 +160,20 @@ def measure_loudness(src: Path, c: Clip, keep, ac: AudioCfg) -> dict | None:
         return None
 
 
-def _audio_args(c: Clip, keep, ac: AudioCfg, bitrate: str, measured: dict | None) -> list[str]:
-    dur = kept_duration(keep, c.duration)
+def _audio_tail(c: Clip, keep, flash, ac: AudioCfg, measured: dict | None) -> list[str]:
+    """Filters after the edit: loudness, resampling, fades (on the output timeline)."""
+    dur = kept_duration(keep, c.duration) + (flash[1] - flash[0] if flash else 0.0)
     fade = min(0.15, dur / 4)
     ln = f"loudnorm=I={ac.loudness_lufs}:TP={ac.true_peak}:LRA=11"
     if measured:
         ln += (f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
                f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
                f":offset={measured['target_offset']}:linear=true")
-    chain = [*_pre_audio_filters(keep, ac), ln, "aresample=48000",
-             "afade=t=in:d=0.03", f"afade=t=out:st={dur - fade:.3f}:d={fade:.3f}"]
-    return ["-af", ",".join(chain), "-c:a", "aac", "-b:a", bitrate, "-ar", "48000", "-ac", "2"]
+    return [ln, "aresample=48000", "afade=t=in:d=0.03", f"afade=t=out:st={dur - fade:.3f}:d={fade:.3f}"]
+
+
+def _audio_codec(bitrate: str) -> list[str]:
+    return ["-c:a", "aac", "-b:a", bitrate, "-ar", "48000", "-ac", "2"]
 
 
 def _video_args(rs: RenderCfg) -> list[str]:
@@ -169,7 +190,8 @@ def _kept_frames(n_hint: int, fps: float, keep) -> callable:
 
 
 def _render(src: Path, tmp: Path, c: Clip, meta: VideoMeta, rs: RenderCfg, plan: ReframePlan | None,
-            rc: ReframeCfg, ac: AudioCfg, keep, ass: Path | None, measured: dict | None, on_progress) -> None:
+            rc: ReframeCfg, ac: AudioCfg, keep, ass: Path | None, measured: dict | None, on_progress,
+            flash=None) -> None:
     import cv2
 
     out_w, out_h = rs.width, rs.height
@@ -184,24 +206,28 @@ def _render(src: Path, tmp: Path, c: Clip, meta: VideoMeta, rs: RenderCfg, plan:
     if sh != meta.height:
         vf_dec.append(f"scale={sw}:{sh}:flags={'bilinear' if rs.fast else 'lanczos'}")
     ff = ffmpeg.require("ffmpeg")
-    dec = subprocess.Popen(
-        [ff, "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", f"{c.start:.3f}", "-i", str(src.resolve()),
-         "-t", f"{c.duration:.3f}", "-map", "0:v:0", *(["-vf", ",".join(vf_dec)] if vf_dec else []),
-         "-fps_mode", "passthrough", "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
+
+    def decoder(start: float, dur: float) -> subprocess.Popen:
+        return subprocess.Popen(
+            [ff, "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", f"{start:.3f}", "-i", str(src.resolve()),
+             "-t", f"{dur:.3f}", "-map", "0:v:0", *(["-vf", ",".join(vf_dec)] if vf_dec else []),
+             "-fps_mode", "passthrough", "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+
+    dec = decoder(c.start, c.duration)
     vf = ["setsar=1"]
     if rs.sharpen > 0:
         vf.insert(0, f"unsharp=5:5:{rs.sharpen:.2f}:5:5:0")
     if ass:
         vf.append(f"subtitles=filename={ass.name}")  # run from the captions dir: no path escaping
     err = tempfile.TemporaryFile()
+    a_inputs, a_filters = _audio_graph(src.resolve(), c, keep, flash, ac, _audio_tail(c, keep, flash, ac, measured), in0=1)
     enc = subprocess.Popen(
         [ff, "-hide_banner", "-loglevel", "error", "-y",
          "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{out_w}x{out_h}", "-r", f"{out_fps:.5f}", "-i", "pipe:0",
-         "-ss", f"{c.start:.3f}", "-t", f"{c.duration:.3f}", "-i", str(src.resolve()),
-         "-map", "0:v", "-map", "1:a:0?", "-vf", ",".join(vf),
-         *_audio_args(c, keep, ac, rs.audio_bitrate, measured), *_video_args(rs), "-shortest", str(tmp.resolve())],
+         *a_inputs, "-map", "0:v", *a_filters, "-vf", ",".join(vf),
+         *_audio_codec(rs.audio_bitrate), *_video_args(rs), "-shortest", str(tmp.resolve())],
         stdin=subprocess.PIPE, stderr=err, cwd=ass.parent if ass else None,
     )
     size = sw * sh * 3
@@ -210,6 +236,24 @@ def _render(src: Path, tmp: Path, c: Clip, meta: VideoMeta, rs: RenderCfg, plan:
     interp = cv2.INTER_LINEAR if rs.fast else None
     i = 0  # source frame index (the plan and the edits count source frames)
     try:
+        if flash:  # the cold open: the payoff's frames first, then the clip from its start
+            fa, fb = flash
+            j = int(round(fa * meta.fps / step)) * step
+            want = max(1, int(round((fb - fa) * out_fps)))
+            dec_f = decoder(c.start + fa, fb - fa)
+            try:
+                for _ in range(want):
+                    buf = dec_f.stdout.read(size)
+                    if len(buf) < size:
+                        break
+                    frame = np.frombuffer(buf, np.uint8).reshape(sh, sw, 3)
+                    out = compose(frame, plan.shot_at(j) if plan else None, j, out_w, out_h, meta, rc, cv2, interp)
+                    enc.stdin.write(np.ascontiguousarray(out).tobytes())
+                    j += step
+            finally:
+                dec_f.kill()
+                dec_f.stdout.close()
+                dec_f.wait()
         while True:
             buf = dec.stdout.read(size)
             if len(buf) < size:

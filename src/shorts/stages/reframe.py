@@ -28,17 +28,22 @@ import numpy as np
 from common.paths import MODELS_DIR
 
 from ..config import Config, ReframeCfg
-from ..models import Clip, FaceSample, ReframePlan, Selection, Shot, VideoMeta, load_json, save_json
+from ..models import Clip, FaceSample, ReframePlan, Selection, Shot, TextSample, VideoMeta, load_json, save_json
 from common.progress import Reporter
 from common.ffmpeg import require
 from .select import OUT as SELECTION
 
 REFRAME_DIR = "reframe"
-VERSION = 2
+VERSION = 3
 MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
 MODEL_URL = ("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
              "face_detection_yunet/face_detection_yunet_2023mar.onnx")
 MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+TEXT_MODEL = MODELS_DIR / "text_detection_en_ppocrv3_2023may.onnx"
+TEXT_MODEL_URL = ("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
+                  "text_detection_ppocr/text_detection_en_ppocrv3_2023may.onnx")
+TEXT_MODEL_SHA256 = "03f550c6b406fda8bf54bd8327815f6c7e2edd98cea02348c93d879254366587"
+TEXT_INPUT = (640, 352)   # the detector wants multiples of 32
 
 
 def plan_path(job_dir: Path, clip: Clip) -> Path:
@@ -78,12 +83,18 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
 
     if todo:
         det = _detector(rc)
+        tdet = None
+        if rc.detect_text:
+            try:
+                tdet = _text_detector()
+            except Exception as e:  # noqa: BLE001  (no model / no network: captions just won't dodge text)
+                report(None, f"Text detection unavailable ({type(e).__name__}: {e}); captions may cover on-screen text")
         total = sum(c.duration for c in todo)
         done = 0.0
         for i, c in enumerate(todo):
             def prog(frac: float, c=c, i=i) -> None:
                 report((done + frac * c.duration) / total, f"Clip {i + 1}/{len(todo)}: tracking faces…")
-            plan = analyze(job_dir / meta.file, c, meta, rc, det, prog)
+            plan = analyze(job_dir / meta.file, c, meta, rc, det, prog, tdet)
             save_json(plan, plan_path(job_dir, c))
             done += c.duration
 
@@ -93,24 +104,63 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
             counts[s.mode] += 1
     n = sum(counts.values())
     split = f", {counts['split']} facecam split" if counts["split"] else ""
+    with_text = sum(1 for c in sel.clips if any(t.boxes for t in load_json(ReframePlan, plan_path(job_dir, c)).texts))
+    text = f" · on-screen text in {with_text} clip{'s' * (with_text != 1)}" if with_text else ""
     return (f"{len(sel.clips)} clips · {n} shots: {counts['track']} tracked, {counts['fit']} fit, "
-            f"{counts['center']} centre{split}" + ("" if todo else " · cached"))
+            f"{counts['center']} centre{split}{text}" + ("" if todo else " · cached"))
 
 
 # ---------------------------------------------------------------- analysis (I/O)
 
 def ensure_model() -> Path:
-    if MODEL.exists():
-        return MODEL
-    MODEL.parent.mkdir(parents=True, exist_ok=True)
-    tmp = MODEL.with_suffix(".part")
-    with urllib.request.urlopen(MODEL_URL, timeout=60) as r:
+    return _ensure(MODEL, MODEL_URL, MODEL_SHA256, "face")
+
+
+def ensure_text_model() -> Path:
+    return _ensure(TEXT_MODEL, TEXT_MODEL_URL, TEXT_MODEL_SHA256, "text")
+
+
+def _ensure(path: Path, url: str, sha256: str, what: str) -> Path:
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".part")
+    with urllib.request.urlopen(url, timeout=60) as r:
         tmp.write_bytes(r.read())
-    if hashlib.sha256(tmp.read_bytes()).hexdigest() != MODEL_SHA256:
+    if hashlib.sha256(tmp.read_bytes()).hexdigest() != sha256:
         tmp.unlink()
-        raise RuntimeError("Downloaded face model failed its checksum")
-    tmp.replace(MODEL)
-    return MODEL
+        raise RuntimeError(f"Downloaded {what} model failed its checksum")
+    tmp.replace(path)
+    return path
+
+
+def _text_detector():
+    os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+    import cv2
+
+    m = cv2.dnn_TextDetectionModel_DB(str(ensure_text_model()))
+    m.setBinaryThreshold(0.3)
+    m.setPolygonThreshold(0.5)
+    m.setMaxCandidates(200)
+    m.setUnclipRatio(2.0)
+    m.setInputParams(1.0 / 255.0, TEXT_INPUT, (122.67891434, 116.66876762, 104.00698793), False)
+    return m
+
+
+def detect_text(model, frame: np.ndarray, min_h: float = 0.025) -> list[list[float]]:
+    """Axis-aligned boxes of text in the frame, as fractions; tiny ones (watermarks, UI) are ignored."""
+    import cv2
+
+    img = cv2.resize(frame, TEXT_INPUT, interpolation=cv2.INTER_AREA)
+    quads, _ = model.detect(img)
+    out = []
+    for q in quads or []:
+        q = np.asarray(q, dtype=float)
+        x0, y0 = q[:, 0].min() / TEXT_INPUT[0], q[:, 1].min() / TEXT_INPUT[1]
+        x1, y1 = q[:, 0].max() / TEXT_INPUT[0], q[:, 1].max() / TEXT_INPUT[1]
+        if y1 - y0 >= min_h:
+            out.append([round(max(0.0, x0), 4), round(max(0.0, y0), 4), round(min(1.0, x1), 4), round(min(1.0, y1), 4)])
+    return out
 
 
 def _detector(rc: ReframeCfg):
@@ -120,7 +170,7 @@ def _detector(rc: ReframeCfg):
     return cv2.FaceDetectorYN.create(str(ensure_model()), "", (320, 320), rc.face_score, 0.3, 50)
 
 
-def analyze(src: Path, clip: Clip, meta: VideoMeta, rc: ReframeCfg, det, on_progress) -> ReframePlan:
+def analyze(src: Path, clip: Clip, meta: VideoMeta, rc: ReframeCfg, det, on_progress, text_det=None) -> ReframePlan:
     import cv2
 
     h = rc.analysis_height
@@ -133,9 +183,11 @@ def analyze(src: Path, clip: Clip, meta: VideoMeta, rc: ReframeCfg, det, on_prog
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     step = max(1, round(meta.fps / rc.sample_fps))
+    text_step = max(1, round(meta.fps / rc.text_fps))
     est_frames = max(1, round(clip.duration * meta.fps))
     cuts = [0]
     samples: list[FaceSample] = []
+    texts: list[TextSample] = []
     edges: list[tuple[int, np.ndarray]] = []  # (frame, packed edge map) per sample: finds facecam borders
     prev_small = prev_gray = None
     i = 0
@@ -162,6 +214,8 @@ def analyze(src: Path, clip: Clip, meta: VideoMeta, rc: ReframeCfg, det, on_prog
                      round(float(f[2] / w), 4), round(float(f[3] / h), 4), round(float(f[-1]), 3)]
                     for f in (faces if faces is not None else [])
                 ]))
+            if text_det is not None and i % text_step == 0:
+                texts.append(TextSample(f=i, boxes=detect_text(text_det, frame)))
             prev_small, prev_gray = small, gray
             i += 1
             if i % 15 == 0:
@@ -178,7 +232,32 @@ def analyze(src: Path, clip: Clip, meta: VideoMeta, rc: ReframeCfg, det, on_prog
         cuts, cams = detect_cams(edges, (h, w), samples, cuts, overlays, rc)
     shots = plan_shots(cuts, i, samples, meta.fps, crop_width(meta.width, meta.height), rc, overlays, cams)
     return ReframePlan(key=plan_key(clip, rc), fps=meta.fps, n_frames=i, src_w=meta.width, src_h=meta.height,
-                       shots=shots, samples=samples, overlays=overlays)
+                       shots=shots, samples=samples, overlays=overlays, texts=texts)
+
+
+def visible_text_boxes(plan: ReframePlan, fi: int, rc: ReframeCfg) -> list[tuple[float, float, float, float]]:
+    """Burned-in text near frame `fi`, mapped into the 9:16 output (fractions of its width/height)."""
+    if not plan.texts:
+        return []
+    near = min(plan.texts, key=lambda t: abs(t.f - fi))
+    if abs(near.f - fi) > max(1, int(plan.fps)) or not near.boxes:
+        return []
+    shot = plan.shot_at(fi)
+    out = []
+    if shot.mode == "split":
+        return []  # cam + screen layout: not handled (rarely has burned-in captions)
+    if shot.mode == "fit":
+        fg = 9 / 16 * plan.src_h / plan.src_w        # foreground height as a fraction of the output height
+        top = min(max(rc.fit_y - fg / 2, 0.0), 1.0 - fg)
+        return [(x0, top + y0 * fg, x1, top + y1 * fg) for x0, y0, x1, y1 in near.boxes]
+    cw = crop_width(plan.src_w, plan.src_h)
+    x = shot.x[min(max(fi - shot.start, 0), len(shot.x) - 1)] if shot.x else 0.5
+    left = min(max(x - cw / 2, 0.0), 1.0 - cw)
+    for x0, y0, x1, y1 in near.boxes:
+        if x1 <= left or x0 >= left + cw:
+            continue  # cropped away
+        out.append((max(0.0, (x0 - left) / cw), y0, min(1.0, (x1 - left) / cw), y1))
+    return out
 
 
 # ---------------------------------------------------------------- decisions (pure)

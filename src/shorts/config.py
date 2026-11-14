@@ -41,11 +41,13 @@ class SelectCfg(_Strict):
     window_min: float = 20.0     # transcript sent to Gemini in windows of about this length
     overlap_min: float = 2.0     # windows overlap so a moment on a boundary isn't lost
     min_clip_s: float = 15.0
-    max_clip_s: float = 60.0
+    max_clip_s: float = 50.0
     min_score: float = 4.0       # deliberately low: a human reviews the picks
     min_hook_score: float = 5.0  # after the editor pass: drop clips whose opening won't stop the scroll
     min_standalone_score: float = 5.0  # ...or that need the rest of the video to make sense
     trim_lead_fillers: bool = True  # start on the first real word ("And now we're back" -> "we're back")
+    trim_promo: bool = True      # cut trailing plugs ("go check it out", sponsors, "link in the description")
+    loop_bonus: float = 0.3      # score bonus when the ending leads back into the opening (clean replay)
     max_clips: int = 25
     max_overlap_s: float = 2.0   # two picks sharing more than this are duplicates
     temperature: float = 0.2
@@ -55,6 +57,9 @@ class SelectCfg(_Strict):
     offline_fallback: bool = True  # if Gemini is unreachable, pick moments with a heuristic
     refine: bool = True          # 2nd Gemini pass: compare all picks, tighten hooks, write on-screen text
     use_heatmap: bool = True     # YouTube "Most replayed" data as a signal (when the video has it)
+    use_audio: bool = True       # loudness + reactions (crash, screams, laughter) from the audio as signals
+    loud_top_fraction: float = 0.12  # share of lines marked "loud" for the picker
+    burst_min_s: float = 0.75    # loud non-speech right after a line must last this long to count as a reaction
     heat_bonus: float = 1.5      # score bonus for clips viewers replayed most (0 = off)
 
 
@@ -77,6 +82,8 @@ class ReframeCfg(_Strict):
     fit_dim: float = 0.55           # FIT shots: background brightness
     screen_layout: str = "split"    # facecam over gameplay/screen: "split" (cam top, screen bottom) or "track"
     cam_edge_persistence: float = 0.35  # how steady a cam box border must be (0-1) to count as a facecam overlay
+    detect_text: bool = True        # find burned-in text (the source's own captions, graphics) so ours avoid it
+    text_fps: float = 1.0           # how often to look for it
     split_cam_min: float = 0.30     # SPLIT shots: cam panel height, min/max fraction of the output height
     split_cam_max: float = 0.45
 
@@ -86,14 +93,19 @@ class CaptionCfg(_Strict):
     font: str = "Inter Black"
     size: int = 92               # on a 1080x1920 canvas (scales with the output)
     uppercase: bool = True
-    max_words: int = 3
+    max_words: int = 2
     max_chars: int = 16          # per line, before the line breaks early
     pause_s: float = 0.35        # a pause longer than this starts a new line
     min_word_s: float = 0.08     # words Whisper timed as ~0 s get at least this long
-    position: float = 0.68       # bottom edge of the text, as a fraction of the height
+    position: float = 0.6        # bottom edge of the text, as a fraction of the height
     text_color: str = "#FFFFFF"
     highlight_color: str = "#FFE600"
     emphasis_color: str = "#4ADE80"
+    emphasize_numbers: bool = True  # money and numbers ("$10,000", "100") always in the emphasis colour
+    avoid_text: bool = True      # move a caption line above/below burned-in text it would cover
+    text_margin: int = 24        # px of air between our caption and the source's text (1080x1920 canvas)
+    safe_top: float = 0.30       # captions never move above this (hook banner, Shorts search bar)...
+    safe_bottom: float = 0.78    # ...or below this (title, buttons)
     outline: float = 7
     shadow: float = 3
     pop_scale: float = 1.08      # active word grows this much
@@ -102,6 +114,7 @@ class CaptionCfg(_Strict):
 
 class HookCfg(_Strict):
     enabled: bool = True         # on-screen hook text at the top for the first seconds
+    auto: bool = True            # skip it when the spoken first line already states the premise
     duration_s: float = 2.8
     font: str = "Inter Black"
     size: int = 70               # on a 1080x1920 canvas
@@ -109,6 +122,13 @@ class HookCfg(_Strict):
     text_color: str = "#000000"
     box_color: str = "#FFFFFF"
     max_chars_per_line: int = 18
+
+
+class ColdOpenCfg(_Strict):
+    enabled: bool = True         # open on a flash of the payoff (the crash, the reaction), then hard-cut to the start
+    duration_s: float = 0.7
+    min_lead_s: float = 6.0      # only when the payoff is at least this far into the clip (else it's not a tease)
+    when: str = "always"         # "always" | "no_premise": only when the spoken opening doesn't state the premise
 
 
 class PacingCfg(_Strict):
@@ -162,6 +182,7 @@ class Config(_Strict):
     captions: CaptionCfg = CaptionCfg()
     preview: PreviewCfg = PreviewCfg()
     hook: HookCfg = HookCfg()
+    cold_open: ColdOpenCfg = ColdOpenCfg()
     pacing: PacingCfg = PacingCfg()
     audio: AudioCfg = AudioCfg()
     export: ExportCfg = ExportCfg()

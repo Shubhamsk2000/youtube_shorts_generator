@@ -8,15 +8,17 @@ seconds. Everything is laid out on a 1080x1920 canvas and libass scales it to th
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import CaptionCfg, Config, HookCfg
+from ..text import merge_fragments
 from ..models import Clip, ReframePlan, Selection, Transcript, VideoMeta, load_json
 from common.progress import Reporter
 from . import pacing
-from .reframe import plan_path, split_panel_frac
+from .reframe import plan_path, split_panel_frac, visible_text_boxes
 from .select import OUT as SELECTION
 
 CAPTIONS_DIR = "captions"
@@ -54,37 +56,44 @@ def run(job_dir: Path, cfg: Config, *, report: Reporter | None = None) -> str:
     meta = load_json(VideoMeta, job_dir / "meta.json")
     cc = cfg.captions
     wanted, wanted_edits = set(), set()
-    n_lines, cut_s = 0, 0.0
+    n_lines, n_flash, cut_s = 0, 0, 0.0
     for i, c in enumerate(sel.clips):
         report(i / max(len(sel.clips), 1), f"Clip {i + 1}/{len(sel.clips)}")
         keep = None
+        audio = (pacing.ClipAudio(job_dir / "audio.wav", c.start, c.duration)
+                 if cfg.pacing.enabled or cfg.cold_open.enabled else None)
         if cfg.pacing.enabled:
-            audio = pacing.ClipAudio(job_dir / "audio.wav", c.start, c.duration)
             keep = pacing.keep_segments(spoken_spans(t, c), c.duration, cfg.pacing, audio)
-        pacing.save_keep(job_dir, c, keep)
-        if keep:
+        flash = pacing.flash_window(c, t, audio, cfg.cold_open)
+        pacing.save_edits(job_dir, c, keep, flash)
+        if keep or flash:
             wanted_edits.add(pacing.edits_path(job_dir, c).name)
+        if keep:
             cut_s += c.duration - pacing.kept_duration(keep, c.duration)
+        lead = flash[1] - flash[0] if flash else 0.0   # the cold open plays before the clip's own timeline
+        n_flash += bool(flash)
 
-        lines = build_lines(edit_words(clip_words(t, c, cc), keep, c.duration, cc), cc) if cc.enabled else []
-        hook = hook_text(c) if cfg.hook.enabled else ""
+        lines = build_lines(edit_words(clip_words(t, c, cc), keep, c.duration, cc, lead), cc) if cc.enabled else []
+        hook = hook_text(c) if cfg.hook.enabled and (c.show_hook or not cfg.hook.auto) else ""
         if not lines and not hook:
             continue
         n_lines += len(lines)
         plan_p = plan_path(job_dir, c)
         plan = load_json(ReframePlan, plan_p) if cfg.reframe.enabled and plan_p.exists() else None
 
-        def line_y(start: float, plan=plan, keep=keep) -> int | None:
-            """Facecam split shot -> caption centred on the seam between cam and screen."""
+        def line_y(start: float, plan=plan, keep=keep, lead=lead) -> int | None:
+            """Facecam split shot -> caption centred on the seam between cam and screen; otherwise moved off
+            any burned-in text it would cover. None = the default position."""
             if plan is None:
                 return None
-            shot = plan.shot_at(int(pacing.unmap(start, keep) * plan.fps))
-            if shot.mode != "split" or not shot.cams:
-                return None
-            return round(split_panel_frac(shot.cams, meta.width, meta.height, cfg.reframe) * H)
+            fi = int(pacing.unmap(max(0.0, start - lead), keep) * plan.fps)
+            shot = plan.shot_at(fi)
+            if shot.mode == "split" and shot.cams:
+                return round(split_panel_frac(shot.cams, meta.width, meta.height, cfg.reframe) * H)
+            return avoid_y(visible_text_boxes(plan, fi, cfg.reframe), cc)
 
         p = ass_path(job_dir, c)
-        text = to_ass(lines, cc, hook, cfg.hook, line_y)
+        text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead)
         if not p.exists() or p.read_text() != text:  # unchanged files keep their render cache valid
             p.write_text(text)
         wanted.add(p.name)
@@ -97,6 +106,8 @@ def run(job_dir: Path, cfg: Config, *, report: Reporter | None = None) -> str:
     parts = [f"{len(sel.clips)} clips"]
     if cc.enabled:
         parts.append(f"{n_lines} caption lines")
+    if n_flash:
+        parts.append(f"{n_flash} cold open{'s' * (n_flash != 1)}")
     if cfg.pacing.enabled:
         parts.append(f"{cut_s:.0f}s of pauses cut")
     return " · ".join(parts)
@@ -109,13 +120,38 @@ def spoken_spans(t: Transcript, clip: Clip) -> list[tuple[float, float]]:
 
 
 def edit_words(words: list[CapWord], keep: list[tuple[float, float]] | None, dur: float,
-               cc: CaptionCfg) -> list[CapWord]:
-    """Move caption words onto the edited (pauses removed) timeline."""
-    if not keep:
+               cc: CaptionCfg, lead: float = 0.0) -> list[CapWord]:
+    """Move caption words onto the output timeline: pauses removed, and `lead` seconds of cold open in front."""
+    if not keep and not lead:
         return words
-    moved = [CapWord(w.text, pacing.remap(w.start, keep), pacing.remap(w.end, keep), w.sentence_start,
-                     w.emphasis, w.ends_clause) for w in words]
-    return fix_timing(moved, pacing.kept_duration(keep, dur), cc.min_word_s)
+    moved = [CapWord(w.text, pacing.remap(w.start, keep) + lead, pacing.remap(w.end, keep) + lead,
+                     w.sentence_start, w.emphasis, w.ends_clause) for w in words]
+    return fix_timing(moved, pacing.kept_duration(keep, dur) + lead, cc.min_word_s)
+
+
+def avoid_y(boxes: list[tuple[float, float, float, float]], cc: CaptionCfg) -> int | None:
+    """Centre y (px, 1080x1920 canvas) for a caption line that would cover burned-in text: the nearest free
+    spot above or below it inside the safe zone. None = the default position is fine (or nothing fits)."""
+    if not boxes or not cc.avoid_text:
+        return None
+    block = cc.size * 1.25
+    bottom = cc.position * H
+    top = bottom - block
+    m = cc.text_margin
+
+    def covers(t: float, b: float) -> bool:
+        return any(y0 * H - m < b and y1 * H + m > t for _, y0, _, y1 in boxes)
+
+    if not covers(top, bottom):
+        return None
+    lo, hi = cc.safe_top * H + block / 2, cc.safe_bottom * H - block / 2
+    cands = [c for _, y0, _, y1 in boxes for c in (y0 * H - m - block / 2, y1 * H + m + block / 2)]
+    free = [c for c in cands if lo <= c <= hi and not covers(c - block / 2, c + block / 2)]
+    if not free:
+        return None
+    default = bottom - block / 2
+    best = min(free, key=lambda c: abs(c - default))
+    return math.ceil(best) if best > default else math.floor(best)   # round away from the text, never into it
 
 
 def hook_text(c: Clip) -> str:
@@ -132,13 +168,17 @@ def clip_words(t: Transcript, clip: Clip, cc: CaptionCfg) -> list[CapWord]:
     for s in t.sentences:
         if not (clip.start_sentence <= s.id <= clip.end_sentence):
             continue
-        for k, w in enumerate(s.words):
+        for k, w in enumerate(merge_fragments(s.words)):   # also fixes transcripts made before a merge rule
             text = display_text(w.text, cc.uppercase)
             if not text:
                 continue
             words.append(CapWord(text, w.start - clip.start + off, w.end - clip.start + off,
                                  sentence_start=k == 0, ends_clause=bool(re.search(r"[.,?!;:]$", w.text.strip()))))
     mark_emphasis(words, clip.emphasis_words)
+    if cc.emphasize_numbers:
+        for w in words:
+            if re.search(r"[$€£₹]|\d", w.text):
+                w.emphasis = True
     return fix_timing([w for w in words if w.end > 0 and w.start < dur], dur, cc.min_word_s)
 
 
@@ -234,7 +274,7 @@ def wrap(text: str, max_chars: int) -> list[str]:
 
 
 def to_ass(lines: list[CapLine], cc: CaptionCfg, hook: str = "", hc: HookCfg | None = None,
-           line_y=None) -> str:
+           line_y=None, lead: float = 0.0) -> str:
     hc = hc or HookCfg()
     margin_v = round(H * (1 - cc.position))
     head = f"""[Script Info]
@@ -259,7 +299,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     if hook:
         text = "\\N".join(display_text(x, False) for x in wrap(hook, hc.max_chars_per_line))
         y = round(hc.position * H)
-        events.append(f"Dialogue: 1,{_ts(0)},{_ts(hc.duration_s)},Hook,,0,0,0,,"
+        events.append(f"Dialogue: 1,{_ts(0)},{_ts(lead + hc.duration_s)},Hook,,0,0,0,,"
                       f"{{\\an5\\pos({W // 2},{y})\\fad(80,220)\\fscx80\\fscy80\\t(0,160,\\fscx100\\fscy100)}}{text}")
     for line in lines:
         y = line_y(line.start) if line_y else None

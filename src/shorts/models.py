@@ -45,6 +45,13 @@ class Transcript(BaseModel):
         return [w for s in self.sentences for w in s.words]
 
 
+class AudioSignals(BaseModel):
+    """Loudness of the whole video (signals.json): what happened between and under the words."""
+    bin_s: float
+    loudness: list[float]   # dBFS per bin
+    speech_db: float        # median level of transcribed speech: the reference for "loud"
+
+
 class ClipScores(BaseModel):
     hook: float        # do the first ~3s make you stay?
     standalone: float  # understandable without the rest of the video
@@ -75,6 +82,9 @@ class Clip(BaseModel):
     hashtags: list[str] = []
     heat: float | None = None    # YouTube "Most replayed" level of this part, 0-1 (None = no data)
     payoff_sentence: int | None = None  # sentence id where the payoff lands
+    show_hook: bool = True       # False: the spoken opening already states the premise, no text banner needed
+    context: str = ""            # what a cold viewer is missing at the start (the banner states it)
+    loop: bool = False           # the last line sets up the first: replays without a seam
 
     @property
     def duration(self) -> float:
@@ -105,6 +115,11 @@ class FaceSample(BaseModel):
     faces: list[list[float]]       # [cx, cy, w, h, score], fractions of the frame
 
 
+class TextSample(BaseModel):
+    f: int                         # frame index within the clip
+    boxes: list[list[float]]       # burned-in text: [x0, y0, x1, y1], fractions of the source frame
+
+
 class Shot(BaseModel):
     start: int                     # first frame (inclusive)
     end: int                       # last frame (exclusive)
@@ -125,6 +140,7 @@ class ReframePlan(BaseModel):
     shots: list[Shot]
     samples: list[FaceSample] = []
     overlays: list[list[float]] = []  # faces on on-screen graphics, ignored (cx, cy, w, h)
+    texts: list[TextSample] = []      # on-screen text the captions should stay clear of
 
     def shot_at(self, frame: int) -> Shot:
         for s in self.shots:

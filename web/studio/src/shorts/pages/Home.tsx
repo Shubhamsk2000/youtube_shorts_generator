@@ -43,7 +43,7 @@ export function Home({ system }: { system?: SystemInfo }) {
           </p>
           <div className="fade-in mt-9 w-full">
             <UrlForm blocked={blocked} />
-            <ModelPicker className="mt-3" />
+            <ModelPicker className="mt-3" center />
           </div>
           <ul className="mt-4 flex flex-wrap justify-center gap-x-5 gap-y-2 text-sm text-muted">
             {FEATURES.map(({ icon: Icon, label }) => (

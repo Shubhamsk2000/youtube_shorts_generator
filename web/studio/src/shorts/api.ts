@@ -89,6 +89,9 @@ export interface Clip {
   emphasis_words: string[];
   text: string;
   hook_text: string;
+  show_hook?: boolean;
+  context?: string;
+  loop?: boolean;
   description: string;
   hashtags: string[];
   heat: number | null;

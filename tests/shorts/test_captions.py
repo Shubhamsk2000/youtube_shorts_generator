@@ -30,7 +30,7 @@ def test_lines_break_on_count_punctuation_pause_and_sentence():
           cw("FIVE", 1.2, ends_clause=True), cw("SIX", 1.5),                        # comma ends a line
           cw("SEVEN", 2.5),                                                          # long pause
           cw("EIGHT", 2.8, sentence_start=True)]                                     # new sentence
-    lines = build_lines(ws, CC)
+    lines = build_lines(ws, CaptionCfg(max_words=3))
     assert [[w.text for w in l.words] for l in lines] == [
         ["ONE", "TWO", "THREE"], ["FOUR", "FIVE"], ["SIX"], ["SEVEN"], ["EIGHT"]]
 
@@ -73,3 +73,15 @@ def test_clip_words_relative_to_clip():
     out = clip_words(t, clip, CaptionCfg(offset_ms=-100))
     assert [w.text for w in out] == ["HI", "THERE", "FRIEND"]
     assert abs(out[0].start - 0.05) < 1e-6 and out[0].ends_clause and out[0].sentence_start
+
+
+def test_money_and_numbers_are_emphasised():
+    texts = ["Win", "$10,000", "in", "100", "seconds."]
+    words = [Word(text=t, start=i, end=i + 0.5, prob=1) for i, t in enumerate(texts)]
+    t = Transcript(language="en", model="x", duration=10,
+                   sentences=[Sentence(id=0, start=0, end=4.5, text=" ".join(texts), words=words)])
+    clip = Clip(id="x", rank=1, start=0, end=5, start_sentence=0, end_sentence=0, title="t", hook="h",
+                reason="r", scores=ClipScores(hook=5, standalone=5, payoff=5, energy=5), score=5, text="")
+    out = clip_words(t, clip, CC)
+    assert [w.text for w in out if w.emphasis] == ["$10,000", "100"]
+    assert not any(w.emphasis for w in clip_words(t, clip, CaptionCfg(emphasize_numbers=False)))

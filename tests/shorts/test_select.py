@@ -141,3 +141,55 @@ def test_lint_flags_dangling_openings_and_trailing_transitions():
     c = validate([pick(0, 2, payoff_id=1)], ss, 200, CFG)[0][0]
     warnings = " | ".join(lint(c, ss))
     assert 'opens with "He"' in warnings and "transition" in warnings
+
+
+def test_trailing_plug_is_cut_but_never_the_payoff():
+    lines = ["Can trucks stop a speeding train?", "The train hits at full speed!", "It went straight through!",
+             "Go check it out on Prime Video.", "Link in the description."]
+    ss = spoken(lines * 3)
+    c = validate([pick(0, 4, payoff_id=2)], ss, 200, CFG)[0][0]
+    assert c.end_sentence == 2 and "Prime" not in c.text
+    # the plug IS the payoff line: kept
+    c = validate([pick(0, 4, payoff_id=4)], ss, 200, CFG)[0][0]
+    assert c.end_sentence == 4
+    assert validate([pick(0, 4, payoff_id=2)], ss, 200, SelectCfg(trim_promo=False))[0][0].end_sentence == 4
+
+
+def test_banner_skipped_when_the_opening_states_the_premise():
+    ss = sents(40)
+    a, b = validate([pick(0, 4, opening_states_premise=True), pick(10, 14)], ss, 400, CFG)[0]
+    assert {a.start_sentence: a.show_hook, b.start_sentence: b.show_hook} == {0: False, 10: True}
+
+
+def test_hyphenated_words_are_joined():
+    ws = [Word(text=t, start=i, end=i + 1, prob=0.9) for i, t in enumerate(["Spider", "-Man", "and", "semi", "-trucks", "-", "go"])]
+    assert [w.text for w in merge_fragments(ws)] == ["Spider-Man", "and", "semi-trucks", "-", "go"]
+
+
+# ---------------------------------------------------------------- setup banner / loop / payoff tail
+
+def test_payoff_on_the_last_line_gets_more_air():
+    ss = sents(20, gap=2.0)
+    last = validate([pick(0, 3, payoff_id=3)], ss, 200, CFG)[0][0]
+    mid = validate([pick(0, 3, payoff_id=2)], ss, 200, CFG)[0][0]
+    assert abs(last.end - (ss[3].end + 0.8)) < 1e-6 and abs(mid.end - (ss[3].end + 0.4)) < 1e-6
+
+
+def test_loop_bonus_and_context_are_kept():
+    ss = sents(20)
+    plain = validate([pick(0, 3)], ss, 200, CFG)[0][0]
+    looped = validate([pick(0, 3, loops=True, context="who Tariq is")], ss, 200, CFG)[0][0]
+    assert looped.loop and not plain.loop and looped.context == "who Tariq is"
+    assert abs(looped.score - plain.score - 0.3) < 1e-6
+
+
+def test_editor_sees_what_a_cold_viewer_is_missing():
+    from shorts.stages.select import candidate_blocks
+    ss = spoken(["He said it was impossible.", "Then he did it anyway!", "Next, let's try the car."] * 4)
+    c = validate([pick(0, 2, payoff_id=1, context="who 'he' is and what was impossible")], ss, 200, CFG)[0][0]
+    blocks, cids = candidate_blocks([c], ss)
+    assert cids == {"C1": c}
+    assert "Missing for a cold viewer: who 'he' is and what was impossible" in blocks[0]
+    assert 'Opens with: "He said it was impossible.' in blocks[0] and "* [1]" in blocks[0]
+    c2 = validate([pick(0, 2, payoff_id=1)], ss, 200, CFG)[0][0]
+    assert "Missing for a cold viewer" not in candidate_blocks([c2], ss)[0][0]

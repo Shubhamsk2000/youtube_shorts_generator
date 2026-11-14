@@ -59,7 +59,7 @@ def upload_text(c: Clip, meta: VideoMeta) -> str:
         src = f"\nFull video: {meta.source_url}{sep}t={int(c.start)}s" if "youtu" in meta.source_url else ""
     return (f"TITLE\n{c.title}\n\n"
             f"DESCRIPTION\n{(c.description or c.title).strip()}{src}\n\n{tags}\n\n"
-            f"HOOK TEXT (on screen)\n{c.hook_text or c.title}\n\n"
+            f"HOOK TEXT (on screen)\n{(c.hook_text or c.title) if c.show_hook else '(none: the spoken first line states the premise)'}\n\n"
             f"--\nscore {c.score:g} · {c.duration:.0f}s · source {int(c.start // 60)}:{int(c.start % 60):02d}\n")
 
 

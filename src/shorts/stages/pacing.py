@@ -13,35 +13,82 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import PacingCfg
-from ..models import Clip
+from ..config import ColdOpenCfg, PacingCfg
+from ..models import Clip, Transcript
 
 EDITS_DIR = "edits"
 MIN_CUT_S = 0.12  # cuts shorter than this aren't worth a jump
+FLASH_STEP_S = 0.1
+
+Span = tuple[float, float]
 
 
 def edits_path(job_dir: Path, clip: Clip) -> Path:
     return job_dir / EDITS_DIR / f"{clip.id}.json"
 
 
-def load_keep(job_dir: Path, clip: Clip) -> list[tuple[float, float]] | None:
-    """Kept segments (clip-relative seconds), or None = keep everything."""
+def load_edits(job_dir: Path, clip: Clip) -> tuple[list[Span] | None, Span | None]:
+    """(kept segments, cold-open flash), both clip-relative seconds. None = keep everything / no flash."""
     p = edits_path(job_dir, clip)
     if not p.exists():
-        return None
-    keep = json.loads(p.read_text()).get("keep")
-    return [(float(a), float(b)) for a, b in keep] if keep else None
+        return None, None
+    d = json.loads(p.read_text())
+    keep = [(float(a), float(b)) for a, b in d.get("keep") or []] or None
+    fl = d.get("flash")
+    return keep, ((float(fl[0]), float(fl[1])) if fl else None)
 
 
-def save_keep(job_dir: Path, clip: Clip, keep: list[tuple[float, float]] | None) -> None:
+def load_keep(job_dir: Path, clip: Clip) -> list[Span] | None:
+    return load_edits(job_dir, clip)[0]
+
+
+def save_edits(job_dir: Path, clip: Clip, keep: list[Span] | None, flash: Span | None = None) -> None:
     p = edits_path(job_dir, clip)
-    if keep is None:
+    if keep is None and flash is None:
         p.unlink(missing_ok=True)
         return
     p.parent.mkdir(exist_ok=True)
-    text = json.dumps({"keep": [[round(a, 3), round(b, 3)] for a, b in keep]})
+    d: dict = {}
+    if keep:
+        d["keep"] = [[round(a, 3), round(b, 3)] for a, b in keep]
+    if flash:
+        d["flash"] = [round(flash[0], 3), round(flash[1], 3)]
+    text = json.dumps(d)
     if not p.exists() or p.read_text() != text:  # unchanged file keeps the render cache valid
         p.write_text(text)
+
+
+def save_keep(job_dir: Path, clip: Clip, keep: list[Span] | None) -> None:
+    save_edits(job_dir, clip, keep, None)
+
+
+def flash_window(clip: Clip, t: Transcript, audio: "ClipAudio | None", co: ColdOpenCfg) -> Span | None:
+    """Clip-relative (a, b) of the loudest `duration_s` inside the payoff: shown first, before the clip starts."""
+    if not co.enabled or clip.payoff_sentence is None:
+        return None
+    if co.when == "no_premise" and not clip.show_hook:
+        return None
+    s = next((x for x in t.sentences if x.id == clip.payoff_sentence), None)
+    if s is None:
+        return None
+    a0 = s.start - clip.start
+    if a0 < co.min_lead_s:
+        return None
+    length = co.duration_s
+    lo, hi = max(0.0, a0), min(clip.duration, s.end - clip.start + 3.0)  # the line and the reaction after it
+    if hi - lo < length:
+        lo = max(0.0, hi - length)
+    if hi - lo < length:
+        return None
+    best, best_v, a = lo, -1.0, lo
+    while a + length <= hi + 1e-9:
+        v = audio.rms(a, a + length) if audio else None
+        if v is None:
+            break  # no audio to judge by: the start of the payoff line
+        if v > best_v:
+            best, best_v = a, v
+        a += FLASH_STEP_S
+    return round(best, 3), round(best + length, 3)
 
 
 # ---------------------------------------------------------------- audio

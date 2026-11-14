@@ -27,15 +27,17 @@ select:                     # "Find moments" (Gemini free tier)
   window_min: 20            # transcript sent in ~20 min windows (one call each)
   overlap_min: 2
   min_clip_s: 15
-  max_clip_s: 60
+  max_clip_s: 50             # the most-viewed Shorts are almost all 25-47 s
   min_score: 4              # 0-10; kept low on purpose, you review the picks
   min_hook_score: 5         # after the editor pass: drop clips whose first line won't stop the scroll
   min_standalone_score: 5   # ...or that only make sense if you watched the video
+  trim_promo: true          # cut trailing plugs: "go check it out", sponsors, "link in the description"
   trim_lead_fillers: true   # open on the first real word: "And now we're back..." -> "we're back..."
   max_clips: 25
   offline_fallback: true    # if Gemini is down, pick moments with a heuristic
   refine: true              # 2nd "editor" pass: compares all picks, tightens hooks, writes hook text/title/hashtags
   use_heatmap: true         # use YouTube "Most replayed" data when the video has it
+  use_audio: true           # loudness + reactions (crash, screams, laughter) read from the audio
 
 preview:                    # quick review renders: low quality on purpose so they're fast
   width: 540
@@ -59,8 +61,15 @@ audio:
 
 hook:                       # on-screen hook text (written by Gemini) over the first seconds
   enabled: true
+  auto: true                # only when the spoken first line doesn't already state the premise
   duration_s: 2.8
   position: 0.17            # vertical centre, fraction of the height
+
+cold_open:                  # the first 0.7 s show the payoff (crash, reaction), then a hard cut to the start
+  enabled: true
+  duration_s: 0.7
+  min_lead_s: 6             # skipped when the payoff comes sooner than this
+  when: always              # "no_premise" = only when the spoken first line doesn't already state the premise
 
 pacing:                     # jump cuts over dead air between words
   enabled: true
@@ -73,15 +82,18 @@ captions:                   # word-by-word, burned into the previews
   font: Inter Black
   size: 92                  # on a 1080x1920 canvas
   uppercase: true
-  max_words: 3
+  max_words: 2              # 1-2 words at a time, like the biggest Shorts
   max_chars: 16
-  position: 0.68            # bottom of the text at 68% of the height (clear of Shorts UI)
+  position: 0.6             # bottom of the text at 60% of the height (mid-frame, clear of Shorts UI)
   highlight_color: "#FFE600"
-  emphasis_color: "#4ADE80" # words Gemini flagged
+  emphasis_color: "#4ADE80" # words the AI flagged
+  emphasize_numbers: true   # money and numbers always green ("$10,000")
+  avoid_text: true          # a line that would cover the source's own on-screen text moves above/below it
   offset_ms: 0              # shift captions if they feel early/late (negative = earlier)
 
 reframe:                    # 16:9 -> 9:16, shot by shot
   enabled: true             # false = plain centre crop
+  detect_text: true         # find burned-in text (source captions, graphics) once per second, for the captions stage
   sample_fps: 6             # face checks per second (plus the first frame of every shot)
   min_face_h: 0.05          # ignore faces smaller than 5% of the frame height (crowds)
   cut_threshold: 0.25       # camera-cut sensitivity (lower = more cuts)

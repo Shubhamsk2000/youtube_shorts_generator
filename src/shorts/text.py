@@ -8,8 +8,10 @@ _TERMINAL = (".", "?", "!")
 
 
 def _is_fragment(prev: str, text: str) -> bool:
-    """Whisper sometimes splits one word into tokens: "$100" + ",000", "50" + "%", "it" + "'s"."""
+    """Whisper sometimes splits one word into tokens: "$100" + ",000", "50" + "%", "it" + "'s", "Spider" + "-Man"."""
     if text[:1] in ",." and text[1:2].isdigit() and prev[-1:].isdigit():
+        return True
+    if text[:1] == "-" and text[1:2].isalnum() and prev[-1:].isalnum():   # "Spider" + "-Man", "semi" + "-trucks"
         return True
     return text[:1] == "%" or text.lower() in {"'s", "'t", "'re", "'ve", "'ll", "'d", "'m"}
 
