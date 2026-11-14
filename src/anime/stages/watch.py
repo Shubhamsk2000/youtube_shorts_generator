@@ -105,7 +105,7 @@ def run(job_dir: Path, meta: EpisodeMeta, cfg: Config, *, force: bool = False,
             data, _ = generate_json(
                 parts, SCHEMA, models=[sc.model, *sc.fallback_models], cache_dir=job_dir / LLM_CACHE,
                 system=SYSTEM, refresh=force, temperature=0.3, timeout_s=sc.timeout_s,
-                max_retries=sc.max_retries, min_interval_s=sc.min_interval_s,
+                max_retries=sc.max_retries, min_interval_s=sc.min_interval_s, task="anime.watch",
                 on_status=lambda m: report(None, m),
             )
         except (LLMError, ffmpeg.FFmpegError) as e:

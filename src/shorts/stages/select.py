@@ -259,7 +259,7 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
             prompt, SCHEMA,
             models=[sc.model, *sc.fallback_models], cache_dir=cache_dir, system=SYSTEM, refresh=refresh,
             temperature=sc.temperature, timeout_s=sc.timeout_s, max_retries=sc.max_retries,
-            min_interval_s=sc.min_interval_s, on_status=lambda m: report(i / len(windows), m),
+            min_interval_s=sc.min_interval_s, task="shorts.select", on_status=lambda m: report(i / len(windows), m),
         )
         calls += 1
         raw.extend(data.get("clips") or [])
@@ -305,7 +305,7 @@ def _refine(clips: list[Clip], t: Transcript, meta: VideoMeta, info: VideoInfo |
     data, _ = generate_json(
         prompt, REFINE_SCHEMA, models=[sc.model, *sc.fallback_models], cache_dir=cache_dir, system=SYSTEM,
         refresh=refresh, temperature=sc.temperature, timeout_s=sc.timeout_s, max_retries=sc.max_retries,
-        min_interval_s=sc.min_interval_s, on_status=lambda m: report(None, m),
+        min_interval_s=sc.min_interval_s, task="shorts.refine", on_status=lambda m: report(None, m),
     )
     answers = {str(r.get("cid", "")).strip(): r for r in data.get("clips") or []}
     raw: list[dict] = []

@@ -303,6 +303,7 @@ def tag(t: Track, f: Path, models: list[str], report) -> None:
              "sad (emotional, piano, slow), chill (calm, lo-fi, everyday scenes), funny (bouncy, playful)? "
              "Also name its genre in 1-3 words.", ("audio/mp3", clip)],
             TAG_SCHEMA, models=models, cache_dir=MUSIC_DIR / ".llm_cache", temperature=0.2, max_retries=2,
+            task="anime.music_mood",
             on_status=report)
         if data.get("mood") in MOODS:
             t.mood, t.mood_source = data["mood"], "gemini"

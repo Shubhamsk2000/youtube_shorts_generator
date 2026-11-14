@@ -180,9 +180,10 @@ paste into YouTube. To copy them to the laptop (instance running):
 scripts/fetch-exports.sh
 ```
 
-They land in `data/server-exports/shorts/…` and `data/server-exports/anime/…` in the project. It uses **rsync**:
-only new or changed files are sent, an interrupted copy resumes when you rerun it, and nothing is deleted on
-either side.
+They land in `data/server-exports/shorts/…` and `data/server-exports/anime/…` in the project. Only files never
+fetched before are downloaded (a list of fetched files is kept in `data/server-exports/.fetched-*.txt`), even if
+you deleted or moved your local copies: `--mark-seen` marks everything on the server as fetched, `--all` ignores
+the list.
 
 ### Disk space
 
@@ -233,10 +234,10 @@ what changed, restarts Studio and checks it came back. If a job is running it st
 | Python code (`src/`) | restart: automatic |
 | A dependency (`pyproject.toml`) | `pip install`: automatic (slower) |
 | The UI (`web/`) | `npm ci` + build: automatic (about 1 min) |
-| `configs/shorts.yaml`, `configs/anime.yaml` | travel with git: automatic |
+| `configs/shorts.yaml`, `configs/anime.yaml`, `configs/llm.yaml` | travel with git: automatic (`llm.yaml` is re-read without a restart) |
 | `deploy/studio.service` | reinstalled: automatic |
 | `scripts/server/setup.sh` (new system package, font…) | run it again: `scripts/ssh.sh 'cd yt_video_gen && bash scripts/server/setup.sh'` |
-| `.env` (Gemini key), channel card, avatar | not in git: `scripts/sync-settings.sh` |
+| `.env` (Gemini key, other AI providers' keys), channel card, avatar | not in git: `scripts/sync-settings.sh` |
 | Songs, episodes | not in git: `scripts/send.sh` |
 
 Tip: the channel card can also be edited directly in the server's Studio (*Channel* page); then it lives only on

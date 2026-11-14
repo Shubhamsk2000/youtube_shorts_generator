@@ -189,7 +189,7 @@ def _gemini(job_dir: Path, meta: EpisodeMeta, subs: Subs, sig: Signals, cfg: Con
         prompt, TASKS[style][1],
         models=[sc.model, *sc.fallback_models], cache_dir=job_dir / LLM_CACHE, system=SYSTEM, refresh=refresh,
         temperature=sc.temperature, timeout_s=sc.timeout_s, max_retries=sc.max_retries,
-        min_interval_s=sc.min_interval_s, on_status=lambda m: report(None, m),
+        min_interval_s=sc.min_interval_s, task="anime.select", on_status=lambda m: report(None, m),
     )
     picks = validate(data.get("picks") or [], style, meta, sig, cfg)
     return Selection(source="gemini", model=model, style=style, picks=picks[: n])

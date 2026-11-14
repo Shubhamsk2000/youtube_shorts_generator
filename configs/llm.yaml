@@ -1,0 +1,61 @@
+# Which AI answers each part of Studio. Edit this file to try another provider; no code changes, no restart
+# (it is re-read on the next call). Provider code: src/common/llm_providers.py.
+#
+# How a call is routed:
+#   1. tasks.<name>  if that task is listed below
+#   2. media         if the call sends audio or video (only Gemini can take those)
+#   3. default       everything else
+# A route's `models:` are tried in order (the next one on quota / overload). If a route has no models:
+#   Gemini uses each app's own models (configs/shorts.yaml, anime.yaml),
+#   any other provider uses the `models:` listed under its entry in `providers:`.
+#
+# Task names: shorts.select, shorts.refine, anime.select, anime.watch, anime.music_mood
+
+default:
+  provider: gemini
+  models: []
+
+media:
+  provider: gemini
+  models: []
+
+tasks: {}
+  # Example: send only the shorts clip picker to NVIDIA's free endpoint:
+  # shorts.select: {provider: nvidia, models: [meta/llama-3.3-70b-instruct]}
+
+providers:
+  gemini:
+    kind: gemini
+    api_key_env: GEMINI_API_KEY
+
+  # NVIDIA NIM: free key at https://build.nvidia.com (rate limited). Model ids are listed on that site.
+  nvidia:
+    kind: openai
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key_env: NVIDIA_API_KEY
+    models: [nvidia/nemotron-3.5-super-vl-120b-a12b]
+    min_interval_s: 2
+
+  # OpenRouter: one key, many models (some free, ids ending in :free).
+  openrouter:
+    kind: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    models: [meta-llama/llama-3.3-70b-instruct:free]
+    min_interval_s: 4
+
+  groq:
+    kind: openai
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    models: [llama-3.3-70b-versatile]
+    min_interval_s: 2
+
+  # A model running on this machine (ollama serve). No key needed.
+  ollama:
+    kind: openai
+    base_url: http://127.0.0.1:11434/v1
+    api_key_env:
+    models: [llama3.1]
+    json_mode: object
+    min_interval_s: 0

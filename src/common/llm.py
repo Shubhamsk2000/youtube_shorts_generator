@@ -1,44 +1,157 @@
-"""Minimal Gemini REST client: JSON output, retries/backoff, model fallback, on-disk response cache.
+"""The app's single doorway to AI models: JSON answers (generate_json).
+
+Which provider and model answer is decided by configs/llm.yaml, per task, so you can switch to NVIDIA,
+OpenRouter, Groq, a local Ollama... without touching the apps. How each provider is called lives in
+common/llm_providers.py. This file adds what every provider needs: retries with backoff, model fallback,
+cool-downs for models that are out of quota, call spacing for free tiers and an on-disk answer cache.
 
 The prompt can be plain text or a list of parts: text, or (mime_type, bytes) for inline media
-(e.g. a small mp4 proxy, so Gemini can watch a scene).
-
-Plain urllib on purpose: one endpoint, no SDK churn.
+(e.g. a small mp4 proxy so Gemini can watch a scene). Media calls use the `media:` route.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
-import re
-import socket
+import threading
 import time
-import urllib.error
-import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+import yaml
 
+from .llm_providers import KINDS, LLMError, Part, ProviderCfg, Request, Retryable
+from .paths import CONFIG_DIR
 
-class LLMError(RuntimeError):
-    """Gemini could not produce an answer (after retries and fallbacks)."""
+__all__ = ["LLMError", "Part", "generate_json", "route_info", "load_llm_config"]
 
-
-class _Retryable(Exception):
-    def __init__(self, msg: str, wait: float | None = None, switch_model: bool = False, overloaded: bool = False):
-        super().__init__(msg)
-        self.wait, self.switch_model, self.overloaded = wait, switch_model, overloaded
-
-
-_last_call = {"t": 0.0}
-_cooldown: dict[str, float] = {}  # model -> monotonic time until which it is skipped (overloaded / out of quota)
+CONFIG_FILE = CONFIG_DIR / "llm.yaml"
 OVERLOAD_COOLDOWN_S = 600
 QUOTA_COOLDOWN_S = 3600
 
+_last_call: dict[str, float] = {}
+_cooldown: dict[str, float] = {}   # "provider/model" -> monotonic time until which it is skipped
+_lock = threading.Lock()
 
-Part = str | tuple[str, bytes]
+
+# ------------------------------------------------------------------ config
+
+@dataclass
+class Route:
+    provider: str = "gemini"
+    models: list[str] = field(default_factory=list)   # empty = the calling app's own models (Gemini only)
+
+
+@dataclass
+class LLMConfig:
+    default: Route = field(default_factory=Route)
+    media: Route = field(default_factory=Route)
+    tasks: dict[str, Route] = field(default_factory=dict)
+    providers: dict[str, ProviderCfg] = field(default_factory=lambda: {
+        "gemini": ProviderCfg("gemini", "gemini", api_key_env="GEMINI_API_KEY")})
+
+
+_cfg_cache: dict = {"mtime": None, "cfg": None}
+
+
+def load_llm_config() -> LLMConfig:
+    """configs/llm.yaml, re-read when it changes (no restart needed)."""
+    try:
+        mtime = CONFIG_FILE.stat().st_mtime
+    except FileNotFoundError:
+        mtime = None
+    if _cfg_cache["cfg"] is not None and _cfg_cache["mtime"] == mtime:
+        return _cfg_cache["cfg"]
+    cfg = LLMConfig()
+    if mtime is not None:
+        raw = yaml.safe_load(CONFIG_FILE.read_text()) or {}
+
+        def route(d) -> Route:
+            d = d or {}
+            return Route(str(d.get("provider", "gemini")), [str(m) for m in d.get("models") or []])
+
+        cfg.default = route(raw.get("default"))
+        cfg.media = route(raw.get("media"))
+        cfg.tasks = {k: route(v) for k, v in (raw.get("tasks") or {}).items() if v}
+        for name, p in (raw.get("providers") or {}).items():
+            p = p or {}
+            cfg.providers[name] = ProviderCfg(
+                name=name, kind=p.get("kind", "gemini"), base_url=p.get("base_url"),
+                api_key_env=p.get("api_key_env"), models=[str(m) for m in p.get("models") or []],
+                min_interval_s=p.get("min_interval_s"), json_mode=p.get("json_mode", "object"),
+                extra_body=p.get("extra_body") or {}, headers=p.get("headers") or {})
+    _cfg_cache.update(mtime=mtime, cfg=cfg)
+    return cfg
+
+
+def _resolve(task: str | None, has_media: bool, caller_models: list[str]) -> tuple[ProviderCfg, list[str]]:
+    cfg = load_llm_config()
+    route = cfg.tasks.get(task or "") or (cfg.media if has_media else cfg.default)
+    p = cfg.providers.get(route.provider)
+    if p is None:
+        raise LLMError(f"configs/llm.yaml: unknown provider '{route.provider}'")
+    if p.kind not in KINDS:
+        raise LLMError(f"configs/llm.yaml: provider '{p.name}' has unknown kind '{p.kind}'")
+    # the apps' own model lists are Gemini model names: only valid when Gemini answers
+    models = route.models or (caller_models if p.kind == "gemini" else []) or p.models
+    if not models:
+        raise LLMError(f"configs/llm.yaml: no models for provider '{p.name}' (task {task or 'default'})")
+    return p, list(dict.fromkeys(models))
+
+
+def route_info(task: str | None = None, has_media: bool = False, caller_models: list[str] | None = None) -> dict:
+    """What would answer this task: for status pages."""
+    try:
+        p, models = _resolve(task, has_media, caller_models or ["gemini-3.8-flash"])
+        key_ok = True
+        try:
+            p.key()
+        except LLMError:
+            key_ok = False
+        return {"provider": p.name, "kind": p.kind, "models": models, "key_set": key_ok}
+    except LLMError as e:
+        return {"provider": None, "error": str(e), "key_set": False}
+
+
+# ------------------------------------------------------------------ calls
+
+def _space(provider: str, min_interval_s: float) -> None:
+    with _lock:
+        gap = min_interval_s - (time.monotonic() - _last_call.get(provider, 0.0))
+        if gap > 0:
+            time.sleep(gap)
+        _last_call[provider] = time.monotonic()
+
+
+def _with_retries(p: ProviderCfg, models: list[str], call: Callable[[str], object], *, max_retries: int,
+                  min_interval_s: float, on_status: Callable[[str], None], accept: Callable[[object], object]):
+    last_err = "no models configured"
+    interval = p.min_interval_s if p.min_interval_s is not None else min_interval_s
+    for model in models:
+        tag = f"{p.name}/{model}"
+        if _cooldown.get(tag, 0) > time.monotonic() and model != models[-1]:
+            continue  # failed moments ago: don't spend two more timeouts finding that out
+        overloaded = 0
+        for attempt in range(max_retries + 1):
+            _space(p.name, interval)
+            try:
+                return accept(call(model)), model
+            except Retryable as e:
+                last_err = f"{model}: {e}"
+                overloaded = overloaded + 1 if e.overloaded else 0
+                # a model that keeps timing out / returning 503 is overloaded: the next model is faster than waiting
+                if e.switch_model or attempt == max_retries or (overloaded >= 2 and model != models[-1]):
+                    _cooldown[tag] = time.monotonic() + (QUOTA_COOLDOWN_S if e.switch_model else OVERLOAD_COOLDOWN_S)
+                    on_status(f"{model} unavailable ({e}), trying next model…")
+                    break
+                wait = e.wait if e.wait is not None else min(5 * 2 ** attempt, 60)
+                on_status(f"{model}: {e} · retrying in {wait:.0f}s ({attempt + 1}/{max_retries})")
+                time.sleep(wait)
+            except json.JSONDecodeError:
+                last_err = f"{model}: returned invalid JSON"
+                on_status(f"{model} returned invalid JSON, retrying…")
+    raise LLMError(last_err)
 
 
 def generate_json(
@@ -53,124 +166,44 @@ def generate_json(
     min_interval_s: float = 4,
     system: str | None = None,
     refresh: bool = False,
+    task: str | None = None,
     on_status: Callable[[str], None] = lambda m: None,
 ) -> tuple[dict, str]:
-    """Returns (parsed JSON, model used). Raises LLMError."""
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not key:
-        raise LLMError("GEMINI_API_KEY is not set (add it to .env)")
+    """Returns (parsed JSON, model used). Raises LLMError.
 
-    body = {
-        "contents": [{"role": "user", "parts": _parts(prompt)}],
-        "generationConfig": {
-            "temperature": temperature,
-            "responseMimeType": "application/json",
-            "responseSchema": schema,
-        },
-    }
-    if system:
-        body["systemInstruction"] = {"parts": [{"text": system}]}
+    `models` are the calling app's (Gemini) models; configs/llm.yaml may route the task elsewhere."""
+    req = Request(parts=[prompt] if isinstance(prompt, str) else list(prompt), schema=schema, system=system,
+                  temperature=temperature, timeout_s=timeout_s)
+    p, order = _resolve(task, req.has_media, models)
+    provider = KINDS[p.kind](p)
 
-    last_err = "no models configured"
-    order = list(dict.fromkeys(models))  # dedupe, keep order
-    for model in order:
-        cache = None
-        if cache_dir:
-            digest = hashlib.sha256(json.dumps([model, body], sort_keys=True).encode()).hexdigest()[:16]
-            cache = cache_dir / f"{model}-{digest}.json"
+    if cache_dir:  # an answer cached for the first model that would be asked
+        for model in order:
+            cache = cache_dir / f"{model.replace('/', '_')}-{_digest(p.name, model, req)}.json"
             if cache.exists() and not refresh:
                 return json.loads(cache.read_text()), model
-        if _cooldown.get(model, 0) > time.monotonic() and model != order[-1]:
-            continue  # failed moments ago in this run: don't spend two more timeouts finding that out
 
-        overloaded = 0  # consecutive timeouts / 5xx on this model
-        for attempt in range(max_retries + 1):
-            gap = min_interval_s - (time.monotonic() - _last_call["t"])
-            if gap > 0:
-                time.sleep(gap)
-            try:
-                _last_call["t"] = time.monotonic()
-                text = _call(model, body, key, timeout_s)
-                data = json.loads(text)
-            except _Retryable as e:
-                last_err = f"{model}: {e}"
-                overloaded = overloaded + 1 if e.overloaded else 0
-                # a model that keeps timing out / returning 503 is overloaded: the next model is faster than waiting
-                if e.switch_model or attempt == max_retries or (overloaded >= 2 and model != order[-1]):
-                    _cooldown[model] = time.monotonic() + (QUOTA_COOLDOWN_S if e.switch_model else OVERLOAD_COOLDOWN_S)
-                    on_status(f"{model} unavailable ({e}), trying next model…")
-                    break
-                wait = e.wait if e.wait is not None else min(5 * 2 ** attempt, 60)
-                on_status(f"{model}: {e} · retrying in {wait:.0f}s ({attempt + 1}/{max_retries})")
-                time.sleep(wait)
-                continue
-            except json.JSONDecodeError:
-                last_err = f"{model}: returned invalid JSON"
-                on_status(f"{model} returned invalid JSON, retrying…")
-                continue
-            if cache:
-                cache.parent.mkdir(parents=True, exist_ok=True)
-                cache.write_text(json.dumps(data))
-            return data, model
-    raise LLMError(last_err)
+    def accept(text):
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise json.JSONDecodeError("expected a JSON object", str(text)[:50], 0)
+        return data
+
+    data, model = _with_retries(p, order, lambda m: provider.generate(m, req), max_retries=max_retries,
+                                min_interval_s=min_interval_s, on_status=on_status, accept=accept)
+    if cache_dir:
+        cache = cache_dir / f"{model.replace('/', '_')}-{_digest(p.name, model, req)}.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(data))
+    return data, model
 
 
-def _parts(prompt: str | list[Part]) -> list[dict]:
-    items = [prompt] if isinstance(prompt, str) else prompt
-    out = []
-    for it in items:
-        if isinstance(it, str):
-            out.append({"text": it})
-        else:
-            mime, data = it
-            out.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode()}})
-    return out
+def _digest(provider: str, model: str, req: Request) -> str:
+    parts = [p if isinstance(p, str) else [p[0], hashlib.sha256(p[1]).hexdigest()] for p in req.parts]
+    key = json.dumps([provider if provider != "gemini" else "", model, parts, req.schema, req.system, req.temperature],
+                     sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
-def _call(model: str, body: dict, key: str, timeout_s: float) -> str:
-    req = urllib.request.Request(
-        API.format(model=model),
-        data=json.dumps(body).encode(),
-        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as r:
-            resp = json.load(r)
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode(errors="replace")
-        try:
-            err = json.loads(raw).get("error", {})
-        except json.JSONDecodeError:
-            err = {"message": raw[:300]}
-        msg = err.get("message", "").split("\n")[0][:200]
-        if e.code == 429:
-            daily = bool(re.search(r"per ?day|PerDay|daily", raw))
-            return_wait = _retry_delay(err)
-            raise _Retryable(f"rate limited{' (daily quota used up)' if daily else ''}",
-                             wait=return_wait, switch_model=daily) from None
-        if e.code in (500, 502, 503, 504):
-            raise _Retryable(f"HTTP {e.code} {err.get('status', '')}".strip(), overloaded=True) from None
-        if e.code == 404:
-            raise _Retryable(f"model not found", switch_model=True) from None
-        raise LLMError(f"Gemini HTTP {e.code}: {msg}") from None  # 400/401/403: retrying won't help
-    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
-        raise _Retryable(f"network: {getattr(e, 'reason', e)}",
-                         overloaded=isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in str(e)) from None
-
-    cands = resp.get("candidates") or []
-    if not cands:
-        block = (resp.get("promptFeedback") or {}).get("blockReason")
-        raise _Retryable(f"empty response{f' (blocked: {block})' if block else ''}")
-    c = cands[0]
-    parts = (c.get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-    if c.get("finishReason") not in (None, "STOP") and not text:
-        raise _Retryable(f"finish reason {c.get('finishReason')}")
-    return text
-
-
-def _retry_delay(err: dict) -> float | None:
-    for d in err.get("details", []):
-        if d.get("@type", "").endswith("RetryInfo") and (m := re.match(r"([\d.]+)s", d.get("retryDelay", ""))):
-            return min(float(m.group(1)) + 1, 120)
-    return None
+def gemini_key_set() -> bool:
+    return bool(os.getenv("GEMINI_API_KEY", "").strip())

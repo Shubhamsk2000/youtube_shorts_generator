@@ -85,17 +85,23 @@ Rerunning resumes from cache; `--again` asks Gemini for new picks. Settings: `co
 tempo, beat grid, downbeats, energy, the strongest hits, and its best 40-60 s section. Use licensed music
 (YouTube Audio Library): label songs add a second copyright claim.
 
+## AI providers
+
+Every AI call goes through `src/common/llm.py`; how each provider is called lives in `src/common/llm_providers.py`
+(Gemini, or any OpenAI-compatible API such as NVIDIA NIM, OpenRouter, Groq, Ollama). Choose the provider per task in
+**`configs/llm.yaml`**: no code changes.
+
 ## Layout
 
 ```
-src/common/       shared: Gemini client (text, video, audio), ffmpeg helpers, job lock, the shared runner, paths
+src/common/       shared: AI doorway (llm.py) + providers (llm_providers.py), ffmpeg helpers, job lock, runner, paths
 src/studio/       the Studio server: mounts both APIs (/api/shorts, /api/anime), queue status, serves web/studio
 src/shorts/       long video → shorts (stages/, cli.py, server.py)
 src/anime/        anime edits (stages/ incl. amv.py, music.py, card.py, cli.py)
-configs/          shorts.yaml, anime.yaml
+configs/          shorts.yaml, anime.yaml, llm.yaml (which AI provider answers what)
 web/studio/       the one React app: src/kit (components + theme), src/shorts, src/anime, src/app (shell, home)
 data/             all media (git-ignored): shorts/{uploads,workspace,exports}, anime/{episodes,music,workspace,exports}
-tests/            shorts/, anime/
+tests/            shorts/, anime/, common/
 .cache/           models, pip/npm caches, Hugging Face (git-ignored)
 ```
 
