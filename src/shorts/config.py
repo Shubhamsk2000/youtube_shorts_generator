@@ -125,8 +125,12 @@ class HookCfg(_Strict):
 
 
 class ColdOpenCfg(_Strict):
-    enabled: bool = True         # open on a flash of the payoff (the crash, the reaction), then hard-cut to the start
-    duration_s: float = 0.7
+    # open on a flash of the payoff, then hard-cut to the start. Off by default: out of context it reads as a
+    # stray fragment of another moment (bad editing) more often than as a tease
+    enabled: bool = False
+    duration_s: float = 0.7      # length of a wordless reaction flash (crash, scream, laugh)
+    min_phrase_s: float = 0.4    # a spoken flash is a whole phrase with a pause on both sides, this long...
+    max_phrase_s: float = 1.2    # ...at most
     min_lead_s: float = 6.0      # only when the payoff is at least this far into the clip (else it's not a tease)
     when: str = "always"         # "always" | "no_premise": only when the spoken opening doesn't state the premise
 

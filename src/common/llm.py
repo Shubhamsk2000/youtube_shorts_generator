@@ -225,11 +225,16 @@ def generate_json(
     p, order = _resolve(task, req.has_media, models)
     provider = KINDS[p.kind](p)
 
-    if cache_dir:  # an answer cached for the first model that would be asked
+    if cache_dir and not refresh:
+        # Reuse the answer of the model that would be asked now. A fallback's old answer only counts while the
+        # models before it are cooling down (quota / overload): otherwise picking another model in the UI would
+        # silently return the previous model's cached clips.
         for model in order:
             cache = cache_dir / f"{model.replace('/', '_')}-{_digest(p.name, model, req)}.json"
-            if cache.exists() and not refresh:
+            if cache.exists():
                 return json.loads(cache.read_text()), model
+            if _cooldown.get(f"{p.name}/{model}", 0) <= time.monotonic():
+                break
 
     def accept(text):
         data = json.loads(text)

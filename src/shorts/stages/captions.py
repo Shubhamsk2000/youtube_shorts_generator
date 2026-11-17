@@ -59,44 +59,15 @@ def run(job_dir: Path, cfg: Config, *, report: Reporter | None = None) -> str:
     n_lines, n_flash, cut_s = 0, 0, 0.0
     for i, c in enumerate(sel.clips):
         report(i / max(len(sel.clips), 1), f"Clip {i + 1}/{len(sel.clips)}")
-        keep = None
-        audio = (pacing.ClipAudio(job_dir / "audio.wav", c.start, c.duration)
-                 if cfg.pacing.enabled or cfg.cold_open.enabled else None)
-        if cfg.pacing.enabled:
-            keep = pacing.keep_segments(spoken_spans(t, c), c.duration, cfg.pacing, audio)
-        flash = pacing.flash_window(c, t, audio, cfg.cold_open)
-        pacing.save_edits(job_dir, c, keep, flash)
+        keep, flash, n = build_clip(job_dir, cfg, t, meta, c)
         if keep or flash:
             wanted_edits.add(pacing.edits_path(job_dir, c).name)
         if keep:
             cut_s += c.duration - pacing.kept_duration(keep, c.duration)
-        lead = flash[1] - flash[0] if flash else 0.0   # the cold open plays before the clip's own timeline
         n_flash += bool(flash)
-
-        lines = build_lines(edit_words(clip_words(t, c, cc), keep, c.duration, cc, lead), cc) if cc.enabled else []
-        hook = hook_text(c) if cfg.hook.enabled and (c.show_hook or not cfg.hook.auto) else ""
-        if not lines and not hook:
-            continue
-        n_lines += len(lines)
-        plan_p = plan_path(job_dir, c)
-        plan = load_json(ReframePlan, plan_p) if cfg.reframe.enabled and plan_p.exists() else None
-
-        def line_y(start: float, plan=plan, keep=keep, lead=lead) -> int | None:
-            """Facecam split shot -> caption centred on the seam between cam and screen; otherwise moved off
-            any burned-in text it would cover. None = the default position."""
-            if plan is None:
-                return None
-            fi = int(pacing.unmap(max(0.0, start - lead), keep) * plan.fps)
-            shot = plan.shot_at(fi)
-            if shot.mode == "split" and shot.cams:
-                return round(split_panel_frac(shot.cams, meta.width, meta.height, cfg.reframe) * H)
-            return avoid_y(visible_text_boxes(plan, fi, cfg.reframe), cc)
-
-        p = ass_path(job_dir, c)
-        text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead)
-        if not p.exists() or p.read_text() != text:  # unchanged files keep their render cache valid
-            p.write_text(text)
-        wanted.add(p.name)
+        n_lines += n
+        if ass_path(job_dir, c).exists():
+            wanted.add(ass_path(job_dir, c).name)
     for f in out_dir.iterdir():
         if f.name not in wanted:
             f.unlink()
@@ -112,6 +83,52 @@ def run(job_dir: Path, cfg: Config, *, report: Reporter | None = None) -> str:
         parts.append(f"{cut_s:.0f}s of pauses cut")
     return " · ".join(parts)
 
+
+def build_clip(job_dir: Path, cfg: Config, t: Transcript, meta: VideoMeta, c: Clip
+               ) -> tuple[list[pacing.Span] | None, pacing.Span | None, int]:
+    """Pacing + cold open + captions for one clip -> edits/<id>.json and captions/<id>.ass.
+    Returns (keep, flash, caption lines); no .ass is left when the clip has neither captions nor a hook."""
+    cc = cfg.captions
+    keep = None
+    audio = (pacing.ClipAudio(job_dir / "audio.wav", c.start, c.duration)
+             if cfg.pacing.enabled or cfg.cold_open.enabled else None)
+    if cfg.pacing.enabled:
+        keep = pacing.keep_segments(spoken_spans(t, c), c.duration, cfg.pacing, audio)
+    flash = pacing.flash_window(c, t, audio, cfg.cold_open)
+    pacing.save_edits(job_dir, c, keep, flash)
+    lead = flash[1] - flash[0] if flash else 0.0   # the cold open plays before the clip's own timeline
+
+    lines = build_lines(edit_words(clip_words(t, c, cc), keep, c.duration, cc, lead), cc) if cc.enabled else []
+    hook = hook_text(c) if cfg.hook.enabled and (c.show_hook or not cfg.hook.auto) else ""
+    p = ass_path(job_dir, c)
+    if not lines and not hook:
+        p.unlink(missing_ok=True)
+        return keep, flash, 0
+    plan_p = plan_path(job_dir, c)
+    plan = load_json(ReframePlan, plan_p) if cfg.reframe.enabled and plan_p.exists() else None
+
+    def line_y(start: float) -> int | None:
+        """Facecam split shot -> caption centred on the seam between cam and screen; otherwise moved off
+        any burned-in text it would cover. None = the default position."""
+        if plan is None:
+            return None
+        fi = int(pacing.unmap(max(0.0, start - lead), keep) * plan.fps)
+        shot = plan.shot_at(fi)
+        if shot.mode == "split" and shot.cams:
+            return round(split_panel_frac(shot.cams, meta.width, meta.height, cfg.reframe) * H)
+        return avoid_y(visible_text_boxes(plan, fi, cfg.reframe), cc)
+
+    text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead)
+    if not p.exists() or p.read_text() != text:  # unchanged files keep their render cache valid
+        p.write_text(text)
+    return keep, flash, len(lines)
+
+
+def refresh_clip(job_dir: Path, cfg: Config, c: Clip) -> None:
+    """Rebuild one clip's edits + captions with the current settings (e.g. the cold open was switched off
+    after the captions were made: the old .ass is shifted behind a flash that no longer plays)."""
+    build_clip(job_dir, cfg, load_json(Transcript, job_dir / "transcript.json"),
+               load_json(VideoMeta, job_dir / "meta.json"), c)
 
 def spoken_spans(t: Transcript, clip: Clip) -> list[tuple[float, float]]:
     """(start, end) of every word in the clip, relative to the clip start (for pacing)."""

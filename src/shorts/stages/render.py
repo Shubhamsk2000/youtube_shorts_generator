@@ -27,12 +27,13 @@ from ..config import AudioCfg, Config, ExportCfg, PreviewCfg, ReframeCfg
 from ..models import Clip, ReframePlan, Selection, Shot, VideoMeta, load_json
 from common.progress import Reporter
 from common import ffmpeg
-from .captions import ass_path
+from .captions import ass_path, refresh_clip
 from .pacing import edits_path, kept_duration, load_edits
 from .reframe import plan_path, split_panel_frac
 from .select import OUT as SELECTION
 
 CLIPS_DIR = "clips"
+FLASH_FADE_S = 0.03
 RenderCfg = PreviewCfg | ExportCfg
 
 
@@ -49,6 +50,15 @@ def clip_file(job_dir: Path, clip: Clip, cfg: Config, rs: RenderCfg | None = Non
     return f"{clip.id}-{hashlib.sha1(key.encode()).hexdigest()[:6]}.mp4"
 
 
+def refresh_if_stale(job_dir: Path, cfg: Config, c: Clip) -> bool:
+    """Edits made with a cold open that has since been switched off: the captions are shifted behind a flash
+    that will no longer play (they would run late), so rebuild that clip's edits + captions first."""
+    if cfg.cold_open.enabled or not load_edits(job_dir, c)[1]:
+        return False
+    refresh_clip(job_dir, cfg, c)
+    return True
+
+
 def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None = None) -> str:
     report = report or (lambda fraction=None, message=None: None)
     sel = load_json(Selection, job_dir / SELECTION)
@@ -56,6 +66,8 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
     out_dir = job_dir / CLIPS_DIR
     out_dir.mkdir(exist_ok=True)
 
+    for c in sel.clips:
+        refresh_if_stale(job_dir, cfg, c)
     names = {c.id: clip_file(job_dir, c, cfg) for c in sel.clips}
     wanted = set(names.values())
     for f in out_dir.iterdir():  # stale previews from an earlier selection / settings
@@ -92,13 +104,13 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
 def render_clip(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config, rs: RenderCfg, dst: Path,
                 on_progress, two_pass_loudness: bool = False) -> None:
     """Render one clip with everything the earlier stages decided (framing, captions, edits)."""
+    refresh_if_stale(job_dir, cfg, c)
     ass = ass_path(job_dir, c)
     ass = ass if (cfg.captions.enabled or cfg.hook.enabled) and ass.exists() else None
     plan_p = plan_path(job_dir, c)
     plan = load_json(ReframePlan, plan_p) if cfg.reframe.enabled and plan_p.exists() else None
     keep, flash = load_edits(job_dir, c)
     keep = keep if cfg.pacing.enabled else None
-    flash = flash if cfg.cold_open.enabled else None
     src = job_dir / meta.file
     measured = None
     if two_pass_loudness:
@@ -135,7 +147,9 @@ def _audio_graph(src: Path, c: Clip, keep, flash, ac: AudioCfg, tail: list[str],
     fa, fb = flash
     inputs = ["-ss", f"{c.start + fa:.3f}", "-t", f"{fb - fa:.3f}", "-i", str(src), *inputs]
     hp = [f"highpass=f={ac.highpass_hz}"] if ac.highpass_hz > 0 else []
-    graph = (f"[{in0}:a:0]{','.join(hp) or 'anull'}[fl];"
+    fd = min(FLASH_FADE_S, (fb - fa) / 4)  # no click where the flash starts and where it cuts to the clip
+    fades = [f"afade=t=in:d={fd:.3f}", f"afade=t=out:st={fb - fa - fd:.3f}:d={fd:.3f}"]
+    graph = (f"[{in0}:a:0]{','.join([*hp, *fades])}[fl];"
              f"[{in0 + 1}:a:0]{','.join(pre) or 'anull'}[mn];"
              f"[fl][mn]concat=n=2:v=0:a=1,{','.join(tail)}[aout]")
     return inputs, ["-filter_complex", graph, "-map", "[aout]"]
