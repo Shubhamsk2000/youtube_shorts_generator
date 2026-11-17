@@ -66,3 +66,52 @@ def test_gemini_schema_becomes_json_schema():
                                                          "y": {"type": "STRING", "enum": ["a"]}}, "required": ["x"]})
     assert s == {"type": "object", "properties": {"x": {"type": "array", "items": {"type": "string"}},
                                                   "y": {"type": "string", "enum": ["a"]}}, "required": ["x"]}
+
+
+@pytest.fixture
+def fake_provider(monkeypatch):
+    """Records which model generate_json asked; answers {"from": <model>}."""
+    asked: list[str] = []
+
+    class Fake:
+        supports_media = False
+
+        def __init__(self, cfg):
+            pass
+
+        def generate(self, model, req):
+            asked.append(model)
+            return json.dumps({"from": model})
+
+    monkeypatch.setitem(llm.KINDS, "openai", Fake)
+    llm._cooldown.clear()
+    return asked
+
+
+def test_picking_a_model_in_the_ui_does_not_reuse_the_old_models_cached_answer(cfg, fake_provider, tmp_path,
+                                                                                monkeypatch):
+    local = tmp_path / "llm.local.yaml"
+    monkeypatch.setattr(llm, "LOCAL_FILE", local)
+    cfg("""
+tasks:
+  shorts.select: {provider: nvidia}
+providers:
+  nvidia: {kind: openai, base_url: https://example.test/v1, models: [nemotron, deepseek], min_interval_s: 0}
+""")
+    cache = tmp_path / "cache"
+    call = dict(schema={"type": "OBJECT"}, models=["gemini-a"], cache_dir=cache, task="shorts.select", min_interval_s=0)
+
+    assert llm.generate_json("pick moments", **call) == ({"from": "nemotron"}, "nemotron")
+    assert llm.generate_json("pick moments", **call) == ({"from": "nemotron"}, "nemotron")   # cached
+    assert fake_provider == ["nemotron"]
+
+    llm.set_task_model(["shorts.select"], "nvidia", "deepseek")   # the UI's pick: deepseek first, nemotron fallback
+    assert llm._resolve("shorts.select", False, ["gemini-a"])[1] == ["deepseek", "nemotron"]
+    assert llm.generate_json("pick moments", **call) == ({"from": "deepseek"}, "deepseek")
+    assert fake_provider == ["nemotron", "deepseek"]
+
+    # a fallback's cached answer is still reused while the picked model is cooling down (quota / overload)
+    (cache / f"deepseek-{llm._digest('nvidia', 'deepseek', llm.Request(parts=['pick moments'], schema={'type': 'OBJECT'}, system=None, temperature=0.4, timeout_s=180))}.json").unlink()
+    llm._cooldown["nvidia/deepseek"] = llm.time.monotonic() + 60
+    assert llm.generate_json("pick moments", **call) == ({"from": "nemotron"}, "nemotron")
+    assert fake_provider == ["nemotron", "deepseek"]

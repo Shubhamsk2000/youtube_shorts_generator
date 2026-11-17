@@ -8,6 +8,7 @@ stage (captions are timed on the edited timeline) and read by the renderer.
 from __future__ import annotations
 
 import json
+import math
 import wave
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from ..models import Clip, Transcript
 EDITS_DIR = "edits"
 MIN_CUT_S = 0.12  # cuts shorter than this aren't worth a jump
 FLASH_STEP_S = 0.1
+FLASH_MARGIN_S = 0.15  # a wordless reaction window keeps this far from any word
+FLASH_PAUSE_S = 0.2    # a phrase flash needs at least this much silence on both sides
+FLASH_LEAD_S, FLASH_TAIL_S = 0.05, 0.1
 
 Span = tuple[float, float]
 
@@ -63,7 +67,11 @@ def save_keep(job_dir: Path, clip: Clip, keep: list[Span] | None) -> None:
 
 
 def flash_window(clip: Clip, t: Transcript, audio: "ClipAudio | None", co: ColdOpenCfg) -> Span | None:
-    """Clip-relative (a, b) of the loudest `duration_s` inside the payoff: shown first, before the clip starts."""
+    """Clip-relative (a, b) of the cold open: a tease from the payoff, played before the clip starts.
+
+    Never a slice through speech (that sounds like a botched cut): either a reaction with no words in it
+    (crash, scream, laugh) or a short phrase of whole words with a pause on both sides. None = no clean
+    moment, so no flash rather than a bad one."""
     if not co.enabled or clip.payoff_sentence is None:
         return None
     if co.when == "no_premise" and not clip.show_hook:
@@ -74,21 +82,57 @@ def flash_window(clip: Clip, t: Transcript, audio: "ClipAudio | None", co: ColdO
     a0 = s.start - clip.start
     if a0 < co.min_lead_s:
         return None
-    length = co.duration_s
     lo, hi = max(0.0, a0), min(clip.duration, s.end - clip.start + 3.0)  # the line and the reaction after it
-    if hi - lo < length:
-        lo = max(0.0, hi - length)
-    if hi - lo < length:
+    near = [w for x in t.sentences for w in x.words if w.end - clip.start > lo - 2.0 and w.start - clip.start < hi + 2.0]
+    words = [(w.start - clip.start, w.end - clip.start) for w in near]
+    ends = [w.text.rstrip("\"')]").endswith((".", "!", "?")) for w in near]
+    cands = _phrase_windows(words, ends, lo, hi, co)
+    speech = _speech_level(words, audio)
+    if speech is not None:  # wordless windows only count when they're loud (a crash, a scream), not silence
+        cands += [ab for ab in _reaction_windows(words, lo, hi, co) if (audio.rms(*ab) or 0.0) >= speech]
+    if not cands:
         return None
-    best, best_v, a = lo, -1.0, lo
+    if speech is None:  # nothing to judge loudness by: the earliest clean phrase
+        a, b = min(cands)
+    else:
+        a, b = max(cands, key=lambda ab: (audio.rms(*ab) or 0.0))
+    return round(a, 3), round(b, 3)
+
+
+def _speech_level(words: list[Span], audio: "ClipAudio | None") -> float | None:
+    """Median loudness of the words: the bar a wordless reaction has to clear."""
+    if audio is None:
+        return None
+    levels = [r for a, b in words if b - a > 0.05 and (r := audio.rms(max(0.0, a), b)) is not None]
+    return float(np.median(levels)) if levels else None
+
+
+def _reaction_windows(words: list[Span], lo: float, hi: float, co: ColdOpenCfg) -> list[Span]:
+    """Fixed-length windows in the payoff region that no word touches (with a margin)."""
+    out, a, length = [], lo, co.duration_s
     while a + length <= hi + 1e-9:
-        v = audio.rms(a, a + length) if audio else None
-        if v is None:
-            break  # no audio to judge by: the start of the payoff line
-        if v > best_v:
-            best, best_v = a, v
+        b = a + length
+        if not any(ws < b + FLASH_MARGIN_S and we > a - FLASH_MARGIN_S for ws, we in words):
+            out.append((a, b))
         a += FLASH_STEP_S
-    return round(best, 3), round(best + length, 3)
+    return out
+
+
+def _phrase_windows(words: list[Span], ends: list[bool], lo: float, hi: float, co: ColdOpenCfg) -> list[Span]:
+    """Whole short sentences inside [lo, hi] with a pause before and after: a complete exclamation
+    ("Drop him!", "Keep calm, okay?"), never half a thought ("So if I were you,")."""
+    out = []
+    for i in range(len(words)):
+        if words[i][0] < lo or (i > 0 and (words[i][0] - words[i - 1][1] < FLASH_PAUSE_S or not ends[i - 1])):
+            continue
+        for j in range(i, len(words)):
+            a, b = words[i][0] - FLASH_LEAD_S, words[j][1] + FLASH_TAIL_S
+            if b - a > co.max_phrase_s or words[j][1] > hi:
+                break
+            nxt = words[j + 1][0] if j + 1 < len(words) else math.inf
+            if ends[j] and nxt - words[j][1] >= FLASH_PAUSE_S and b - a >= co.min_phrase_s:
+                out.append((max(0.0, a), b))
+    return out
 
 
 # ---------------------------------------------------------------- audio

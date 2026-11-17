@@ -65,9 +65,11 @@ hook:                       # on-screen hook text (written by Gemini) over the f
   duration_s: 2.8
   position: 0.17            # vertical centre, fraction of the height
 
-cold_open:                  # the first 0.7 s show the payoff (crash, reaction), then a hard cut to the start
-  enabled: true
-  duration_s: 0.7
+cold_open:                  # open on a flash of the payoff, then a hard cut to the start
+  enabled: false            # off: out of context the flash sounds like a stray bit of another moment
+  duration_s: 0.7           # a wordless reaction flash (crash, scream, laugh)...
+  min_phrase_s: 0.4         # ...or a whole spoken phrase with a pause on both sides (never cut mid-word)
+  max_phrase_s: 1.2
   min_lead_s: 6             # skipped when the payoff comes sooner than this
   when: always              # "no_premise" = only when the spoken first line doesn't already state the premise
 

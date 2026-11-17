@@ -1,0 +1,14 @@
+What limits it today
+It picks clips without seeing the video. Gemini reads the transcript plus loudness and heatmap numbers. In MrBeast-style videos the best moments are often visual: someone falls into a trap, a face reacts, something explodes. A transcript of a hilarious fall might say only "oh no!", so a lot of the funniest material is invisible to the picker.
+Its scores barely separate clips. On the trap video all 21 picks scored between 7.0 and 9.7. Meanwhile YouTube's "Most replayed" heat for the same clips ranges from 0.03 to 0.69. Real viewers disagree with the LLM far more than its scores suggest, and the scores are what decide the ranking.
+"Funny" only shows up as loudness. The audio signals detect "loud non-speech after a line", which can't tell laughter from an explosion or music. On top of that, min_clip_s: 15 and the HOOK→TENSION→PAYOFF structure suit story clips. A lot of comedy is an 8–15 s setup, punchline and reaction, and those get stretched or dropped.
+There's no feedback loop. reviews.json only records "approved", and nothing feeds back which shorts actually got views. Every run starts from zero.
+What I'd do, in priority order
+#	Change	Why	Effort
+1	Let Gemini watch the top candidates. Send each candidate as a 1 fps, 360p clip to Gemini (it accepts video) to rescore it and tag it funny, visual gag, reaction or story.	Catches the visual comedy the transcript can't see. About 10k tokens per 40 s clip, which fits the free tier for ~25 candidates.	Medium
+2	Use timestamped comments. yt-dlp can pull comments; ones like "8:42 had me dying 💀" point at funny moments.	Real viewers labelling funny moments for free. Pairs well with the heatmap.	Small
+3	Add a laughter/scream classifier. A small CPU audio model (YAMNet or PANNs) can tag laughter, screaming, applause and crashes separately.	Laughter is the best single signal for "funny".	Small–medium
+4	Add a comedy clip type. Allow 8–20 s clips with their own prompt: setup, punchline, reaction, ideally looping.	Short, loopable funny clips tend to rewatch well.	Small
+5	Rank with real signals. Weight the ranking more on heat, comments and the video pass, and less on the LLM's own scores. Or have Gemini compare clips head to head ("A vs B, which gets more views?").	LLMs compare clips more reliably than they score them in isolation.	Small
+6	Build a test set. MrBeast posts his own Shorts cut from his main videos, and those show which moments his team judged best. Run 5 videos through the pipeline and measure how many of those moments it finds.	Gives you a number to improve against instead of guessing.	Small
+7	Close the loop. Pull views and retention for your uploaded shorts from the YouTube Analytics API, and put the winners into the prompt as examples.	The pipeline gets better on your channel specifically.	Medium
