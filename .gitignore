@@ -57,3 +57,6 @@ configs/*.local.yaml
 # --- Deployment (your server address and key path) ---
 .deploy.env
 *.pem
+
+# --- Personal planning notes (kept local) ---
+YOUTUBE_CHANNEL_IDEAS.md
