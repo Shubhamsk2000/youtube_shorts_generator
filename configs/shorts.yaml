@@ -7,6 +7,7 @@ download:
   cookies_from_browser: null  # e.g. "firefox" if YouTube asks to confirm you're not a bot
   cookies_file: data/shorts/cookies.txt  # exported YouTube cookies; used if present (needed on servers)
   min_free_disk_gb: 3.0
+  live_last_min: 0          # live streams: only the last N minutes up to now (0 = whole stream from the start)
 
 transcribe:
   model: large-v3-turbo     # most accurate that's still faster than realtime on 2 vCPU (1.8x; small.en = 2.8x, more mistakes)
@@ -102,4 +103,10 @@ reframe:                    # 16:9 -> 9:16, shot by shot
   static_tolerance: 0.05    # subject moves less than this -> locked crop, no motion
   max_speed: 0.5            # max crop pan, frame widths per second
   fit_y: 0.42               # FIT shots: where the full frame sits (keeps captions clear)
-  screen_layout: split      # facecam over gameplay: "split" = cam on top, gameplay below; "track" = old behaviour
+  screen_layout: pip        # facecam over gameplay: "pip" = gameplay fills the frame, cam in a top corner;
+                            # "split" = cam panel on top, gameplay below; "track" = ignore the cam box
+  pip_corner: auto          # PIP: "auto" (same side as in the source), "left" or "right"
+  pip_width: 0.42           # cam width, fraction of the frame width (max pip_max_h of the height)
+  pip_max_h: 0.28
+  pip_top: 0.075            # top edge, fraction of the height (clear of the Shorts top bar)
+  pip_border: 6             # white border, px at 1080 wide (0 = none)

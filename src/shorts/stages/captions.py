@@ -2,9 +2,9 @@
 
 Pacing first (which pauses to cut, see pacing.py), then captions timed on the edited timeline.
 One caption "line" holds up to max_words words; it is drawn once per word, with that word
-highlighted, so the highlight follows the speech. In facecam SPLIT shots the line sits on the seam
+highlighted, so the highlight follows the speech. In facecam "split" shots the line sits on the seam
 between cam and screen. The hook text (Gemini's on-screen line) is shown at the top for the first
-seconds. Everything is laid out on a 1080x1920 canvas and libass scales it to the output size.
+seconds (below the corner cam in "pip" shots). Everything is laid out on a 1080x1920 canvas and libass scales it to the output size.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from ..text import merge_fragments
 from ..models import Clip, ReframePlan, Selection, Transcript, VideoMeta, load_json
 from common.progress import Reporter
 from . import pacing
-from .reframe import plan_path, split_panel_frac, visible_text_boxes
+from .reframe import pip_bottom, plan_path, split_panel_frac, visible_text_boxes
 from .select import OUT as SELECTION
 
 CAPTIONS_DIR = "captions"
@@ -114,11 +114,19 @@ def build_clip(job_dir: Path, cfg: Config, t: Transcript, meta: VideoMeta, c: Cl
             return None
         fi = int(pacing.unmap(max(0.0, start - lead), keep) * plan.fps)
         shot = plan.shot_at(fi)
-        if shot.mode == "split" and shot.cams:
+        if shot.mode == "split" and shot.cams and cfg.reframe.screen_layout == "split":
             return round(split_panel_frac(shot.cams, meta.width, meta.height, cfg.reframe) * H)
         return avoid_y(visible_text_boxes(plan, fi, cfg.reframe), cc)
 
-    text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead)
+    hook_min_y = None
+    if hook and plan is not None:  # keep the hook clear of a corner cam on screen while it shows
+        spans = [(0, int(pacing.unmap(min(cfg.hook.duration_s, c.duration), keep) * plan.fps) + 1)]
+        if flash:  # the cold open plays first, from the payoff's frames
+            spans.append((int(flash[0] * plan.fps), int(flash[1] * plan.fps) + 1))
+        bottoms = [b for sh in plan.shots if any(sh.start < e and s < sh.end for s, e in spans)
+                   if (b := pip_bottom(sh, plan.src_w, plan.src_h, cfg.reframe, H)) is not None]
+        hook_min_y = max(bottoms) if bottoms else None
+    text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead, hook_min_y=hook_min_y)
     if not p.exists() or p.read_text() != text:  # unchanged files keep their render cache valid
         p.write_text(text)
     return keep, flash, len(lines)
@@ -291,7 +299,7 @@ def wrap(text: str, max_chars: int) -> list[str]:
 
 
 def to_ass(lines: list[CapLine], cc: CaptionCfg, hook: str = "", hc: HookCfg | None = None,
-           line_y=None, lead: float = 0.0) -> str:
+           line_y=None, lead: float = 0.0, hook_min_y: int | None = None) -> str:
     hc = hc or HookCfg()
     margin_v = round(H * (1 - cc.position))
     head = f"""[Script Info]
@@ -316,6 +324,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     if hook:
         text = "\\N".join(display_text(x, False) for x in wrap(hook, hc.max_chars_per_line))
         y = round(hc.position * H)
+        if hook_min_y is not None:  # top of the hook box goes below the corner cam
+            n = text.count("\\N") + 1
+            y = max(y, hook_min_y + 28 + round(n * hc.size * 1.25 / 2) + 16)
         events.append(f"Dialogue: 1,{_ts(0)},{_ts(lead + hc.duration_s)},Hook,,0,0,0,,"
                       f"{{\\an5\\pos({W // 2},{y})\\fad(80,220)\\fscx80\\fscy80\\t(0,160,\\fscx100\\fscy100)}}{text}")
     for line in lines:

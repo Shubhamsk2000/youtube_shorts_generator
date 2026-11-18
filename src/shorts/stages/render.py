@@ -5,7 +5,8 @@ frame in numpy and resized ONCE to the output size (Lanczos), then piped into a 
 sharpens lightly, burns in captions and muxes the audio:
   TRACK/CENTER  moving 9:16 crop window
   FIT           whole frame over a blurred copy of itself
-  SPLIT         facecam on top, the gameplay/screen underneath
+  SPLIT         facecam + gameplay/screen: "pip" = gameplay full frame, cam in a top corner;
+                "split" = cam panel on top, the screen underneath (reframe.screen_layout)
 Pauses removed by the pacing step are skipped frame by frame (video) and with aselect (audio).
 Audio: high-pass + loudness normalisation to the Shorts level (two-pass for exports).
 
@@ -19,6 +20,7 @@ import re
 import subprocess
 import tempfile
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +31,7 @@ from common.progress import Reporter
 from common import ffmpeg
 from .captions import ass_path, refresh_clip
 from .pacing import edits_path, kept_duration, load_edits
-from .reframe import plan_path, split_panel_frac
+from .reframe import crop_to_aspect, pip_geometry, plan_path, screen_crop, split_panel_frac
 from .select import OUT as SELECTION
 
 CLIPS_DIR = "clips"
@@ -46,7 +48,8 @@ def clip_file(job_dir: Path, clip: Clip, cfg: Config, rs: RenderCfg | None = Non
     rs = rs or cfg.preview
     key = json.dumps([round(clip.start, 3), round(clip.end, 3), rs.model_dump(mode="json"),
                       cfg.audio.model_dump(), _digest(plan_path(job_dir, clip)), _digest(ass_path(job_dir, clip)),
-                      _digest(edits_path(job_dir, clip)), "v4"], sort_keys=True)
+                      _digest(edits_path(job_dir, clip)), cfg.reframe.model_dump(mode="json"), "v5"],
+                     sort_keys=True)
     return f"{clip.id}-{hashlib.sha1(key.encode()).hexdigest()[:6]}.mp4"
 
 
@@ -309,7 +312,9 @@ def compose(frame: np.ndarray, shot: Shot | None, i: int, out_w: int, out_h: int
     sh, sw = frame.shape[:2]
     if shot is not None and shot.mode == "fit":
         return compose_fit(frame, out_w, out_h, rc, cv2, interp)
-    if shot is not None and shot.mode == "split" and shot.cams:
+    if shot is not None and shot.mode == "split" and shot.cams and rc.screen_layout != "track":
+        if rc.screen_layout == "pip":
+            return compose_pip(frame, shot, out_w, out_h, rc, cv2, interp)
         return compose_split(frame, shot, out_w, out_h, meta, rc, cv2, interp)
     cw = min(sw, round(sh * out_w / out_h))
     x = 0.5
@@ -339,19 +344,6 @@ def compose_fit(frame: np.ndarray, out_w: int, out_h: int, rc: ReframeCfg, cv2, 
     return bg
 
 
-def _crop_to_aspect(x0: float, y0: float, x1: float, y1: float, aspect: float, fx: float, fy: float
-                    ) -> tuple[float, float, float, float]:
-    """Largest sub-box of (x0,y0,x1,y1) with width/height = aspect, centred on (fx, fy) where possible."""
-    w, h = x1 - x0, y1 - y0
-    if w / h > aspect:  # too wide: trim the sides
-        nw = h * aspect
-        left = float(np.clip(x0 + fx * w - nw / 2, x0, x1 - nw))
-        return left, y0, left + nw, y1
-    nh = w / aspect
-    top = float(np.clip(y0 + fy * h - nh / 2, y0, y1 - nh))
-    return x0, top, x1, top + nh
-
-
 def split_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, meta: VideoMeta, rc: ReframeCfg
                    ) -> tuple[int, list[tuple[int, int, int, int]], tuple[int, int, int, int]]:
     """(cam panel height, cam source crops (px), screen source crop (px)) for a SPLIT shot."""
@@ -366,24 +358,11 @@ def split_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, meta: V
         ix, iy = 0.015 * (x1 - x0), 0.015 * (y1 - y0)
         box = (x0 + ix, y0 + iy, x1 - ix, y1 - iy)
         w_k = out_w - slot_w * (n - 1) if k == n - 1 else slot_w
-        a, b, c, d = _crop_to_aspect(box[0] * sw, box[1] * sh, box[2] * sw, box[3] * sh, w_k / panel_h, fx, fy)
+        a, b, c, d = crop_to_aspect(box[0] * sw, box[1] * sh, box[2] * sw, box[3] * sh, w_k / panel_h, fx, fy)
         cams.append((int(a), int(b), max(int(a) + 2, int(c)), max(int(b) + 2, int(d))))
 
-    gh = out_h - panel_h
-    aspect = out_w / gh
-    cw, ch = round(sh * aspect), sh
-    if cw > sw:
-        cw, ch = sw, round(sw / aspect)
-    # the screen crop: as central as possible, but don't show the cam twice
-    best_left, best_cost = (sw - cw) // 2, None
-    for shift in np.linspace(-0.25, 0.25, 21):
-        left = int(np.clip(round((0.5 + shift) * sw - cw / 2), 0, sw - cw))
-        overlap = sum(max(0, min(left + cw, x1 * sw) - max(left, x0 * sw)) for x0, _, x1, _ in shot.cams)
-        cost = overlap * 4 + abs(shift) * sw
-        if best_cost is None or cost < best_cost:
-            best_left, best_cost = left, cost
-    top = (sh - ch) // 2
-    return panel_h, cams, (best_left, top, best_left + cw, top + ch)
+    screen = screen_crop(shot.cams, sw, sh, out_w / (out_h - panel_h))
+    return panel_h, cams, screen
 
 
 def compose_split(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, meta: VideoMeta, rc: ReframeCfg,
@@ -399,6 +378,76 @@ def compose_split(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, meta: V
         w_k = out_w - slot_w * (n - 1) if k == n - 1 else slot_w
         out[:panel_h, x:x + w_k] = _resize(frame[b:d, a:c], w_k, panel_h, cv2, interp)
     out[panel_h:] = _resize(frame[gt:gb, gl:gr], out_w, out_h - panel_h, cv2, interp)
+    return out
+
+
+def _hex_bgr(color: str) -> tuple[int, int, int]:
+    c = color.lstrip("#")
+    return int(c[4:6], 16), int(c[2:4], 16), int(c[0:2], 16)
+
+
+def _rounded_mask(w: int, h: int, r: int, cv2) -> np.ndarray:
+    """Anti-aliased rounded rectangle, float32 0-1 (drawn at 4x and shrunk)."""
+    s = 4
+    m = np.zeros((h * s, w * s), np.uint8)
+    r = max(0, min(r, w // 2, h // 2)) * s
+    if r:
+        for cx, cy in ((r, r), (w * s - r - 1, r), (r, h * s - r - 1), (w * s - r - 1, h * s - r - 1)):
+            cv2.circle(m, (cx, cy), r, 255, -1, cv2.LINE_AA)
+    cv2.rectangle(m, (r, 0), (w * s - r - 1, h * s - 1), 255, -1)
+    cv2.rectangle(m, (0, r), (w * s - 1, h * s - r - 1), 255, -1)
+    return cv2.resize(m, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
+
+
+@lru_cache(maxsize=16)
+def _pip_layers(w: int, h: int, radius: int, border: int, shadow: float, pad: int):
+    """Alpha layers for one cam size, on a canvas padded by `pad` px: (shadow, border, cam)."""
+    import cv2
+
+    W, H = w + 2 * pad, h + 2 * pad
+    cam = np.zeros((H, W), np.float32)
+    cam[pad:pad + h, pad:pad + w] = _rounded_mask(w, h, radius, cv2)
+    ring = np.zeros((H, W), np.float32)
+    if border:
+        ring[pad - border:pad + h + border, pad - border:pad + w + border] = _rounded_mask(
+            w + 2 * border, h + 2 * border, radius + border, cv2)
+    outer = np.maximum(ring, cam)
+    sh = np.zeros((H, W), np.float32)
+    if shadow > 0:
+        off = max(1, pad // 3)
+        sh[off:, :] = outer[:H - off, :]  # cast downwards
+        k = max(3, (pad // 2) * 2 + 1)
+        sh = cv2.GaussianBlur(sh, (k, k), 0) * shadow
+    return sh[..., None], ring[..., None], cam[..., None]
+
+
+def compose_pip(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, rc: ReframeCfg, cv2, interp=None) -> np.ndarray:
+    """Gameplay/screen fills the frame; the facecam sits in a top corner (rounded, bordered, shadowed)."""
+    sh, sw = frame.shape[:2]
+    (gl, gt, gr, gb), cams = pip_geometry(shot, sw, sh, out_w, out_h, rc)
+    out = _resize(frame[gt:gb, gl:gr], out_w, out_h, cv2, interp)
+    out = np.array(out, copy=True)  # _resize may hand back a view of the decoded frame
+    scale = out_w / 1080
+    border = round(rc.pip_border * scale)
+    pad = border + max(4, round(18 * scale))
+    color = np.array(_hex_bgr(rc.pip_border_color), np.float32)
+    for (a, b, c, d), (x, y, w, h) in cams:
+        shadow, ring, alpha = _pip_layers(w, h, round(rc.pip_radius * w), border, rc.pip_shadow, pad)
+        cam = np.zeros((h + 2 * pad, w + 2 * pad, 3), np.float32)
+        cam[pad:pad + h, pad:pad + w] = _resize(frame[b:d, a:c], w, h, cv2, interp)
+        # clip the padded layer to the canvas
+        X0, Y0 = x - pad, y - pad
+        ox0, oy0 = max(0, -X0), max(0, -Y0)
+        ox1 = min(cam.shape[1], out_w - X0)
+        oy1 = min(cam.shape[0], out_h - Y0)
+        if ox1 <= ox0 or oy1 <= oy0:
+            continue
+        region = out[Y0 + oy0:Y0 + oy1, X0 + ox0:X0 + ox1].astype(np.float32)
+        sl = np.s_[oy0:oy1, ox0:ox1]
+        region *= 1 - shadow[sl]
+        region = region * (1 - ring[sl]) + color * ring[sl]
+        region = region * (1 - alpha[sl]) + cam[sl] * alpha[sl]
+        out[Y0 + oy0:Y0 + oy1, X0 + ox0:X0 + ox1] = np.clip(region + 0.5, 0, 255).astype(np.uint8)
     return out
 
 

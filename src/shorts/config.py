@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict
@@ -18,6 +19,7 @@ class DownloadCfg(_Strict):
     cookies_from_browser: str | None = None
     cookies_file: Path = Path("data/shorts/cookies.txt")  # used only if it exists
     min_free_disk_gb: float = 3.0
+    live_last_min: float = 0.0   # live streams: only the last N minutes up to now (0 = from the start)
 
 
 class TranscribeCfg(_Strict):
@@ -80,12 +82,28 @@ class ReframeCfg(_Strict):
     fit_y: float = 0.42             # FIT shots: vertical centre of the full frame (keeps captions clear)
     fit_blur: int = 31              # FIT shots: background blur strength
     fit_dim: float = 0.55           # FIT shots: background brightness
-    screen_layout: str = "split"    # facecam over gameplay/screen: "split" (cam top, screen bottom) or "track"
+    # facecam over gameplay/screen: "pip" (gameplay fills the frame, cam in a top corner),
+    # "split" (cam panel on top, screen underneath) or "track" (ignore the cam box, follow faces)
+    screen_layout: Literal["pip", "split", "track"] = "pip"
     cam_edge_persistence: float = 0.35  # how steady a cam box border must be (0-1) to count as a facecam overlay
     detect_text: bool = True        # find burned-in text (the source's own captions, graphics) so ours avoid it
     text_fps: float = 1.0           # how often to look for it
     split_cam_min: float = 0.30     # SPLIT shots: cam panel height, min/max fraction of the output height
     split_cam_max: float = 0.45
+    pip_corner: Literal["auto", "left", "right"] = "auto"  # PIP shots: top corner for the cam (auto = the side it's on in the source)
+    pip_width: float = 0.42         # cam width, fraction of the output width
+    pip_max_h: float = 0.28         # ...and at most this fraction of the output height
+    pip_top: float = 0.075          # top edge, fraction of the height (clear of the Shorts top bar)
+    pip_margin: float = 0.035       # gap to the side edge, fraction of the width
+    pip_radius: float = 0.07        # corner rounding, fraction of the cam width
+    pip_border: int = 6             # px on a 1080-wide canvas (0 = none)
+    pip_border_color: str = "#FFFFFF"
+    pip_shadow: float = 0.45        # drop-shadow strength (0 = none)
+
+    # settings that only change how a plan is drawn, not the analysis: excluded from the plan cache key
+    RENDER_ONLY: ClassVar[set[str]] = {"fit_y", "fit_blur", "fit_dim", "split_cam_min", "split_cam_max",
+                                        "pip_corner", "pip_width", "pip_max_h", "pip_top", "pip_margin",
+                                        "pip_radius", "pip_border", "pip_border_color", "pip_shadow"}
 
 
 class CaptionCfg(_Strict):
