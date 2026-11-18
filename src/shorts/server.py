@@ -112,8 +112,9 @@ class JobStore:
         for d in ws.iterdir():
             if not d.is_dir():
                 continue
-            if only_cli and d.name in self.jobs and d.name not in self._cli_ids:
-                continue  # the server's own jobs are already live in memory
+            if only_cli and d.name in self.jobs and (d.name not in self._cli_ids or (d / JOB_FILE).exists()):
+                self._cli_ids.discard(d.name)  # the server's own jobs (or a CLI job it took over) are live in memory
+                continue
             try:
                 if (d / JOB_FILE).exists():
                     job = load_json(JobState, d / JOB_FILE)
