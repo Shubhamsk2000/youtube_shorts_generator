@@ -93,15 +93,27 @@ class JobStore:
         self.lock = threading.RLock()
         self.jobs: dict[str, JobState] = {}
         self._last_save: dict[str, float] = {}
+        self._cli_ids: set[str] = set()  # jobs made by the CLI (no job.json): re-read on every scan
+        self._last_scan = 0.0
         self._load()
 
-    def _load(self) -> None:
+    def rescan(self) -> None:
+        """Pick up jobs the CLI created or advanced since startup (throttled)."""
+        if time.monotonic() - self._last_scan < 2:
+            return
+        with self.lock:
+            self._load(only_cli=True)
+
+    def _load(self, only_cli: bool = False) -> None:
+        self._last_scan = time.monotonic()
         ws = self.cfg.workspace()
         if not ws.exists():
             return
         for d in ws.iterdir():
             if not d.is_dir():
                 continue
+            if only_cli and d.name in self.jobs and d.name not in self._cli_ids:
+                continue  # the server's own jobs are already live in memory
             try:
                 if (d / JOB_FILE).exists():
                     job = load_json(JobState, d / JOB_FILE)
@@ -119,7 +131,8 @@ class JobStore:
                     elif job.status == "interrupted" and all(s.status in ("done", "planned") for s in job.stages):
                         job.status = "done"
                 elif (d / download.META).exists():  # created by the CLI
-                    job = _job_from_cli_dir(d)
+                    job = _job_from_cli_dir(d, self.cfg)
+                    self._cli_ids.add(job.id)
                 else:
                     continue
                 self.jobs[job.id] = job
@@ -202,7 +215,7 @@ def _reconcile(job: JobState, d: Path, cfg: Config) -> None:
         ren.message = f"{len(sel.clips)} previews"
 
 
-def _job_from_cli_dir(d: Path) -> JobState:
+def _job_from_cli_dir(d: Path, cfg: Config) -> JobState:
     meta = load_json(VideoMeta, d / download.META)
     stages = _fresh_stages()
     stages[0].status = "done"
@@ -215,12 +228,20 @@ def _job_from_cli_dir(d: Path) -> JobState:
         stages[2].status = "done"
         stages[2].message = select.describe(load_json(Selection, d / select.OUT), cached=True)
     created = datetime.fromtimestamp((d / download.META).stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
-    return JobState(
+    job = JobState(
         id=meta.id, source=meta.source_url or meta.file, title=meta.title, duration=meta.duration,
-        is_youtube=bool(meta.source_url), status="done" if all(s.status in ("done", "planned") for s in stages) else "interrupted",
+        is_youtube=bool(meta.source_url), status="interrupted",
         created_at=created, updated_at=created, stages=stages,
         width=meta.width, height=meta.height, fps=meta.fps,
     )
+    _reconcile(job, d, cfg)  # reframe / captions / render outputs already on disk
+    if lock_owner(d):  # the CLI is working on it right now
+        job.status = "running"
+        if cur := next((s for s in job.stages if s.status == "pending"), None):
+            cur.status, cur.message = "running", "Running from the command line…"
+    elif all(s.status in ("done", "planned") for s in job.stages):
+        job.status = "done"
+    return job
 
 
 class StoreHooks(Hooks):
@@ -390,6 +411,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
 
     @router.get("/jobs", response_model=list[JobState])
     def list_jobs():
+        store.rescan()
         return store.all()
 
     def start_job(source: str) -> JobState:
@@ -455,6 +477,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
 
     @router.get("/jobs/{job_id}", response_model=JobState)
     def get_job(job_id: str):
+        store.rescan()
         return _job_or_404(store, job_id)
 
     @router.post("/jobs/{job_id}/retry", response_model=JobState)
