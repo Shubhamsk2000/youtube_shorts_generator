@@ -35,7 +35,7 @@ from common.ffmpeg import require
 from .select import OUT as SELECTION
 
 REFRAME_DIR = "reframe"
-VERSION = 3
+VERSION = 5
 MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
 MODEL_URL = ("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
              "face_detection_yunet/face_detection_yunet_2023mar.onnx")
@@ -447,6 +447,23 @@ def find_cam_box(P: np.ndarray, face: tuple[float, float, float, float], thr: fl
     tops, bots = rows(cy - 3 * fh, cy - 0.3 * fh), rows(cy + 0.3 * fh, cy + 3 * fh)
     if not (lefts and rights and len(tops) and len(bots)):
         return None
+    # a candidate line stands for a run of adjacent rows/cols (the face band sees thick or wobbly
+    # borders, and static room detail inside the cam, as one run): snap each side to the best line
+    # within `slack` px along its full length, as presence checks do (see _cover)
+    slack = 3
+
+    def hsnap(y: int, a: int, b: int) -> tuple[int, float]:
+        ys = np.arange(max(0, y - slack), min(H, y + slack + 1))
+        c = (ch[ys, b] - ch[ys, a]) / (b - a)
+        k = int(np.argmax(c))
+        return int(ys[k]), float(c[k])
+
+    def vsnap(x: int, t: int, b: int) -> tuple[int, float]:
+        xs = np.arange(max(0, x - slack), min(W, x + slack + 1))
+        c = (cv[b, xs] - cv[t, xs]) / (b - t)
+        k = int(np.argmax(c))
+        return int(xs[k]), float(c[k])
+
     best, best_area = None, 0
     for l in lefts:
         for r in rights:
@@ -455,17 +472,18 @@ def find_cam_box(P: np.ndarray, face: tuple[float, float, float, float], thr: fl
                 continue
             m = int(0.1 * w)
             a, b = l + m, r - m
-            ts = tops[(ch[tops, b] - ch[tops, a]) >= cover * (b - a)]
-            bs = bots[(ch[bots, b] - ch[bots, a]) >= cover * (b - a)]
+            ts = [y for y, c in (hsnap(int(t), a, b) for t in tops) if c >= cover]
+            bs = [y for y, c in (hsnap(int(bo), a, b) for bo in bots) if c >= cover]
             for t in ts:
                 for bo in bs:
                     h = bo - t
                     if h > 0.75 * H or h < max(1.15 * fh, 0.2 * H) or not 0.5 <= w / h <= 2.5 or w * h <= best_area:
                         continue
                     mm = int(0.1 * h)
-                    need = cover * (h - 2 * mm)
-                    if cv[bo - mm, l] - cv[t + mm, l] >= need and cv[bo - mm, r] - cv[t + mm, r] >= need:
-                        best, best_area = (int(l), int(t), int(r), int(bo)), w * h
+                    l2, cl = vsnap(int(l), t + mm, bo - mm)
+                    r2, cr = vsnap(int(r), t + mm, bo - mm)
+                    if cl >= cover and cr >= cover:
+                        best, best_area = (l2, int(t), r2, int(bo)), w * h
     return best
 
 
@@ -475,12 +493,18 @@ def border_cover(P: np.ndarray, box: tuple[int, int, int, int], thr: float, slac
 
 
 def _cover(ch: np.ndarray, cv: np.ndarray, box: tuple[int, int, int, int], slack: int = 3) -> float:
+    return min(_sides(ch, cv, box, slack))
+
+
+def _sides(ch: np.ndarray, cv: np.ndarray, box: tuple[int, int, int, int], slack: int = 3
+           ) -> tuple[float, float, float, float]:
+    """Steady-line coverage of each side of a box (top, bottom, left, right); each may sit `slack` px off."""
     H, W = ch.shape[0], cv.shape[1]
     l, t, r, b = box
     mw, mh = int(0.1 * (r - l)), int(0.1 * (b - t))
     xa, xb, ya, yb = l + mw, r - mw, t + mh, b - mh
     if xb <= xa or yb <= ya:
-        return 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     def hline(y0: int) -> float:
         ys = np.arange(max(0, y0 - slack), min(H, y0 + slack + 1))
@@ -490,7 +514,17 @@ def _cover(ch: np.ndarray, cv: np.ndarray, box: tuple[int, int, int, int], slack
         xs = np.arange(max(0, x0 - slack), min(W, x0 + slack + 1))
         return float(((cv[yb, xs] - cv[ya, xs]) / (yb - ya)).max())
 
-    return min(hline(t), hline(b), vline(l), vline(r))
+    return hline(t), hline(b), vline(l), vline(r)
+
+
+def _cam_on(ch: np.ndarray, cv: np.ndarray, box: tuple[int, int, int, int], face: bool = False) -> bool:
+    """Is a known cam box on screen in one frame? A cam without a drawn border shows its edge only
+    where it contrasts with the gameplay behind it, so one side may fade for a moment: 3 sides must
+    be clear lines and the 4th at least partly there. A face inside the box is evidence too."""
+    s = sorted(_sides(ch, cv, box))
+    if face:
+        return s[1] >= 0.5 and s[0] >= 0.25
+    return s[1] >= 0.75 and s[0] >= 0.4
 
 
 def _outside_steady(P: np.ndarray, box: tuple[int, int, int, int], thr: float) -> float:
@@ -543,10 +577,19 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
 
     boxes: list[tuple[int, int, int, int]] = []
 
-    def consider(P, f, t=thr) -> None:
+    def consider(P, f, t=thr) -> bool:
         box = find_cam_box(P, face_px(f), t)
-        if box and _outside_steady(P, box, thr) <= 0.08 and not any(_iou(box, b) > 0.8 for b in boxes):
-            boxes.append(box)
+        if box and _outside_steady(P, box, thr) <= 0.08:
+            if not any(_iou(box, b) > 0.8 for b in boxes):
+                boxes.append(box)
+            return True
+        return False
+
+    # persistence over ~4 s windows: when the gameplay holds still for long (a player standing, a menu),
+    # whole-clip persistence can't tell a cam border from the scene, but a window where it moves can
+    win = 24
+    windows = [sum(unpack(e) for _, e in edges[j:j + win]) / len(edges[j:j + win])
+               for j in range(0, len(edges), win) if len(edges[j:j + win]) >= win // 2] if len(edges) > win else []
 
     # 1) cams that stay put: faces that keep showing up in one spot, on whole-clip persistence
     clusters: list[dict] = []
@@ -562,14 +605,26 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
                 clusters.append({"cx": f[0], "cy": f[1], "faces": [f]})
     for c in sorted(clusters, key=lambda c: -len(c["faces"]))[:6]:
         if len(c["faces"]) >= 3:
-            consider(P_all, list(np.median(np.array(c["faces"])[:, :4], axis=0)))
+            f = list(np.median(np.array(c["faces"])[:, :4], axis=0))
+            if not windows:
+                consider(P_all, f)
+                continue
+            # candidates from the whole clip and from each window; keep the one whose border holds in
+            # the most windows (a static background can make a wrong, larger box look steady overall)
+            cands = {box for P in [P_all, *windows]
+                     if (box := find_cam_box(P, face_px(f), thr)) and _outside_steady(P, box, thr) <= 0.08}
+            if cands:
+                best = max(cands, key=lambda box: (sum(border_cover(P, box, thr) >= 0.85 for P in windows),
+                                                   -(box[2] - box[0]) * (box[3] - box[1])))
+                if not any(_iou(best, x) > 0.8 for x in boxes):
+                    boxes.append(best)
     # no cam that persists across the clip -> not a facecam video: never split (court lines,
     # doors and on-screen graphics make rectangles around faces in ordinary footage)
     if not boxes:
         return cuts, {}
     # 2) cams that move or grow (editors zoom the cam in for reactions): per shot
     for k, n in shot_n.items():
-        if n < 4:
+        if n < 4 or len(shot_n) == 1:  # one shot: step 1 already searched it (whole clip + windows)
             continue
         P = shot_sum[k] / n
         seen: list = []
@@ -585,11 +640,16 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
         return cuts, {}
 
     # 3) which cams are on screen in each sample frame (a border shows up as an edge in every frame)
+    by_frame = {s.f: s for s in samples}
+
+    def face_in(b, f) -> bool:
+        return f in by_frame and any(b[0] <= x[0] * W <= b[2] and b[1] <= x[1] * H <= b[3] for x in by_frame[f].faces)
+
     def presence() -> list[tuple]:
         out_states = []
-        for _, e in edges:
+        for f, e in edges:
             ch, cv = _line_maps(unpack(e), 0.5)
-            on = [b for b in boxes if _cover(ch, cv, b) >= 0.75]
+            on = [b for b in boxes if _cam_on(ch, cv, b, face_in(b, f))]
             on.sort(key=lambda b: -(b[2] - b[0]) * (b[3] - b[1]))
             keep: list = []
             for b in on:  # a zoomed and a normal version of one cam: keep the bigger
@@ -598,15 +658,12 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
             out_states.append(tuple(sorted(keep[:2])))
         return out_states
 
-    by_frame = {s.f: s for s in samples}
-
     def validated(states: list[tuple]) -> list[tuple]:
         """Drop boxes that rarely hold a face: a facecam shows its person most of the time."""
         good = set()
         for b in boxes:
             on = [frames[j] for j, st in enumerate(states) if b in st]
-            with_face = sum(1 for f in on if f in by_frame and any(
-                b[0] <= x[0] * W <= b[2] and b[1] <= x[1] * H <= b[3] for x in by_frame[f].faces))
+            with_face = sum(1 for f in on if face_in(b, f))
             if on and with_face >= 0.5 * len(on):
                 good.add(b)
         return [tuple(b for b in st if b in good) for st in states]
@@ -656,12 +713,19 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
         votes = [sm[j] for j, f in enumerate(frames) if _shot_of(f, new_cuts) == k]
         seg_states.append(max(set(votes), key=votes.count) if votes else ())
         seg_len.append(len(votes))
-    # a blip without a cam between cam segments is the cam animating (zooming in/out): keep the split
+    # a blip without a cam between cam segments is the cam animating (zooming in/out): keep the split.
+    # Up to ~3 s with the same cam on both sides is the border fading against the gameplay behind it
+    # (a stream cam doesn't vanish for a second or two): keep it too, so the layout doesn't flicker
+    gap = max(4, round(3 * rc.sample_fps))
     for k, st in enumerate(seg_states):
-        if not st and seg_len[k] <= 4:
-            prev = seg_states[k - 1] if k > 0 else ()
-            nxt = seg_states[k + 1] if k + 1 < len(seg_states) else ()
+        if st:
+            continue
+        prev = seg_states[k - 1] if k > 0 else ()
+        nxt = seg_states[k + 1] if k + 1 < len(seg_states) else ()
+        if seg_len[k] <= 4:
             seg_states[k] = prev or nxt
+        elif seg_len[k] <= gap and prev and prev == nxt:
+            seg_states[k] = prev
     out: dict[int, list[list[float]]] = {}
     for k, st in enumerate(seg_states):
         if st:
