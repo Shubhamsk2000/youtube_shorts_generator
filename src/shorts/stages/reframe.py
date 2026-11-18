@@ -8,8 +8,9 @@ Each shot then gets ONE mode, so the framing never flickers mid-shot:
   TRACK   one face dominates, or the whole group fits in a 9:16 window -> follow it (smoothed)
   FIT     faces spread wider than 9:16 -> whole frame over a blurred copy of itself
   CENTER  no reliable face -> centre crop
-  SPLIT   a facecam box over gameplay / a screen -> cam on top, the screen underneath
-          (cam boxes are found as rectangles whose border edges stay put while the content moves)
+  SPLIT   a facecam box over gameplay / a screen (found as a rectangle whose border edges stay put while
+          the content moves). Drawn per reframe.screen_layout: "pip" = the gameplay fills the frame and the
+          cam sits in a top corner; "split" = cam panel on top, the screen underneath
 At a cut the crop jumps (that's what a cut looks like); within a shot it is locked when the
 subject barely moves, otherwise smoothed and speed-limited.
 """
@@ -51,7 +52,9 @@ def plan_path(job_dir: Path, clip: Clip) -> Path:
 
 
 def plan_key(clip: Clip, rc: ReframeCfg) -> str:
-    raw = json.dumps([VERSION, round(clip.start, 3), round(clip.end, 3), rc.model_dump()], sort_keys=True)
+    analysis = rc.model_dump(exclude=rc.RENDER_ONLY)
+    analysis["screen_layout"] = rc.screen_layout != "track"  # pip and split need the same analysis
+    raw = json.dumps([VERSION, round(clip.start, 3), round(clip.end, 3), analysis], sort_keys=True)
     return hashlib.sha1(raw.encode()).hexdigest()[:12]
 
 
@@ -103,7 +106,8 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
         for s in load_json(ReframePlan, plan_path(job_dir, c)).shots:
             counts[s.mode] += 1
     n = sum(counts.values())
-    split = f", {counts['split']} facecam split" if counts["split"] else ""
+    split = (f", {counts['split']} facecam {'corner cam' if rc.screen_layout == 'pip' else 'split'}"
+             if counts["split"] else "")
     with_text = sum(1 for c in sel.clips if any(t.boxes for t in load_json(ReframePlan, plan_path(job_dir, c)).texts))
     text = f" · on-screen text in {with_text} clip{'s' * (with_text != 1)}" if with_text else ""
     return (f"{len(sel.clips)} clips · {n} shots: {counts['track']} tracked, {counts['fit']} fit, "
@@ -207,7 +211,7 @@ def analyze(src: Path, clip: Clip, meta: VideoMeta, rc: ReframeCfg, det, on_prog
                 cuts.append(i)
             if i % step == 0 or i == cuts[-1]:
                 _, faces = det.detect(frame)
-                if rc.screen_layout == "split":
+                if rc.screen_layout != "track":
                     edges.append((i, np.packbits(cv2.Canny(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 40, 120) > 0)))
                 samples.append(FaceSample(f=i, faces=[
                     [round(float((f[0] + f[2] / 2) / w), 4), round(float((f[1] + f[3] / 2) / h), 4),
@@ -245,7 +249,16 @@ def visible_text_boxes(plan: ReframePlan, fi: int, rc: ReframeCfg) -> list[tuple
     shot = plan.shot_at(fi)
     out = []
     if shot.mode == "split":
-        return []  # cam + screen layout: not handled (rarely has burned-in captions)
+        if rc.screen_layout != "pip" or not shot.cams:
+            return []  # cam panel + screen layout: not handled
+        out_w, out_h = 1080, 1920
+        (gl, gt, gr, gb), _ = pip_geometry(shot, plan.src_w, plan.src_h, out_w, out_h, rc)
+        l, t, r, b = gl / plan.src_w, gt / plan.src_h, gr / plan.src_w, gb / plan.src_h
+        for x0, y0, x1, y1 in near.boxes:
+            if x1 <= l or x0 >= r:
+                continue
+            out.append((max(0.0, (x0 - l) / (r - l)), (y0 - t) / (b - t), min(1.0, (x1 - l) / (r - l)), (y1 - t) / (b - t)))
+        return out
     if shot.mode == "fit":
         fg = 9 / 16 * plan.src_h / plan.src_w        # foreground height as a fraction of the output height
         top = min(max(rc.fit_y - fg / 2, 0.0), 1.0 - fg)
@@ -682,3 +695,77 @@ def split_panel_frac(cams: list[list[float]], src_w: int, src_h: int, rc: Refram
     slot = 9 / len(cams)  # output is 9 wide x 16 tall
     want = slot / (sum(aspects) / len(aspects)) / 16
     return float(np.clip(want, rc.split_cam_min, rc.split_cam_max))
+
+
+# ---------------------------------------------------------------- facecam layouts (pure)
+
+def crop_to_aspect(x0: float, y0: float, x1: float, y1: float, aspect: float, fx: float, fy: float
+                   ) -> tuple[float, float, float, float]:
+    """Largest sub-box of (x0,y0,x1,y1) with width/height = aspect, centred on (fx, fy) where possible."""
+    w, h = x1 - x0, y1 - y0
+    if w / h > aspect:  # too wide: trim the sides
+        nw = h * aspect
+        left = float(np.clip(x0 + fx * w - nw / 2, x0, x1 - nw))
+        return left, y0, left + nw, y1
+    nh = w / aspect
+    top = float(np.clip(y0 + fy * h - nh / 2, y0, y1 - nh))
+    return x0, top, x1, top + nh
+
+
+def screen_crop(cams: list[list[float]], sw: int, sh: int, aspect: float) -> tuple[int, int, int, int]:
+    """Crop (px) of the gameplay/screen with width/height = aspect: as central as possible (crosshairs,
+    characters and menus sit in the middle), shifted sideways so it doesn't show the cam a second time."""
+    cw, ch = round(sh * aspect), sh
+    if cw > sw:
+        cw, ch = sw, round(sw / aspect)
+    best_left, best_cost = (sw - cw) // 2, None
+    for shift in np.linspace(-0.25, 0.25, 21):
+        left = int(np.clip(round((0.5 + shift) * sw - cw / 2), 0, sw - cw))
+        overlap = sum(max(0, min(left + cw, x1 * sw) - max(left, x0 * sw)) for x0, _, x1, _ in cams)
+        cost = overlap * 4 + abs(shift) * sw
+        if best_cost is None or cost < best_cost:
+            best_left, best_cost = left, cost
+    top = (sh - ch) // 2
+    return best_left, top, best_left + cw, top + ch
+
+
+def pip_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, rc: ReframeCfg
+                 ) -> tuple[tuple[int, int, int, int], list[tuple[tuple[int, int, int, int], tuple[int, int, int, int]]]]:
+    """PIP layout -> (screen crop px, [(cam source crop px, cam output box x, y, w, h)]).
+
+    The screen fills the whole output; each cam goes in a top corner, on the side where it sits in the
+    source (a second cam takes the other corner). The cam keeps its own shape, between 3:4 and 16:9.
+    """
+    screen = screen_crop(shot.cams, sw, sh, out_w / out_h)
+    used: set[str] = set()
+    cams = []
+    for k, (x0, y0, x1, y1) in enumerate(shot.cams[:2]):
+        fx = shot.face_x[k] if k < len(shot.face_x) else 0.5
+        fy = shot.face_y[k] if k < len(shot.face_y) else 0.45
+        ix, iy = 0.015 * (x1 - x0), 0.015 * (y1 - y0)  # inset: the cam's own border/rounded corners don't show
+        bx0, by0, bx1, by1 = (x0 + ix) * sw, (y0 + iy) * sh, (x1 - ix) * sw, (y1 - iy) * sh
+        aspect = float(np.clip((bx1 - bx0) / max(1.0, by1 - by0), 0.75, 16 / 9))
+        a, b, c, d = crop_to_aspect(bx0, by0, bx1, by1, aspect, fx, fy)
+        w = rc.pip_width * out_w
+        h = w / aspect
+        if h > rc.pip_max_h * out_h:
+            h = rc.pip_max_h * out_h
+            w = h * aspect
+        w, h = int(round(w / 2) * 2), int(round(h / 2) * 2)
+        side = rc.pip_corner if rc.pip_corner != "auto" else ("left" if (x0 + x1) / 2 < 0.5 else "right")
+        if side in used:
+            side = "left" if side == "right" else "right"
+        used.add(side)
+        margin = round(rc.pip_margin * out_w)
+        x = margin if side == "left" else out_w - margin - w
+        y = round(rc.pip_top * out_h)
+        cams.append(((int(a), int(b), max(int(a) + 2, int(c)), max(int(b) + 2, int(d))), (x, y, w, h)))
+    return screen, cams
+
+
+def pip_bottom(shot: Shot, src_w: int, src_h: int, rc: ReframeCfg, out_h: int = 1920) -> int | None:
+    """Lowest edge (px on a 1080x1920 canvas) of the corner cam(s) in a PIP shot; None if not a PIP shot."""
+    if shot.mode != "split" or not shot.cams or rc.screen_layout != "pip":
+        return None
+    _, cams = pip_geometry(shot, src_w, src_h, out_h * 9 // 16, out_h, rc)
+    return max(y + h for _, (_, y, _, h) in cams) + round(rc.pip_border * out_h / 1920)
