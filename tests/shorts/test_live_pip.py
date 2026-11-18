@@ -107,13 +107,19 @@ def _synthetic_stream(n=120, H=360, W=640, box=(25, 152, 128, 232), static_frac=
         else:
             m = rng.random((H, W)) < 0.04  # moving gameplay: edges everywhere, nowhere steady
         m[t:b, l:r] = False
-        m[t, l:r] = m[b, l:r] = True
-        m[t:b, r] = True
-        if i % 2 == 0:
+        # the cam's sides; edge detection finds no line along the frame's own edge
+        if t > 0:
+            m[t, l:r] = True
+        if b < H - 1:
+            m[b, l:r] = True
+        if r < W - 1:
+            m[t:b, r] = True
+        if l > 0 and i % 2 == 0:
             m[t:b, l] = True
-        m[170:176, 60:95] = True  # the streamer's room behind the face: static detail inside the cam
+        m[t + 18:t + 24, l + 35:l + 70] = True  # the streamer's room behind the face: static detail inside the cam
         edges.append((f, np.packbits(m)))
-        samples.append(FaceSample(f=f, faces=[[(l + r) / 2 / W, (t + b) / 2 / H - 0.02, 0.04, 0.09, 0.9]]))
+        # the streamer sits left of centre, small in the cam (far from the camera)
+        samples.append(FaceSample(f=f, faces=[[(l + 0.4 * (r - l)) / W, (t + b) / 2 / H - 0.02, 0.035, 0.075, 0.9]]))
     return edges, samples
 
 
@@ -137,3 +143,30 @@ def test_no_cam_in_still_footage_without_overlay():
     edges, samples = _synthetic_stream(static_frac=1.0)
     _, cams = detect_cams(edges, (360, 640), samples, [0], [], RC)
     assert not cams
+
+
+def _cam_share(cuts, cams, n=1200):
+    return sum(((cuts + [n])[k + 1] - c) for k, c in enumerate(cuts) if k in cams) / n
+
+
+def test_corner_cam_flush_with_the_frame_edges():
+    """A cam tucked into the top-left corner has only two drawn sides (right, bottom)."""
+    from shorts.stages.reframe import detect_cams
+
+    edges, samples = _synthetic_stream(box=(0, 0, 163, 92))
+    cuts, cams = detect_cams(edges, (360, 640), samples, [0], [], RC)
+    assert _cam_share(cuts, cams) >= 0.95
+    (x0, y0, x1, y1), = {tuple(b) for v in cams.values() for b in v}
+    assert x0 < 0.01 and y0 < 0.01 and abs(x1 - 163 / 640) < 0.01 and abs(y1 - 92 / 360) < 0.015
+
+
+def test_cam_from_the_videos_other_clips():
+    """A clip that is a still screen all along (a map) can't find the cam alone; the cam found in the
+    video's other clips is used if this clip confirms it, and a hint elsewhere changes nothing."""
+    from shorts.stages.reframe import detect_cams
+
+    edges, samples = _synthetic_stream(box=(0, 0, 163, 92), static_frac=1.0)
+    assert detect_cams(edges, (360, 640), samples, [0], [], RC)[1] == {}
+    cuts, cams = detect_cams(edges, (360, 640), samples, [0], [], RC, [[0.0, 0.0, 0.2547, 0.2556]])
+    assert _cam_share(cuts, cams) >= 0.95
+    assert detect_cams(edges, (360, 640), samples, [0], [], RC, [[0.6, 0.6, 0.9, 0.9]])[1] == {}

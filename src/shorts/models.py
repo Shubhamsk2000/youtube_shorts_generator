@@ -141,6 +141,7 @@ class ReframePlan(BaseModel):
     samples: list[FaceSample] = []
     overlays: list[list[float]] = []  # faces on on-screen graphics, ignored (cx, cy, w, h)
     texts: list[TextSample] = []      # on-screen text the captions should stay clear of
+    cam_hints: list[list[float]] = [] # cam boxes from the video's other clips this plan was made with
 
     def shot_at(self, frame: int) -> Shot:
         for s in self.shots:
