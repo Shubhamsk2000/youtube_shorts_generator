@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from ..config import Config
 from ..models import VideoInfo, VideoMeta, load_json, save_json
@@ -52,11 +55,13 @@ def _ydl_opts(cfg: Config) -> dict:
         "format_sort": [f"res:{h}", "fps", f"vcodec:{d.prefer_codec}", "acodec"],
         "merge_output_format": "mkv",  # mkv holds any vcodec/acodec combo without re-encoding
         "noplaylist": True,
+        "live_from_start": True,  # live streams: grab from the beginning (cut at "now", see _stop_at_now)
         "quiet": True,
         "noprogress": True,
         "js_runtimes": {"deno": {}, "node": {}},  # YouTube needs a JS runtime for signatures
         "retries": 10,
         "fragment_retries": 10,
+        "concurrent_fragment_downloads": 8,  # live / DASH streams come in ~5 s pieces: fetch several at once
     }
     if d.cookies_from_browser:
         opts["cookiesfrombrowser"] = (d.cookies_from_browser,)
@@ -66,9 +71,62 @@ def _ydl_opts(cfg: Config) -> dict:
     return opts
 
 
-def _estimate_size(info: dict) -> int:
+def _estimate_size(info: dict, live_last_s: float = 0) -> int:
     fmts = info.get("requested_formats") or [info]
-    return sum((f.get("filesize") or f.get("filesize_approx") or 0) for f in fmts)
+    size = sum((f.get("filesize") or f.get("filesize_approx") or 0) for f in fmts)
+    if not size and (secs := info.get("duration") or _live_elapsed(info, live_last_s)):
+        # live / post-live streams report no size: bitrate (kbit/s) × length
+        size = int(sum(f.get("tbr") or 0 for f in fmts) * 1000 / 8 * secs)
+    return size
+
+
+def _live_status(info: dict) -> str | None:
+    return info.get("live_status") or ("is_live" if info.get("is_live") else None)
+
+
+def _reject_upcoming(info: dict) -> None:
+    if _live_status(info) == "is_upcoming":
+        raise DownloadError("That stream hasn't started yet. Paste it again once it is live or has ended.")
+
+
+def _stop_at_now(fragments, n_last: int = 0):
+    """Wrap yt-dlp's live-from-start fragment generator so it ends at the live edge instead of
+    following the broadcast forever. The first batch it yields runs from the stream's start to
+    "now" (every fragment carries that batch's fragment_count); anything after that is new live data.
+    n_last > 0: only the last n_last fragments of that batch."""
+    def sq_of(frag) -> int | None:
+        sq = parse_qs(urlparse(frag.get("url") or "").query).get("sq")
+        return int(sq[0]) if sq else None
+
+    def gen(ctx):
+        head = None
+        for frag in fragments(ctx):
+            count = frag.get("fragment_count")
+            if head is None:
+                head = count
+            elif count != head:
+                return  # a later poll: we're past the snapshot point
+            sq = sq_of(frag)
+            if n_last and head is not None and sq is not None and sq < head - n_last:
+                continue  # before the window we want
+            yield frag
+            if sq is not None and head is not None and sq >= head - 1:
+                return
+    return gen
+
+
+def _snapshot_live(info: dict, last_s: float = 0) -> None:
+    for f in info.get("requested_formats") or [info]:
+        if callable(f.get("fragments")):
+            frag_s = f.get("target_duration") or 5.0
+            f["fragments"] = _stop_at_now(f["fragments"], math.ceil(last_s / frag_s) if last_s else 0)
+
+
+def _live_elapsed(info: dict, last_s: float = 0) -> float:
+    start = info.get("release_timestamp") or info.get("timestamp")
+    # YouTube keeps only the last 120 h of a live stream
+    secs = min(max(time.time() - start, 0), 120 * 3600) if start else 0
+    return min(secs, last_s) if last_s and secs else (last_s or secs)
 
 
 def resolve_job(source: str, cfg: Config) -> JobRef:
@@ -83,11 +141,19 @@ def resolve_job(source: str, cfg: Config) -> JobRef:
             raise DownloadError(_clean_ytdlp_error(e)) from e
         if info.get("_type") == "playlist":
             raise DownloadError("That's a playlist link. Paste a single video URL.")
+        _reject_upcoming(info)
+        jid, title = info["id"], info.get("title") or info["id"]
+        if _live_status(info) == "is_live":
+            # each paste of a live link is its own snapshot (up to that moment), so a later paste,
+            # or the finished VOD, doesn't reuse an older, shorter download
+            jid = f"{jid}-live{time.strftime('%Y%m%d-%H%M')}"
+            last = f"last {cfg.download.live_last_min:g} min " if cfg.download.live_last_min else ""
+            title = f"{title} (live, {last}until {time.strftime('%H:%M')})"
         return JobRef(
-            id=info["id"],
-            dir=cfg.workspace() / info["id"],
+            id=jid,
+            dir=cfg.workspace() / jid,
             source=source,
-            title=info.get("title") or info["id"],
+            title=title,
             duration=info.get("duration"),
             is_youtube=info.get("extractor_key", "").lower().startswith("youtube"),
         )
@@ -150,16 +216,28 @@ def _download_youtube(url: str, job: JobRef, cfg: Config, report: Reporter) -> V
         with yt_dlp.YoutubeDL(opts) as ydl:
             report(None, "Picking best format…")
             info = ydl.extract_info(url, download=False)
-            need = _estimate_size(info)
+            _reject_upcoming(info)
+            live = _live_status(info) == "is_live"
+            last_s = cfg.download.live_last_min * 60 if live else 0
+            if live:
+                _snapshot_live(info, last_s)
+            need = _estimate_size(info, last_s)
             expected["total"] = need
             free = free_disk_gb(job.dir)
             if free - need / 1e9 < cfg.download.min_free_disk_gb:
                 raise DownloadError(
                     f"Not enough disk: download ≈{need / 1e9:.1f} GB, free {free:.1f} GB, "
                     f"must keep {cfg.download.min_free_disk_gb} GB free. Delete old jobs or "
-                    "lower download.max_height in configs/shorts.yaml."
+                    "lower download.max_height in configs/shorts.yaml"
+                    + (" (or set download.live_last_min to grab only the end of the stream)." if live else ".")
                 )
-            report(0.0, f"Downloading {info.get('height') or '?'}p ≈{need / 1e9:.2f} GB")
+            if live:
+                mins = _live_elapsed(info, last_s) / 60
+                what = f"the last {mins:.0f} min" if last_s else f"from the start up to now (≈{mins:.0f} min)"
+                report(0.0, f"Live stream: downloading {what} "
+                            f"at {info.get('height') or '?'}p ≈{need / 1e9:.2f} GB")
+            else:
+                report(0.0, f"Downloading {info.get('height') or '?'}p ≈{need / 1e9:.2f} GB")
             ydl.process_info(info)
     except yt_dlp.utils.DownloadError as e:
         raise DownloadError(_clean_ytdlp_error(e)) from e
@@ -169,7 +247,7 @@ def _download_youtube(url: str, job: JobRef, cfg: Config, report: Reporter) -> V
     if not candidates:
         raise DownloadError("yt-dlp finished but no source file was found")
     src = max(candidates, key=lambda p: p.stat().st_size)
-    return _meta_from_file(src, info["id"], info.get("title") or info["id"], url)
+    return _meta_from_file(src, job.id, job.title, url)
 
 
 def _clean_ytdlp_error(e: Exception) -> str:
