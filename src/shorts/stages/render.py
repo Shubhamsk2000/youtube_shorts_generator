@@ -31,7 +31,7 @@ from common.progress import Reporter
 from common import ffmpeg
 from .captions import ass_path, refresh_clip
 from .pacing import edits_path, kept_duration, load_edits
-from .reframe import crop_to_aspect, pip_geometry, plan_path, screen_crop, split_panel_frac
+from .reframe import crop_to_aspect, pip_band, pip_geometry, plan_path, screen_crop, split_panel_frac
 from .select import OUT as SELECTION
 
 CLIPS_DIR = "clips"
@@ -425,8 +425,18 @@ def compose_pip(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, rc: Refra
     """Gameplay/screen fills the frame; the facecam sits in a top corner (rounded, bordered, shadowed)."""
     sh, sw = frame.shape[:2]
     (gl, gt, gr, gb), cams = pip_geometry(shot, sw, sh, out_w, out_h, rc)
-    out = _resize(frame[gt:gb, gl:gr], out_w, out_h, cv2, interp)
-    out = np.array(out, copy=True)  # _resize may hand back a view of the decoded frame
+    by, bh = pip_band(out_w, out_h, rc)
+    if bh >= out_h:
+        out = _resize(frame[gt:gb, gl:gr], out_w, out_h, cv2, interp)
+        out = np.array(out, copy=True)  # _resize may hand back a view of the decoded frame
+    else:  # zoomed out: the gameplay full width, over a blurred and dimmed fill of the same crop
+        screen = frame[gt:gb, gl:gr]
+        small = cv2.resize(screen, (max(1, out_w // 8), max(1, out_h // 8)), interpolation=cv2.INTER_AREA)
+        k = max(1, rc.fit_blur // 8) * 2 + 1
+        small = cv2.GaussianBlur(small, (k, k), 0)
+        out = cv2.resize(small, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+        out = (out.astype(np.float32) * rc.fit_dim).astype(np.uint8)
+        out[by:by + bh] = _resize(screen, out_w, bh, cv2, interp)
     scale = out_w / 1080
     border = round(rc.pip_border * scale)
     pad = border + max(4, round(18 * scale))

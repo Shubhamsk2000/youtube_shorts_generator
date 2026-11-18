@@ -99,11 +99,14 @@ class ReframeCfg(_Strict):
     pip_border: int = 6             # px on a 1080-wide canvas (0 = none)
     pip_border_color: str = "#FFFFFF"
     pip_shadow: float = 0.45        # drop-shadow strength (0 = none)
+    pip_screen_aspect: float = 0.5625  # gameplay width/height: 0.5625 = fills the 9:16 frame; wider (0.625 = 10:16,
+                                       # 0.6875 = 11:16) zooms out, full width over a blurred copy of itself
 
     # settings that only change how a plan is drawn, not the analysis: excluded from the plan cache key
     RENDER_ONLY: ClassVar[set[str]] = {"fit_y", "fit_blur", "fit_dim", "split_cam_min", "split_cam_max",
                                         "pip_corner", "pip_width", "pip_max_h", "pip_top", "pip_margin",
-                                        "pip_radius", "pip_border", "pip_border_color", "pip_shadow"}
+                                        "pip_radius", "pip_border", "pip_border_color", "pip_shadow",
+                                        "pip_screen_aspect"}
 
 
 class CaptionCfg(_Strict):
