@@ -103,8 +103,13 @@ reframe:                    # 16:9 -> 9:16, shot by shot
   static_tolerance: 0.05    # subject moves less than this -> locked crop, no motion
   max_speed: 0.5            # max crop pan, frame widths per second
   fit_y: 0.42               # FIT shots: where the full frame sits (keeps captions clear)
-  screen_layout: pip        # facecam over gameplay: "pip" = gameplay fills the frame, cam in a top corner;
-                            # "split" = cam panel on top, gameplay below; "track" = ignore the cam box
+  screen_layout: split      # facecam over gameplay: "split" = cam panel on top (stacked), gameplay fills the rest;
+                            # "pip" = gameplay fills the frame, cam in a top corner; "track" = ignore the cam box
+  split_cam_min: 0.20       # stacked: cam panel height, fraction of the frame (sized to the cam's shape in between;
+  split_cam_max: 0.30       # set both equal to fix it)
+  smart_layout: true        # per-shot framing: gameplay-only shots of a stream shown whole instead of centre-cropped
+  background: blur          # "blur" or "tweet" (video inside your Channel card over the blur, hook text as the tweet)
+                            # Studio's Layout panel overrides these four per video
   pip_corner: auto          # PIP: "auto" (same side as in the source), "left" or "right"
   pip_width: 0.42           # cam width, fraction of the frame width (max pip_max_h of the height)
   pip_max_h: 0.28

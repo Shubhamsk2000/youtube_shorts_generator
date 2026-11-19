@@ -22,7 +22,7 @@ from common import ffmpeg
 from common.paths import DATA_DIR
 from common.sysinfo import free_disk_gb
 
-from .config import Config, load_config
+from .config import LAYOUT_FILE, Config, load_config, load_job_layout, with_job_layout
 from .models import Selection, Transcript, VideoMeta, load_json, save_json
 from common.progress import Hooks, Reporter
 from .stages import captions, download, reframe, render, select, transcribe
@@ -93,14 +93,27 @@ class JobStore:
         self.lock = threading.RLock()
         self.jobs: dict[str, JobState] = {}
         self._last_save: dict[str, float] = {}
+        self._cli_ids: set[str] = set()  # jobs made by the CLI (no job.json): re-read on every scan
+        self._last_scan = 0.0
         self._load()
 
-    def _load(self) -> None:
+    def rescan(self) -> None:
+        """Pick up jobs the CLI created or advanced since startup (throttled)."""
+        if time.monotonic() - self._last_scan < 2:
+            return
+        with self.lock:
+            self._load(only_cli=True)
+
+    def _load(self, only_cli: bool = False) -> None:
+        self._last_scan = time.monotonic()
         ws = self.cfg.workspace()
         if not ws.exists():
             return
         for d in ws.iterdir():
             if not d.is_dir():
+                continue
+            if only_cli and d.name in self.jobs and (d.name not in self._cli_ids or (d / JOB_FILE).exists()):
+                self._cli_ids.discard(d.name)  # the server's own jobs (or a CLI job it took over) are live in memory
                 continue
             try:
                 if (d / JOB_FILE).exists():
@@ -119,7 +132,8 @@ class JobStore:
                     elif job.status == "interrupted" and all(s.status in ("done", "planned") for s in job.stages):
                         job.status = "done"
                 elif (d / download.META).exists():  # created by the CLI
-                    job = _job_from_cli_dir(d)
+                    job = _job_from_cli_dir(d, self.cfg)
+                    self._cli_ids.add(job.id)
                 else:
                     continue
                 self.jobs[job.id] = job
@@ -202,7 +216,7 @@ def _reconcile(job: JobState, d: Path, cfg: Config) -> None:
         ren.message = f"{len(sel.clips)} previews"
 
 
-def _job_from_cli_dir(d: Path) -> JobState:
+def _job_from_cli_dir(d: Path, cfg: Config) -> JobState:
     meta = load_json(VideoMeta, d / download.META)
     stages = _fresh_stages()
     stages[0].status = "done"
@@ -215,12 +229,20 @@ def _job_from_cli_dir(d: Path) -> JobState:
         stages[2].status = "done"
         stages[2].message = select.describe(load_json(Selection, d / select.OUT), cached=True)
     created = datetime.fromtimestamp((d / download.META).stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
-    return JobState(
+    job = JobState(
         id=meta.id, source=meta.source_url or meta.file, title=meta.title, duration=meta.duration,
-        is_youtube=bool(meta.source_url), status="done" if all(s.status in ("done", "planned") for s in stages) else "interrupted",
+        is_youtube=bool(meta.source_url), status="interrupted",
         created_at=created, updated_at=created, stages=stages,
         width=meta.width, height=meta.height, fps=meta.fps,
     )
+    _reconcile(job, d, cfg)  # reframe / captions / render outputs already on disk
+    if lock_owner(d):  # the CLI is working on it right now
+        job.status = "running"
+        if cur := next((s for s in job.stages if s.status == "pending"), None):
+            cur.status, cur.message = "running", "Running from the command line…"
+    elif all(s.status in ("done", "planned") for s in job.stages):
+        job.status = "done"
+    return job
 
 
 class StoreHooks(Hooks):
@@ -371,6 +393,21 @@ class ReviewBody(BaseModel):
     review: Literal["approved", "rejected"] | None
 
 
+class LayoutBody(BaseModel):
+    screen_layout: Literal["split", "pip", "track"]
+    cam_size: float | None = None          # None = auto (sized to the cam, 20-30%); else a fraction 0.15-0.45
+    background: Literal["blur", "tweet"]
+    smart_layout: bool
+
+
+def _layout_view(cfg: Config, job_dir: Path) -> dict:
+    rc = with_job_layout(cfg, job_dir).reframe
+    lo, hi = sorted((rc.split_cam_min, rc.split_cam_max))
+    return {"screen_layout": rc.screen_layout, "cam_size": lo if abs(hi - lo) < 1e-6 else None,
+            "cam_range": [lo, hi], "background": rc.background, "smart_layout": rc.smart_layout,
+            "custom": bool(load_job_layout(job_dir))}
+
+
 _load_reviews = exporter.load_reviews
 
 
@@ -390,6 +427,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
 
     @router.get("/jobs", response_model=list[JobState])
     def list_jobs():
+        store.rescan()
         return store.all()
 
     def start_job(source: str) -> JobState:
@@ -455,6 +493,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
 
     @router.get("/jobs/{job_id}", response_model=JobState)
     def get_job(job_id: str):
+        store.rescan()
         return _job_or_404(store, job_id)
 
     @router.post("/jobs/{job_id}/retry", response_model=JobState)
@@ -572,6 +611,38 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         if not f or not f.exists():
             raise HTTPException(404, "Not exported yet")
         return FileResponse(f, media_type="video/mp4", filename=f"{clip.rank:02d}-{_slug(clip.title)}-hd.mp4")
+
+    @router.get("/jobs/{job_id}/layout")
+    def get_layout(job_id: str):
+        _job_or_404(store, job_id)
+        return _layout_view(load_config(cfg_path), cfg.workspace() / job_id)
+
+    @router.put("/jobs/{job_id}/layout")
+    def set_layout(job_id: str, body: LayoutBody):
+        """This video's framing (facecam layout, cam size, background); re-renders its previews. Moments,
+        transcript and face analysis are reused (only switching to/from "track" redoes the analysis)."""
+        job = _job_or_404(store, job_id)
+        if job.status in ("queued", "running") or worker.current == job_id:
+            raise HTTPException(409, "Job is in progress: change the layout when it is done")
+        d = cfg.workspace() / job_id
+        base = load_config(cfg_path).reframe
+        data = {"screen_layout": body.screen_layout, "background": body.background,
+                "smart_layout": body.smart_layout}
+        if body.cam_size is None:  # auto: back to the shorts.yaml range
+            data["split_cam_min"], data["split_cam_max"] = base.split_cam_min, base.split_cam_max
+        else:
+            v = min(max(body.cam_size, 0.15), 0.45)
+            data["split_cam_min"] = data["split_cam_max"] = round(v, 3)
+        with store.lock:
+            tmp = d / (LAYOUT_FILE + ".tmp")
+            tmp.write_text(json.dumps(data, indent=1))
+            tmp.replace(d / LAYOUT_FILE)
+        if (d / select.OUT).exists():
+            for key in ("reframe", "captions", "render"):
+                store.update(job_id, stage=key, status="pending", progress=None, message=None,
+                             started_at=None, finished_at=None)
+            worker.submit(job_id)
+        return _layout_view(load_config(cfg_path), d)
 
     @router.post("/jobs/{job_id}/reselect", response_model=JobState)
     def reselect_job(job_id: str):

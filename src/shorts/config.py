@@ -88,8 +88,8 @@ class ReframeCfg(_Strict):
     cam_edge_persistence: float = 0.35  # how steady a cam box border must be (0-1) to count as a facecam overlay
     detect_text: bool = True        # find burned-in text (the source's own captions, graphics) so ours avoid it
     text_fps: float = 1.0           # how often to look for it
-    split_cam_min: float = 0.30     # SPLIT shots: cam panel height, min/max fraction of the output height
-    split_cam_max: float = 0.45
+    split_cam_min: float = 0.20     # SPLIT shots: cam panel height, min/max fraction of the output height
+    split_cam_max: float = 0.30     # (sized to the cam's shape in between; min = max fixes it)
     pip_corner: Literal["auto", "left", "right"] = "auto"  # PIP shots: top corner for the cam (auto = the side it's on in the source)
     pip_width: float = 0.42         # cam width, fraction of the output width
     pip_max_h: float = 0.28         # ...and at most this fraction of the output height
@@ -99,11 +99,25 @@ class ReframeCfg(_Strict):
     pip_border: int = 6             # px on a 1080-wide canvas (0 = none)
     pip_border_color: str = "#FFFFFF"
     pip_shadow: float = 0.45        # drop-shadow strength (0 = none)
+    pip_screen_aspect: float = 0.5625  # gameplay width/height: 0.5625 = fills the 9:16 frame; wider (0.625 = 10:16,
+                                       # 0.6875 = 11:16) zooms out, full width over a blurred copy of itself
+    # smart layout: picks the framing per shot. Gameplay-only shots of a stream (no face, while other shots
+    # have the facecam) show the whole frame over the background instead of a narrow centre crop, and a
+    # blip of under smart_blip_s between two shots with the same facecam keeps the facecam layout
+    smart_layout: bool = True
+    smart_blip_s: float = 1.2
+    # what is around the video: "blur" = a blurred, dimmed copy of the frame (only visible where the video
+    # doesn't fill the frame); "tweet" = the video inside a tweet card (Channel card in Studio) over the blur,
+    # with the hook text as the tweet
+    background: Literal["blur", "tweet"] = "blur"
+    tweet_window_aspect: float = 0.8   # tweet card video window, width/height (shrunk to fit the card on screen)
 
     # settings that only change how a plan is drawn, not the analysis: excluded from the plan cache key
     RENDER_ONLY: ClassVar[set[str]] = {"fit_y", "fit_blur", "fit_dim", "split_cam_min", "split_cam_max",
                                         "pip_corner", "pip_width", "pip_max_h", "pip_top", "pip_margin",
-                                        "pip_radius", "pip_border", "pip_border_color", "pip_shadow"}
+                                        "pip_radius", "pip_border", "pip_border_color", "pip_shadow",
+                                        "pip_screen_aspect", "smart_layout", "smart_blip_s", "background",
+                                        "tweet_window_aspect"}
 
 
 class CaptionCfg(_Strict):
@@ -217,3 +231,27 @@ def load_config(path: Path | None = None) -> Config:
     path = path or CONFIG_DIR / "shorts.yaml"
     data = yaml.safe_load(path.read_text()) if path.exists() else {}
     return Config.model_validate(data or {})
+
+
+# ---------------------------------------------------------------- per-video layout (Studio's Layout panel)
+
+LAYOUT_FILE = "layout.json"   # workspace/<id>/layout.json: overrides of the reframe keys below, for one video
+LAYOUT_KEYS = ("screen_layout", "split_cam_min", "split_cam_max", "smart_layout", "background")
+
+
+def load_job_layout(job_dir: Path) -> dict:
+    try:
+        import json
+        data = json.loads((job_dir / LAYOUT_FILE).read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if k in LAYOUT_KEYS} if isinstance(data, dict) else {}
+
+
+def with_job_layout(cfg: Config, job_dir: Path) -> Config:
+    """cfg with this video's layout overrides applied (idempotent; unchanged when it has none)."""
+    over = load_job_layout(job_dir)
+    if not over:
+        return cfg
+    rc = ReframeCfg.model_validate({**cfg.reframe.model_dump(), **over})
+    return cfg.model_copy(update={"reframe": rc})

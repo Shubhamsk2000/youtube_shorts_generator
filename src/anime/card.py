@@ -72,17 +72,23 @@ def wrap(text: str, font: ImageFont.FreeTypeFont, width: float, max_lines: int) 
     return lines
 
 
-def layout(cc: CardCfg, W: int, H: int, src_w: int, src_h: int, tweet: str) -> Layout:
+def layout(cc: CardCfg, W: int, H: int, src_w: int, src_h: int, tweet: str, *,
+           max_video_ratio: float = 1.0, fit: bool = False) -> Layout:
+    """max_video_ratio: tallest video window, height/width (1 = square). fit: shrink the window so the whole
+    card stays between the top bar (9% of the height) and the bottom 20% (title, buttons)."""
     k = W / BASE_W
     card_w = round(1000 * k)
     pad = 36 * k
     avatar = 92 * k
     vw = _even(card_w - 2 * pad)
-    vh = _even(min(vw * src_h / src_w, vw))  # very tall sources are letterboxed into a square
+    vh = _even(min(vw * src_h / src_w, vw * max_video_ratio))  # very tall sources are letterboxed
     lines = wrap(tweet, _font(cc, "Medium", cc.text_size * k), vw, cc.max_lines) if tweet.strip() else []
     line_h = cc.text_size * k * 1.3
     text_h = len(lines) * line_h
     footer_h = (20 + 34) * k if cc.footer != "none" else 0
+    if fit:
+        rest = pad + avatar + (22 * k + text_h if lines else 0) + 26 * k + footer_h + pad
+        vh = _even(max(vw * 0.4, min(vh, 0.71 * H - rest)))
     card_h = round(pad + avatar + (22 * k + text_h if lines else 0) + 26 * k + vh + footer_h + pad)
     x = (W - card_w) // 2
     y = round(min(max(cc.center_y * H - card_h / 2, 0.09 * H), H - card_h - 0.2 * H))

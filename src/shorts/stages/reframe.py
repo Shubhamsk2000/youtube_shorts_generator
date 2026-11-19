@@ -28,14 +28,14 @@ import numpy as np
 
 from common.paths import MODELS_DIR
 
-from ..config import Config, ReframeCfg
+from ..config import Config, ReframeCfg, with_job_layout
 from ..models import Clip, FaceSample, ReframePlan, Selection, Shot, TextSample, VideoMeta, load_json, save_json
 from common.progress import Reporter
 from common.ffmpeg import require
 from .select import OUT as SELECTION
 
 REFRAME_DIR = "reframe"
-VERSION = 3
+VERSION = 7
 MODEL = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
 MODEL_URL = ("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
              "face_detection_yunet/face_detection_yunet_2023mar.onnx")
@@ -68,6 +68,7 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
     out_dir = job_dir / REFRAME_DIR
     out_dir.mkdir(exist_ok=True)
     sel = load_json(Selection, job_dir / SELECTION)
+    cfg = with_job_layout(cfg, job_dir)
     rc = cfg.reframe
     if not rc.enabled:
         for f in out_dir.glob("*.json"):
@@ -100,6 +101,26 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
             plan = analyze(job_dir / meta.file, c, meta, rc, det, prog, tdet)
             save_json(plan, plan_path(job_dir, c))
             done += c.duration
+
+    # 2nd pass: clips that found no cam, when the video's other clips did (a stream's cam stays put)
+    if rc.screen_layout != "track":
+        plans = {c.id: load_json(ReframePlan, plan_path(job_dir, c)) for c in sel.clips}
+        hints: list[list[float]] = []
+        for pl in plans.values():
+            for s in pl.shots:
+                for b in s.cams:
+                    if not any(_iou(b, h) > 0.6 for h in hints):
+                        hints.append(b)
+        retry = [c for c in sel.clips if hints and plans[c.id].cam_hints != hints
+                 and not any(s.mode == "split" for s in plans[c.id].shots)]
+        if retry:
+            det = _detector(rc)
+            for i, c in enumerate(retry):
+                report(None, f"Clip {i + 1}/{len(retry)} without a cam: trying the video's facecam…")
+                plan = analyze(job_dir / meta.file, c, meta, rc, det, lambda _f: None, None, hints)
+                plan.texts = plans[c.id].texts  # unchanged; text detection is the slow part
+                save_json(plan, plan_path(job_dir, c))
+            todo = todo or retry
 
     counts = {"track": 0, "fit": 0, "center": 0, "split": 0}
     for c in sel.clips:
@@ -174,7 +195,8 @@ def _detector(rc: ReframeCfg):
     return cv2.FaceDetectorYN.create(str(ensure_model()), "", (320, 320), rc.face_score, 0.3, 50)
 
 
-def analyze(src: Path, clip: Clip, meta: VideoMeta, rc: ReframeCfg, det, on_progress, text_det=None) -> ReframePlan:
+def analyze(src: Path, clip: Clip, meta: VideoMeta, rc: ReframeCfg, det, on_progress, text_det=None,
+            cam_hints: list[list[float]] | None = None) -> ReframePlan:
     import cv2
 
     h = rc.analysis_height
@@ -233,10 +255,10 @@ def analyze(src: Path, clip: Clip, meta: VideoMeta, rc: ReframeCfg, det, on_prog
     overlays = find_overlays(samples, cuts)
     cams: dict[int, list[list[float]]] = {}
     if edges:
-        cuts, cams = detect_cams(edges, (h, w), samples, cuts, overlays, rc)
+        cuts, cams = detect_cams(edges, (h, w), samples, cuts, overlays, rc, cam_hints)
     shots = plan_shots(cuts, i, samples, meta.fps, crop_width(meta.width, meta.height), rc, overlays, cams)
     return ReframePlan(key=plan_key(clip, rc), fps=meta.fps, n_frames=i, src_w=meta.width, src_h=meta.height,
-                       shots=shots, samples=samples, overlays=overlays, texts=texts)
+                       shots=shots, samples=samples, overlays=overlays, texts=texts, cam_hints=cam_hints or [])
 
 
 def visible_text_boxes(plan: ReframePlan, fi: int, rc: ReframeCfg) -> list[tuple[float, float, float, float]]:
@@ -254,10 +276,12 @@ def visible_text_boxes(plan: ReframePlan, fi: int, rc: ReframeCfg) -> list[tuple
         out_w, out_h = 1080, 1920
         (gl, gt, gr, gb), _ = pip_geometry(shot, plan.src_w, plan.src_h, out_w, out_h, rc)
         l, t, r, b = gl / plan.src_w, gt / plan.src_h, gr / plan.src_w, gb / plan.src_h
+        by, bh = pip_band(out_w, out_h, rc)
+        y_of = lambda v: (by + (v - t) / (b - t) * bh) / out_h  # noqa: E731  (source y -> output fraction)
         for x0, y0, x1, y1 in near.boxes:
             if x1 <= l or x0 >= r:
                 continue
-            out.append((max(0.0, (x0 - l) / (r - l)), (y0 - t) / (b - t), min(1.0, (x1 - l) / (r - l)), (y1 - t) / (b - t)))
+            out.append((max(0.0, (x0 - l) / (r - l)), y_of(y0), min(1.0, (x1 - l) / (r - l)), y_of(y1)))
         return out
     if shot.mode == "fit":
         fg = 9 / 16 * plan.src_h / plan.src_w        # foreground height as a fraction of the output height
@@ -388,12 +412,15 @@ def _line_maps(P: np.ndarray, thr: float) -> tuple[np.ndarray, np.ndarray]:
     """Cumulative sums of 'steady vertical line' / 'steady horizontal line' pixels.
 
     A border wobbles by a pixel between frames, so persistence is summed across a 3 px band first.
+    The frame's own edges count as lines: a cam tucked into a corner has only two drawn sides.
     """
     import cv2
 
     H, W = P.shape
     ev = cv2.filter2D(P, -1, np.ones((1, 3), np.float32), borderType=cv2.BORDER_CONSTANT) >= thr
     eh = cv2.filter2D(P, -1, np.ones((3, 1), np.float32), borderType=cv2.BORDER_CONSTANT) >= thr
+    ev[:, 0] = ev[:, -1] = True
+    eh[0, :] = eh[-1, :] = True
     ch = np.zeros((H, W + 1), np.int32)
     ch[:, 1:] = np.cumsum(eh, 1)
     cv = np.zeros((H + 1, W), np.int32)
@@ -433,21 +460,48 @@ def find_cam_box(P: np.ndarray, face: tuple[float, float, float, float], thr: fl
     if yb <= ya or xb <= xa:
         return None
 
+    edge_x, edge_y = 0.03 * W, 0.03 * H  # a search range that nearly reaches the frame edge includes it
+
     def cols(lo, hi):
+        lo, hi = (0 if lo < edge_x else lo), (W if hi > W - edge_x else hi)
         idx = np.arange(max(0, int(lo)), min(W, int(hi)))
         c = (cv[yb, idx] - cv[ya, idx]) / (yb - ya)
-        return _peaks(idx[c >= cover], c[c >= cover])
+        found = _peaks(idx[c >= cover], c[c >= cover])
+        return found + [e for e in (0, W - 1) if idx.size and idx[0] <= e <= idx[-1] and e not in found]
 
     def rows(lo, hi):
+        lo, hi = (0 if lo < edge_y else lo), (H if hi > H - edge_y else hi)
         idx = np.arange(max(0, int(lo)), min(H, int(hi)))
         c = (ch[idx, xb] - ch[idx, xa]) / (xb - xa)
-        return np.array(_peaks(idx[c >= cover], c[c >= cover]), int)
+        found = _peaks(idx[c >= cover], c[c >= cover])
+        return np.array(found + [e for e in (0, H - 1) if idx.size and idx[0] <= e <= idx[-1] and e not in found], int)
 
-    lefts, rights = cols(cx - 3.5 * fw, cx - 0.4 * fw), cols(cx + 0.4 * fw, cx + 3.5 * fw)
+    # the streamer may sit far from the camera and off-centre: the cam can be many face-widths wide
+    lefts, rights = cols(cx - 5 * fw, cx - 0.4 * fw), cols(cx + 0.4 * fw, cx + 5 * fw)
     tops, bots = rows(cy - 3 * fh, cy - 0.3 * fh), rows(cy + 0.3 * fh, cy + 3 * fh)
     if not (lefts and rights and len(tops) and len(bots)):
         return None
-    best, best_area = None, 0
+    # a candidate line stands for a run of adjacent rows/cols (the face band sees thick or wobbly
+    # borders, and static room detail inside the cam, as one run): snap each side to the best line
+    # within `slack` px along its full length, as presence checks do (see _cover)
+    slack = 3
+
+    def hsnap(y: int, a: int, b: int) -> tuple[int, float]:
+        ys = np.arange(max(0, y - slack), min(H, y + slack + 1))
+        c = (ch[ys, b] - ch[ys, a]) / (b - a)
+        k = int(np.argmax(c))
+        return int(ys[k]), float(c[k])
+
+    def vsnap(x: int, t: int, b: int) -> tuple[int, float]:
+        xs = np.arange(max(0, x - slack), min(W, x + slack + 1))
+        c = (cv[b, xs] - cv[t, xs]) / (b - t)
+        k = int(np.argmax(c))
+        return int(xs[k]), float(c[k])
+
+    # prefer real drawn sides over the frame's edge (a line just inside the edge is the cam's border,
+    # the strip beyond it is gameplay), then the largest box (lines inside a cam make smaller rectangles)
+
+    best, best_key = None, (-5, 0)
     for l in lefts:
         for r in rights:
             w = r - l
@@ -455,18 +509,27 @@ def find_cam_box(P: np.ndarray, face: tuple[float, float, float, float], thr: fl
                 continue
             m = int(0.1 * w)
             a, b = l + m, r - m
-            ts = tops[(ch[tops, b] - ch[tops, a]) >= cover * (b - a)]
-            bs = bots[(ch[bots, b] - ch[bots, a]) >= cover * (b - a)]
+            ts = [y for y, c in (hsnap(int(t), a, b) for t in tops) if c >= cover]
+            bs = [y for y, c in (hsnap(int(bo), a, b) for bo in bots) if c >= cover]
             for t in ts:
                 for bo in bs:
                     h = bo - t
-                    if h > 0.75 * H or h < max(1.15 * fh, 0.2 * H) or not 0.5 <= w / h <= 2.5 or w * h <= best_area:
+                    if h > 0.75 * H or h < max(1.15 * fh, 0.2 * H) or not 0.5 <= w / h <= 2.5:
+                        continue
+                    if (-_n_edge((l, t, r, bo), H, W), w * h) <= best_key:
                         continue
                     mm = int(0.1 * h)
-                    need = cover * (h - 2 * mm)
-                    if cv[bo - mm, l] - cv[t + mm, l] >= need and cv[bo - mm, r] - cv[t + mm, r] >= need:
-                        best, best_area = (int(l), int(t), int(r), int(bo)), w * h
+                    l2, cl = vsnap(int(l), t + mm, bo - mm)
+                    r2, cr = vsnap(int(r), t + mm, bo - mm)
+                    if cl >= cover and cr >= cover:
+                        best, best_key = (l2, int(t), r2, int(bo)), (-_n_edge((l2, t, r2, bo), H, W), w * h)
     return best
+
+
+def _n_edge(box: tuple[int, int, int, int], H: int, W: int) -> int:
+    """How many of a box's sides lie on the frame's edge."""
+    l, t, r, b = box
+    return (l <= 2) + (t <= 2) + (r >= W - 3) + (b >= H - 3)
 
 
 def border_cover(P: np.ndarray, box: tuple[int, int, int, int], thr: float, slack: int = 3) -> float:
@@ -475,12 +538,18 @@ def border_cover(P: np.ndarray, box: tuple[int, int, int, int], thr: float, slac
 
 
 def _cover(ch: np.ndarray, cv: np.ndarray, box: tuple[int, int, int, int], slack: int = 3) -> float:
+    return min(_sides(ch, cv, box, slack))
+
+
+def _sides(ch: np.ndarray, cv: np.ndarray, box: tuple[int, int, int, int], slack: int = 3
+           ) -> tuple[float, float, float, float]:
+    """Steady-line coverage of each side of a box (top, bottom, left, right); each may sit `slack` px off."""
     H, W = ch.shape[0], cv.shape[1]
     l, t, r, b = box
     mw, mh = int(0.1 * (r - l)), int(0.1 * (b - t))
     xa, xb, ya, yb = l + mw, r - mw, t + mh, b - mh
     if xb <= xa or yb <= ya:
-        return 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     def hline(y0: int) -> float:
         ys = np.arange(max(0, y0 - slack), min(H, y0 + slack + 1))
@@ -490,7 +559,26 @@ def _cover(ch: np.ndarray, cv: np.ndarray, box: tuple[int, int, int, int], slack
         xs = np.arange(max(0, x0 - slack), min(W, x0 + slack + 1))
         return float(((cv[yb, xs] - cv[ya, xs]) / (yb - ya)).max())
 
-    return min(hline(t), hline(b), vline(l), vline(r))
+    return hline(t), hline(b), vline(l), vline(r)
+
+
+def _cam_on(ch: np.ndarray, cv: np.ndarray, box: tuple[int, int, int, int], face: bool = False) -> bool:
+    """Is a known cam box on screen in one frame? A cam without a drawn border shows its edge only
+    where it contrasts with the gameplay behind it, so one side may fade for a moment: 3 sides must
+    be clear lines and the 4th at least partly there. A face inside the box is evidence too.
+    Sides on the frame's edge prove nothing (they are always a line): a cam in a corner or along an
+    edge must show all of its inner sides."""
+    H, W = ch.shape[0], cv.shape[1]
+    l, t, r, b = box
+    on_edge = (t <= 2, b >= H - 3, l <= 2, r >= W - 3)
+    inner = sorted(v for v, e in zip(_sides(ch, cv, box), on_edge) if not e)
+    if not inner:
+        return False
+    if len(inner) < 4:
+        return inner[0] >= (0.5 if face else 0.75)
+    if face:
+        return inner[1] >= 0.5 and inner[0] >= 0.25
+    return inner[1] >= 0.75 and inner[0] >= 0.4
 
 
 def _outside_steady(P: np.ndarray, box: tuple[int, int, int, int], thr: float) -> float:
@@ -512,8 +600,8 @@ def _shot_of(f: int, cuts: list[int]) -> int:
 
 
 def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], samples: list[FaceSample],
-                cuts: list[int], overlays: list[list[float]], rc: ReframeCfg
-                ) -> tuple[list[int], dict[int, list[list[float]]]]:
+                cuts: list[int], overlays: list[list[float]], rc: ReframeCfg,
+                hints: list[list[float]] | None = None) -> tuple[list[int], dict[int, list[list[float]]]]:
     """Find facecam boxes; return (cuts, {shot index: cam boxes [x0, y0, x1, y1] as fractions}).
 
     Boxes are found on edge persistence (whole clip, then per shot for cams that move or zoom in).
@@ -543,10 +631,19 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
 
     boxes: list[tuple[int, int, int, int]] = []
 
-    def consider(P, f, t=thr) -> None:
+    def consider(P, f, t=thr) -> bool:
         box = find_cam_box(P, face_px(f), t)
-        if box and _outside_steady(P, box, thr) <= 0.08 and not any(_iou(box, b) > 0.8 for b in boxes):
-            boxes.append(box)
+        if box and _outside_steady(P, box, thr) <= 0.08:
+            if not any(_iou(box, b) > 0.8 for b in boxes):
+                boxes.append(box)
+            return True
+        return False
+
+    # persistence over ~4 s windows: when the gameplay holds still for long (a player standing, a menu),
+    # whole-clip persistence can't tell a cam border from the scene, but a window where it moves can
+    win = 24
+    windows = [sum(unpack(e) for _, e in edges[j:j + win]) / len(edges[j:j + win])
+               for j in range(0, len(edges), win) if len(edges[j:j + win]) >= win // 2] if len(edges) > win else []
 
     # 1) cams that stay put: faces that keep showing up in one spot, on whole-clip persistence
     clusters: list[dict] = []
@@ -562,14 +659,37 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
                 clusters.append({"cx": f[0], "cy": f[1], "faces": [f]})
     for c in sorted(clusters, key=lambda c: -len(c["faces"]))[:6]:
         if len(c["faces"]) >= 3:
-            consider(P_all, list(np.median(np.array(c["faces"])[:, :4], axis=0)))
+            f = list(np.median(np.array(c["faces"])[:, :4], axis=0))
+            if not windows:
+                consider(P_all, f)
+                continue
+            # candidates from the whole clip and from each window; keep the one whose border holds in
+            # the most windows (a static background can make a wrong, larger box look steady overall)
+            cands = {box for P in [P_all, *windows]
+                     if (box := find_cam_box(P, face_px(f), thr)) and _outside_steady(P, box, thr) <= 0.08}
+            if cands:
+                best = max(cands, key=lambda box: (-_n_edge(box, H, W),  # the frame edge always "holds"
+                                                   sum(border_cover(P, box, thr) >= 0.85 for P in windows),
+                                                   -(box[2] - box[0]) * (box[3] - box[1])))
+                if not any(_iou(best, x) > 0.8 for x in boxes):
+                    boxes.append(best)
+    # none found here, but the video's other clips found one: a stream's cam stays put, and this clip
+    # may just never show it clearly against moving gameplay (a menu, a map). Try it where the
+    # streamer's face keeps showing up; presence and validation below decide frame by frame
+    if not boxes and hints:
+        for x0, y0, x1, y1 in hints:
+            b = (round(x0 * W), round(y0 * H), round(x1 * W), round(y1 * H))
+            # any face counts here, also ones too still to pass as a person (a streamer sitting still)
+            if sum(any(b[0] <= x[0] * W <= b[2] and b[1] <= x[1] * H <= b[3] for x in s.faces)
+                   for s in samples) >= 3:
+                boxes.append(b)
     # no cam that persists across the clip -> not a facecam video: never split (court lines,
     # doors and on-screen graphics make rectangles around faces in ordinary footage)
     if not boxes:
         return cuts, {}
     # 2) cams that move or grow (editors zoom the cam in for reactions): per shot
     for k, n in shot_n.items():
-        if n < 4:
+        if n < 4 or len(shot_n) == 1:  # one shot: step 1 already searched it (whole clip + windows)
             continue
         P = shot_sum[k] / n
         seen: list = []
@@ -585,11 +705,21 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
         return cuts, {}
 
     # 3) which cams are on screen in each sample frame (a border shows up as an edge in every frame)
+    by_frame = {s.f: s for s in samples}
+
+    def face_in(b, f) -> bool:
+        return f in by_frame and any(b[0] <= x[0] * W <= b[2] and b[1] <= x[1] * H <= b[3] for x in by_frame[f].faces)
+
     def presence() -> list[tuple]:
+        # boxes whose border holds over the whole clip are fixed overlays: for those, the face alone shows
+        # the cam is there (a rectangle that only formed around an in-game face for a while is not one)
+        ch_all, cv_all = _line_maps(P_all, thr)
+        fixed = {b for b in boxes if _cover(ch_all, cv_all, b) >= 0.85}
         out_states = []
-        for _, e in edges:
+        for f, e in edges:
             ch, cv = _line_maps(unpack(e), 0.5)
-            on = [b for b in boxes if _cover(ch, cv, b) >= 0.75]
+            # the streamer's face inside a known cam box is enough: in dark scenes its edges barely show
+            on = [b for b in boxes if (b in fixed and face_in(b, f)) or _cam_on(ch, cv, b, face_in(b, f))]
             on.sort(key=lambda b: -(b[2] - b[0]) * (b[3] - b[1]))
             keep: list = []
             for b in on:  # a zoomed and a normal version of one cam: keep the bigger
@@ -598,16 +728,15 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
             out_states.append(tuple(sorted(keep[:2])))
         return out_states
 
-    by_frame = {s.f: s for s in samples}
-
     def validated(states: list[tuple]) -> list[tuple]:
         """Drop boxes that rarely hold a face: a facecam shows its person most of the time."""
         good = set()
         for b in boxes:
             on = [frames[j] for j, st in enumerate(states) if b in st]
-            with_face = sum(1 for f in on if f in by_frame and any(
-                b[0] <= x[0] * W <= b[2] and b[1] <= x[1] * H <= b[3] for x in by_frame[f].faces))
-            if on and with_face >= 0.5 * len(on):
+            with_face = sum(1 for f in on if face_in(b, f))
+            # a facecam shows its person most of the time, and is on screen for a fair part of the clip
+            # (a rectangle around an in-game face for half a second is not a cam)
+            if on and with_face >= 0.5 * len(on) and len(on) >= 0.15 * len(states):
                 good.add(b)
         return [tuple(b for b in st if b in good) for st in states]
 
@@ -656,12 +785,19 @@ def detect_cams(edges: list[tuple[int, np.ndarray]], shape: tuple[int, int], sam
         votes = [sm[j] for j, f in enumerate(frames) if _shot_of(f, new_cuts) == k]
         seg_states.append(max(set(votes), key=votes.count) if votes else ())
         seg_len.append(len(votes))
-    # a blip without a cam between cam segments is the cam animating (zooming in/out): keep the split
+    # a blip without a cam between cam segments is the cam animating (zooming in/out): keep the split.
+    # Up to ~3 s with the same cam on both sides is the border fading against the gameplay behind it
+    # (a stream cam doesn't vanish for a second or two): keep it too, so the layout doesn't flicker
+    gap = max(4, round(3 * rc.sample_fps))
     for k, st in enumerate(seg_states):
-        if not st and seg_len[k] <= 4:
-            prev = seg_states[k - 1] if k > 0 else ()
-            nxt = seg_states[k + 1] if k + 1 < len(seg_states) else ()
+        if st:
+            continue
+        prev = seg_states[k - 1] if k > 0 else ()
+        nxt = seg_states[k + 1] if k + 1 < len(seg_states) else ()
+        if seg_len[k] <= 4:
             seg_states[k] = prev or nxt
+        elif seg_len[k] <= gap and prev and prev == nxt:
+            seg_states[k] = prev
     out: dict[int, list[list[float]]] = {}
     for k, st in enumerate(seg_states):
         if st:
@@ -684,17 +820,56 @@ def split_shot(a: int, b: int, cams: list[list[float]], ss: list[FaceSample]) ->
     return Shot(start=a, end=b, mode="split", cams=cams, face_x=fx, face_y=fy, why="facecam over screen")
 
 
-def split_panel_frac(cams: list[list[float]], src_w: int, src_h: int, rc: ReframeCfg) -> float:
+def split_panel_frac(cams: list[list[float]], src_w: int, src_h: int, rc: ReframeCfg,
+                     out_aspect: float = 9 / 16) -> float:
     """Height of the cam panel in a SPLIT layout, as a fraction of the output height.
 
     Sized so the cam is cropped as little as possible, within [split_cam_min, split_cam_max].
+    out_aspect = width/height of the area the layout fills (9:16, or a tweet card's video window).
     """
+    lo, hi = sorted((rc.split_cam_min, rc.split_cam_max))
     if not cams:
-        return rc.split_cam_min
+        return lo
     aspects = [(c[2] - c[0]) * src_w / max(1e-6, (c[3] - c[1]) * src_h) for c in cams]
-    slot = 9 / len(cams)  # output is 9 wide x 16 tall
-    want = slot / (sum(aspects) / len(aspects)) / 16
-    return float(np.clip(want, rc.split_cam_min, rc.split_cam_max))
+    want = out_aspect / len(cams) / (sum(aspects) / len(aspects))
+    return float(np.clip(want, lo, hi))
+
+
+# ---------------------------------------------------------------- smart layout (pure, render time)
+
+def _same_cams(a: Shot, b: Shot) -> bool:
+    return len(a.cams) == len(b.cams) and all(_iou(x, y) > 0.6 for x, y in zip(a.cams, b.cams))
+
+
+def effective_plan(plan: ReframePlan, rc: ReframeCfg) -> ReframePlan:
+    """The framing actually drawn, shot by shot (reframe.smart_layout); the saved plan stays the analysis.
+
+    * a stream (some shots show the facecam): shots with no face are the game on its own -> the whole frame
+      over the background (FIT) instead of a centre crop that throws away two thirds of it;
+    * a short blip without the cam between two shots with the same cam keeps the facecam layout, so the
+      layout doesn't jump for a fraction of a second.
+    """
+    if not rc.smart_layout or rc.screen_layout == "track" or not plan.shots:
+        return plan
+    orig = plan.shots
+    stream = bool(plan.cam_hints) or any(s.mode == "split" and s.cams for s in orig)
+    if not stream:
+        return plan
+    blip = rc.smart_blip_s * plan.fps
+    shots = []
+    for k, s in enumerate(orig):
+        prev = orig[k - 1] if k else None
+        nxt = orig[k + 1] if k + 1 < len(orig) else None
+        if s.mode == "split":
+            shots.append(s)
+        elif (s.end - s.start < blip and prev and nxt and prev.mode == nxt.mode == "split"
+              and prev.cams and _same_cams(prev, nxt)):
+            shots.append(prev.model_copy(update={"start": s.start, "end": s.end, "why": "short blip: cam kept"}))
+        elif s.mode == "center":
+            shots.append(Shot(start=s.start, end=s.end, mode="fit", why="gameplay only: whole frame"))
+        else:
+            shots.append(s)
+    return plan.model_copy(update={"shots": shots})
 
 
 # ---------------------------------------------------------------- facecam layouts (pure)
@@ -736,7 +911,7 @@ def pip_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, rc: Refra
     The screen fills the whole output; each cam goes in a top corner, on the side where it sits in the
     source (a second cam takes the other corner). The cam keeps its own shape, between 3:4 and 16:9.
     """
-    screen = screen_crop(shot.cams, sw, sh, out_w / out_h)
+    screen = screen_crop(shot.cams, sw, sh, max(out_w / out_h, rc.pip_screen_aspect))
     used: set[str] = set()
     cams = []
     for k, (x0, y0, x1, y1) in enumerate(shot.cams[:2]):
@@ -761,6 +936,13 @@ def pip_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, rc: Refra
         y = round(rc.pip_top * out_h)
         cams.append(((int(a), int(b), max(int(a) + 2, int(c)), max(int(b) + 2, int(d))), (x, y, w, h)))
     return screen, cams
+
+
+def pip_band(out_w: int, out_h: int, rc: ReframeCfg) -> tuple[int, int]:
+    """(top, height) of the gameplay band in a PIP frame: the whole frame, or a full-width band in the
+    middle when pip_screen_aspect is wider than the output (over a blurred copy of the gameplay)."""
+    h = min(out_h, int(round(out_w / max(rc.pip_screen_aspect, 0.1) / 2) * 2))
+    return (out_h - h) // 2, h
 
 
 def pip_bottom(shot: Shot, src_w: int, src_h: int, rc: ReframeCfg, out_h: int = 1920) -> int | None:

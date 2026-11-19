@@ -110,6 +110,18 @@ export interface ClipsData {
   clips: Clip[];
 }
 
+export type ScreenLayout = "split" | "pip" | "track";
+export type Background = "blur" | "tweet";
+
+export interface Layout {
+  screen_layout: ScreenLayout;
+  cam_size: number | null; // null = auto (sized to the cam within cam_range)
+  cam_range: [number, number];
+  background: Background;
+  smart_layout: boolean;
+  custom: boolean; // this video has its own layout (else the shorts.yaml defaults)
+}
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
@@ -150,6 +162,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ clip_ids: clipIds }),
     }),
+  layout: (id: string) => req<Layout>(`/api/shorts/jobs/${encodeURIComponent(id)}/layout`),
+  setLayout: (id: string, l: Pick<Layout, "screen_layout" | "cam_size" | "background" | "smart_layout">) =>
+    req<Layout>(`/api/shorts/jobs/${encodeURIComponent(id)}/layout`, { method: "PUT", body: JSON.stringify(l) }),
   reselect: (id: string) => req<Job>(`/api/shorts/jobs/${encodeURIComponent(id)}/reselect`, { method: "POST" }),
   review: (id: string, clipId: string, review: Review) =>
     req<{ id: string; review: Review }>(

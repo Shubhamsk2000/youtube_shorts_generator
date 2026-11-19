@@ -25,13 +25,15 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import AudioCfg, Config, ExportCfg, PreviewCfg, ReframeCfg
+from ..config import AudioCfg, Config, ExportCfg, PreviewCfg, ReframeCfg, with_job_layout
 from ..models import Clip, ReframePlan, Selection, Shot, VideoMeta, load_json
 from common.progress import Reporter
 from common import ffmpeg
 from .captions import ass_path, refresh_clip
 from .pacing import edits_path, kept_duration, load_edits
-from .reframe import crop_to_aspect, pip_geometry, plan_path, screen_crop, split_panel_frac
+from .canvas import Canvas, canvas, canvas_key
+from .reframe import (crop_to_aspect, effective_plan, pip_band, pip_geometry, plan_path, screen_crop,
+                      split_panel_frac)
 from .select import OUT as SELECTION
 
 CLIPS_DIR = "clips"
@@ -45,10 +47,12 @@ def _digest(p: Path) -> str:
 
 def clip_file(job_dir: Path, clip: Clip, cfg: Config, rs: RenderCfg | None = None) -> str:
     """Cache name: changes whenever the range, settings, framing, captions or edits change."""
+    cfg = with_job_layout(cfg, job_dir)
     rs = rs or cfg.preview
     key = json.dumps([round(clip.start, 3), round(clip.end, 3), rs.model_dump(mode="json"),
                       cfg.audio.model_dump(), _digest(plan_path(job_dir, clip)), _digest(ass_path(job_dir, clip)),
-                      _digest(edits_path(job_dir, clip)), cfg.reframe.model_dump(mode="json"), "v5"],
+                      _digest(edits_path(job_dir, clip)), cfg.reframe.model_dump(mode="json"),
+                      canvas_key(cfg, clip), "v6"],
                      sort_keys=True)
     return f"{clip.id}-{hashlib.sha1(key.encode()).hexdigest()[:6]}.mp4"
 
@@ -64,6 +68,7 @@ def refresh_if_stale(job_dir: Path, cfg: Config, c: Clip) -> bool:
 
 def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None = None) -> str:
     report = report or (lambda fraction=None, message=None: None)
+    cfg = with_job_layout(cfg, job_dir)
     sel = load_json(Selection, job_dir / SELECTION)
     pc = cfg.preview
     out_dir = job_dir / CLIPS_DIR
@@ -107,11 +112,14 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
 def render_clip(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config, rs: RenderCfg, dst: Path,
                 on_progress, two_pass_loudness: bool = False) -> None:
     """Render one clip with everything the earlier stages decided (framing, captions, edits)."""
+    cfg = with_job_layout(cfg, job_dir)
     refresh_if_stale(job_dir, cfg, c)
     ass = ass_path(job_dir, c)
     ass = ass if (cfg.captions.enabled or cfg.hook.enabled) and ass.exists() else None
     plan_p = plan_path(job_dir, c)
     plan = load_json(ReframePlan, plan_p) if cfg.reframe.enabled and plan_p.exists() else None
+    plan = effective_plan(plan, cfg.reframe) if plan is not None else None
+    cv = canvas(cfg, rs.width, rs.height, c, job_dir)
     keep, flash = load_edits(job_dir, c)
     keep = keep if cfg.pacing.enabled else None
     src = job_dir / meta.file
@@ -120,7 +128,7 @@ def render_clip(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config, rs: Render
         on_progress(0.0)
         measured = measure_loudness(src, c, keep, cfg.audio, flash)
     tmp = dst.with_name(dst.stem + ".tmp.mp4")
-    _render(src, tmp, c, meta, rs, plan, cfg.reframe, cfg.audio, keep, ass, measured, on_progress, flash)
+    _render(src, tmp, c, meta, rs, plan, cfg.reframe, cfg.audio, keep, ass, measured, on_progress, flash, cv)
     tmp.replace(dst)
 
 
@@ -208,7 +216,7 @@ def _kept_frames(n_hint: int, fps: float, keep) -> callable:
 
 def _render(src: Path, tmp: Path, c: Clip, meta: VideoMeta, rs: RenderCfg, plan: ReframePlan | None,
             rc: ReframeCfg, ac: AudioCfg, keep, ass: Path | None, measured: dict | None, on_progress,
-            flash=None) -> None:
+            flash=None, cv: Canvas | None = None) -> None:
     import cv2
 
     out_w, out_h = rs.width, rs.height
@@ -251,6 +259,7 @@ def _render(src: Path, tmp: Path, c: Clip, meta: VideoMeta, rs: RenderCfg, plan:
     n_est = max(1, round(c.duration * meta.fps))
     kept = _kept_frames(n_est, meta.fps, keep)
     interp = cv2.INTER_LINEAR if rs.fast else None
+    draw = Framer(cv or Canvas(out_w, out_h, (0, 0, out_w, out_h)), meta, rc, cv2, interp)
     i = 0  # source frame index (the plan and the edits count source frames)
     try:
         if flash:  # the cold open: the payoff's frames first, then the clip from its start
@@ -264,7 +273,7 @@ def _render(src: Path, tmp: Path, c: Clip, meta: VideoMeta, rs: RenderCfg, plan:
                     if len(buf) < size:
                         break
                     frame = np.frombuffer(buf, np.uint8).reshape(sh, sw, 3)
-                    out = compose(frame, plan.shot_at(j) if plan else None, j, out_w, out_h, meta, rc, cv2, interp)
+                    out = draw(frame, plan.shot_at(j) if plan else None, j)
                     enc.stdin.write(np.ascontiguousarray(out).tobytes())
                     j += step
             finally:
@@ -277,7 +286,7 @@ def _render(src: Path, tmp: Path, c: Clip, meta: VideoMeta, rs: RenderCfg, plan:
                 break
             if kept(i):
                 frame = np.frombuffer(buf, np.uint8).reshape(sh, sw, 3)
-                out = compose(frame, plan.shot_at(i) if plan else None, i, out_w, out_h, meta, rc, cv2, interp)
+                out = draw(frame, plan.shot_at(i) if plan else None, i)
                 enc.stdin.write(np.ascontiguousarray(out).tobytes())
             i += step
             if i % 30 < step:
@@ -326,17 +335,55 @@ def compose(frame: np.ndarray, shot: Shot | None, i: int, out_w: int, out_h: int
     return _resize(frame[top:top + ch, left:left + cw], out_w, out_h, cv2, interp)
 
 
-def compose_fit(frame: np.ndarray, out_w: int, out_h: int, rc: ReframeCfg, cv2, interp=None) -> np.ndarray:
-    """Whole frame, full width, over a blurred and dimmed fill of itself."""
+def blurred_bg(frame: np.ndarray, out_w: int, out_h: int, rc: ReframeCfg, cv2) -> np.ndarray:
+    """Centre region of the frame with the output's shape, blurred (cheaply, at 1/8 size) and dimmed."""
     h, w = frame.shape[:2]
-    # background: centre 9:16 region, blurred cheaply at 1/8 size
     bw = min(w, round(h * out_w / out_h))
-    x0 = (w - bw) // 2
-    small = cv2.resize(frame[:, x0:x0 + bw], (max(1, out_w // 8), max(1, out_h // 8)), interpolation=cv2.INTER_AREA)
+    bh = min(h, round(bw * out_h / out_w))
+    x0, y0 = (w - bw) // 2, (h - bh) // 2
+    small = cv2.resize(frame[y0:y0 + bh, x0:x0 + bw], (max(1, out_w // 8), max(1, out_h // 8)),
+                       interpolation=cv2.INTER_AREA)
     k = max(1, rc.fit_blur // 8) * 2 + 1
     small = cv2.GaussianBlur(small, (k, k), 0)
     bg = cv2.resize(small, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-    bg = (bg.astype(np.float32) * rc.fit_dim).astype(np.uint8)
+    return (bg.astype(np.float32) * rc.fit_dim).astype(np.uint8)
+
+
+class Framer:
+    """Draws one output frame: the layout (compose) into the canvas window; with a tweet card, over a
+    blurred copy of the frame and under the card (its transparent window gives the video rounded corners)."""
+
+    def __init__(self, cv: Canvas, meta: VideoMeta, rc: ReframeCfg, cv2, interp=None):
+        self.cv, self.meta, self.rc, self.cv2, self.interp = cv, meta, rc, cv2, interp
+        self.card = None
+        if cv.framed and cv.card is not None:
+            rgba = cv2.imread(str(cv.card), cv2.IMREAD_UNCHANGED)
+            if rgba is not None and rgba.shape[:2] == (cv.H, cv.W) and rgba.shape[2] == 4:
+                a = rgba[..., 3]
+                ys, xs = np.nonzero(a)
+                if len(ys):  # blend only the card's bounding box
+                    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+                    al = a[y0:y1, x0:x1, None].astype(np.uint16)
+                    pre = rgba[y0:y1, x0:x1, :3].astype(np.uint16) * al
+                    self.card = (np.s_[y0:y1, x0:x1], 255 - al, pre)
+
+    def __call__(self, frame: np.ndarray, shot: Shot | None, i: int) -> np.ndarray:
+        cv = self.cv
+        if not cv.framed:
+            return compose(frame, shot, i, cv.W, cv.H, self.meta, self.rc, self.cv2, self.interp)
+        x, y, w, h = cv.win
+        out = blurred_bg(frame, cv.W, cv.H, self.rc, self.cv2)
+        out[y:y + h, x:x + w] = compose(frame, shot, i, w, h, self.meta, self.rc, self.cv2, self.interp)
+        if self.card is not None:
+            sl, inv, pre = self.card
+            out[sl] = ((out[sl].astype(np.uint16) * inv + pre + 127) // 255).astype(np.uint8)
+        return out
+
+
+def compose_fit(frame: np.ndarray, out_w: int, out_h: int, rc: ReframeCfg, cv2, interp=None) -> np.ndarray:
+    """Whole frame, full width, over a blurred and dimmed fill of itself."""
+    h, w = frame.shape[:2]
+    bg = blurred_bg(frame, out_w, out_h, rc, cv2)
     fg_h = round(out_w * h / w / 2) * 2
     fg = _resize(frame, out_w, fg_h, cv2, interp)
     y = int(np.clip(round(rc.fit_y * out_h - fg_h / 2), 0, out_h - fg_h))
@@ -347,7 +394,7 @@ def compose_fit(frame: np.ndarray, out_w: int, out_h: int, rc: ReframeCfg, cv2, 
 def split_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, meta: VideoMeta, rc: ReframeCfg
                    ) -> tuple[int, list[tuple[int, int, int, int]], tuple[int, int, int, int]]:
     """(cam panel height, cam source crops (px), screen source crop (px)) for a SPLIT shot."""
-    panel_h = int(round(split_panel_frac(shot.cams, meta.width, meta.height, rc) * out_h / 2) * 2)
+    panel_h = int(round(split_panel_frac(shot.cams, meta.width, meta.height, rc, out_w / out_h) * out_h / 2) * 2)
     n = len(shot.cams)
     slot_w = out_w // n
     cams = []
@@ -358,6 +405,8 @@ def split_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, meta: V
         ix, iy = 0.015 * (x1 - x0), 0.015 * (y1 - y0)
         box = (x0 + ix, y0 + iy, x1 - ix, y1 - iy)
         w_k = out_w - slot_w * (n - 1) if k == n - 1 else slot_w
+        # a short, wide panel keeps a strip of the cam: centre it a bit above the face so the head isn't cut
+        fy = max(0.0, fy - 0.12)
         a, b, c, d = crop_to_aspect(box[0] * sw, box[1] * sh, box[2] * sw, box[3] * sh, w_k / panel_h, fx, fy)
         cams.append((int(a), int(b), max(int(a) + 2, int(c)), max(int(b) + 2, int(d))))
 
@@ -425,8 +474,18 @@ def compose_pip(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, rc: Refra
     """Gameplay/screen fills the frame; the facecam sits in a top corner (rounded, bordered, shadowed)."""
     sh, sw = frame.shape[:2]
     (gl, gt, gr, gb), cams = pip_geometry(shot, sw, sh, out_w, out_h, rc)
-    out = _resize(frame[gt:gb, gl:gr], out_w, out_h, cv2, interp)
-    out = np.array(out, copy=True)  # _resize may hand back a view of the decoded frame
+    by, bh = pip_band(out_w, out_h, rc)
+    if bh >= out_h:
+        out = _resize(frame[gt:gb, gl:gr], out_w, out_h, cv2, interp)
+        out = np.array(out, copy=True)  # _resize may hand back a view of the decoded frame
+    else:  # zoomed out: the gameplay full width, over a blurred and dimmed fill of the same crop
+        screen = frame[gt:gb, gl:gr]
+        small = cv2.resize(screen, (max(1, out_w // 8), max(1, out_h // 8)), interpolation=cv2.INTER_AREA)
+        k = max(1, rc.fit_blur // 8) * 2 + 1
+        small = cv2.GaussianBlur(small, (k, k), 0)
+        out = cv2.resize(small, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+        out = (out.astype(np.float32) * rc.fit_dim).astype(np.uint8)
+        out[by:by + bh] = _resize(screen, out_w, bh, cv2, interp)
     scale = out_w / 1080
     border = round(rc.pip_border * scale)
     pad = border + max(4, round(18 * scale))
