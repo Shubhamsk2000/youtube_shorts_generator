@@ -89,10 +89,21 @@ class Clip(BaseModel):
     show_hook: bool = True       # False: the spoken opening already states the premise, no text banner needed
     context: str = ""            # what a cold viewer is missing at the start (the banner states it)
     loop: bool = False           # the last line sets up the first: replays without a seam
+    focus_match: bool | None = None  # matches the creator's focus note (None = no note was given)
 
     @property
     def duration(self) -> float:
         return self.end - self.start
+
+
+class Focus(BaseModel):
+    """What the creator asked the AI to look for (focus.json in the project). Empty text = the normal picks."""
+    text: str = ""
+    mode: str = "prefer"     # "prefer": these moments first, plus the other strong ones; "only": just these
+
+    @property
+    def active(self) -> bool:
+        return bool(self.text.strip())
 
 
 class Selection(BaseModel):
@@ -103,6 +114,7 @@ class Selection(BaseModel):
     candidates: int = 0      # picks before validation/dedupe
     rejected: dict[str, int] = {}
     clips: list[Clip]
+    focus: Focus | None = None  # the focus note these picks were made with
 
 
 class VideoInfo(BaseModel):

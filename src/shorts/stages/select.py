@@ -12,13 +12,15 @@ import re
 from pathlib import Path
 
 from ..config import Config, SelectCfg
-from ..models import (AudioSignals, Clip, ClipScores, Selection, Sentence, Transcript, VideoInfo, VideoMeta, load_json,
-                      save_json)
+from ..models import (AudioSignals, Clip, ClipScores, Focus, Selection, Sentence, Transcript, VideoInfo, VideoMeta,
+                      load_json, save_json)
 from common.progress import Reporter
 from . import signals
 from .signals import Mark
 
 OUT = "selection.json"
+FOCUS = "focus.json"            # the creator's note: what to look for (optional)
+FOCUS_MAX = 500
 PAD_LEAD, PAD_TAIL = 0.15, 0.4  # seconds of air before/after the speech
 PAD_TAIL_PAYOFF = 0.8           # more air when the payoff is the last line: let the moment land
 CACHE_DIR = "llm_cache"  # keyed by model + full request, so prompt edits invalidate it
@@ -46,7 +48,7 @@ PROMPT = """Video: "{title}"{channel}
 {about}This is part {part} of {parts} of the transcript ({span}). Each line is: [sentence id] (mm:ss) text{heat_note}
 
 {lines}
-
+{focus_note}
 Find EVERY moment in this part that could work as a standalone short ({min_s:.0f}-{max_s:.0f} seconds; 25-45 s is
 the sweet spot: the most-viewed Shorts on YouTube are almost all under 47 s). Be generous: a human reviews your picks, so include borderline ones
 too and let the scores say how good they are. This part is {minutes:.0f} minutes long: expect around {target}
@@ -137,7 +139,7 @@ context you may use. "Opens with" is exactly what the viewer hears first (filler
 automatic warnings: confirm or fix each one.{heat_note}
 
 {candidates}
-
+{focus_note}
 You are now the final editor. Compare ALL candidates against each other (they come from the same video) and run
 each one through these tests, as a viewer scrolling Shorts who has NEVER seen this video:
 - 2-second test: would the opening words alone stop the scroll? A question, a number, stakes, conflict or a bold
@@ -213,6 +215,26 @@ REFINE_SCHEMA = {
     "required": ["clips"],
 }
 
+FOCUS_NOTE = """
+THE CREATOR'S REQUEST: they want shorts about this, in their own words: "{text}"
+{rule}
+Set matches_focus = true on every clip that is about the request, false on the others.
+"""
+FOCUS_RULES = {
+    "prefer": ("Find EVERY moment in this part that matches the request first, including weaker ones (a human reviews "
+               "them), then the other strong moments as usual."),
+    "only": "Return ONLY moments that match the request. If nothing in this part matches, return an empty list.",
+}
+REFINE_FOCUS_NOTE = """
+THE CREATOR'S REQUEST: they want shorts about this, in their own words: "{text}"
+{rule}
+matches_focus: true if the final clip is about the request.
+"""
+REFINE_FOCUS_RULES = {
+    "prefer": "Keep every candidate that matches the request unless it has no payoff at all; judge the others as usual.",
+    "only": "Drop (keep: false) every candidate that does not match the request.",
+}
+
 HEAT_NOTE = ("\n🔥 = viewers rewatched this part a lot (YouTube \"Most replayed\"), 🔥🔥 = the most. "
              "That is real audience data: weigh it heavily.")
 SIGNAL_NOTE = ("\n🔊 = one of the loudest lines of the video (shouting, a big reaction). "
@@ -226,10 +248,11 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, force: bool = False,
         report: Reporter | None = None) -> tuple[Selection, str]:
     report = report or (lambda fraction=None, message=None: None)
     out = job_dir / OUT
+    focus = load_focus(job_dir)
     if out.exists() and not force:
         sel = load_json(Selection, out)
-        # an offline pick is a stopgap: try Gemini again on the next run
-        if sel.source == "gemini" or not _has_key():
+        # an offline pick is a stopgap: try Gemini again on the next run; a new focus note picks again
+        if (sel.source == "gemini" or not _has_key()) and _same_focus(sel.focus, focus):
             return sel, describe(sel, cached=True)
 
     t = load_json(Transcript, job_dir / "transcript.json")
@@ -241,7 +264,8 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, force: bool = False,
         info = load_info(job_dir, meta, cfg) if cfg.select.use_heatmap or cfg.select.refine else None
         sig, marks = _audio(job_dir, t, cfg.select, force, report)
         try:
-            sel = _select_llm(t, meta, cfg.select, job_dir / CACHE_DIR, report, refresh=force, info=info, marks=marks)
+            sel = _select_llm(t, meta, cfg.select, job_dir / CACHE_DIR, report, refresh=force, info=info, marks=marks,
+                              focus=focus)
         except Exception as e:  # noqa: BLE001  (any LLM failure -> offline fallback)
             from common.llm import LLMError
             if not cfg.select.offline_fallback:
@@ -250,8 +274,61 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, force: bool = False,
             report(None, f"Gemini failed ({reason}); using offline picks")
             sel = select_heuristic(t, cfg.select, heat_fn=heat_fn(info, cfg.select), sig=sig, marks=marks)
             sel.note = f"Gemini unavailable: {reason}. These are rough offline picks; Retry later for AI picks."
+            if focus:
+                sel.note += " Your focus note needs the AI: it applies on the retry."
+    sel.focus = focus
     save_json(sel, out)
     return sel, describe(sel)
+
+
+def load_focus(job_dir: Path) -> Focus | None:
+    """The project's focus note, or None (no note, or an empty one)."""
+    p = job_dir / FOCUS
+    if not p.exists():
+        return None
+    try:
+        f = load_json(Focus, p)
+    except Exception:  # noqa: BLE001
+        return None
+    return f if f.active else None
+
+
+def save_focus(job_dir: Path, text: str, mode: str = "prefer") -> Focus | None:
+    """Write (or with empty text, remove) the focus note. Returns what is now in effect."""
+    text = re.sub(r"\s+", " ", text or "").strip()[:FOCUS_MAX]
+    p = job_dir / FOCUS
+    if not text:
+        p.unlink(missing_ok=True)
+        return None
+    f = Focus(text=text, mode=mode if mode in FOCUS_RULES else "prefer")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    save_json(f, p)
+    return f
+
+
+def _same_focus(a: Focus | None, b: Focus | None) -> bool:
+    key = lambda f: (f.text.strip(), f.mode) if f and f.active else None  # noqa: E731
+    return key(a) == key(b)
+
+
+def _focus_note(focus: Focus | None, refine: bool = False) -> str:
+    if not focus:
+        return ""
+    text = focus.text.replace('"', "'")
+    if refine:
+        return REFINE_FOCUS_NOTE.format(text=text, rule=REFINE_FOCUS_RULES[focus.mode])
+    return FOCUS_NOTE.format(text=text, rule=FOCUS_RULES[focus.mode])
+
+
+def _with_focus(schema: dict, focus: Focus | None) -> dict:
+    """The answer schema, plus matches_focus when there is a note (without one the request stays byte-identical,
+    so cached answers keep working)."""
+    if not focus:
+        return schema
+    import copy
+    s = copy.deepcopy(schema)
+    s["properties"]["clips"]["items"]["properties"]["matches_focus"] = {"type": "BOOLEAN"}
+    return s
 
 
 def describe(sel: Selection, cached: bool = False) -> str:
@@ -260,6 +337,9 @@ def describe(sel: Selection, cached: bool = False) -> str:
         msg = f"{n} moment{'s' * (n != 1)} · {sel.model}"
         if sel.candidates:
             msg += f" · {sel.candidates} proposed"
+        if sel.focus:
+            hits = sum(bool(c.focus_match) for c in sel.clips)
+            msg += f" · {hits} match{'es' * (hits != 1)} your focus"
     else:
         msg = f"{n} offline pick{'s' * (n != 1)} (Gemini unavailable)"
     return msg + (" · cached" if cached else "")
@@ -340,7 +420,7 @@ def _notes(heat, marks) -> str:
 
 def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, report: Reporter,
                 refresh: bool = False, info: VideoInfo | None = None,
-                marks: dict[int, Mark] | None = None) -> Selection:
+                marks: dict[int, Mark] | None = None, focus: Focus | None = None) -> Selection:
     from common.llm import generate_json
 
     heat = heat_fn(info, sc)
@@ -355,11 +435,12 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
         prompt = PROMPT.format(
             title=meta.title, channel=channel, about=about, part=i + 1, parts=len(windows), span=span,
             heat_note=_notes(heat, marks), lines="\n".join(_line(s, heat, marks) for s in win),
+            focus_note=_focus_note(focus),
             min_s=sc.min_clip_s, max_s=sc.max_clip_s, minutes=(win[-1].end - win[0].start) / 60,
             target=max(3, round((win[-1].end - win[0].start) / 90)),
         )
         data, used_model = generate_json(
-            prompt, SCHEMA,
+            prompt, _with_focus(SCHEMA, focus),
             models=[sc.model, *sc.fallback_models], cache_dir=cache_dir, system=SYSTEM, refresh=refresh,
             temperature=sc.temperature, timeout_s=sc.timeout_s, max_retries=sc.max_retries,
             min_interval_s=sc.min_interval_s, task="shorts.select", on_status=lambda m: report(i / len(windows), m),
@@ -369,12 +450,18 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
     report(len(windows) / (len(windows) + sc.refine), f"Checking {len(raw)} proposed moments…")
     # keep some spare candidates for the editor pass to choose from
     wide = sc.model_copy(update={"max_clips": sc.max_clips + 10}) if sc.refine else sc
-    clips, rejected = validate(raw, t.sentences, meta.duration, wide, heat, marks=marks)
+    clips, rejected = validate(raw, t.sentences, meta.duration, wide, heat, marks=marks, focus=focus)
+    note = None
+    if focus and focus.mode == "only" and not clips and raw:
+        # nothing matched: better the best moments than an empty project
+        focus = focus.model_copy(update={"mode": "prefer"})
+        clips, rejected = validate(raw, t.sentences, meta.duration, wide, heat, marks=marks, focus=focus)
+        note = "Nothing matched your focus note, so these are the video's best moments instead."
     refined = False
     if sc.refine and clips:
         report(len(windows) / (len(windows) + 1), f"Editor pass: comparing {len(clips)} candidates…")
         try:
-            clips, rej2 = _refine(clips, t, meta, info, sc, cache_dir, report, refresh, heat, marks)
+            clips, rej2 = _refine(clips, t, meta, info, sc, cache_dir, report, refresh, heat, marks, focus)
             calls += 1
             refined = True
             for k, v in rej2.items():
@@ -382,13 +469,15 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
         except Exception as e:  # noqa: BLE001  (first-pass picks are still good)
             report(None, f"Editor pass failed ({e}); keeping first-pass picks")
             clips = clips[:sc.max_clips]
+    if note is None and sc.refine and not refined:
+        note = "Editor pass unavailable: first-pass picks"
     return Selection(source="gemini", model=used_model, calls=calls, candidates=len(raw), rejected=rejected,
-                     clips=clips, note=None if refined or not sc.refine else "Editor pass unavailable: first-pass picks")
+                     clips=clips, note=note)
 
 
 def _refine(clips: list[Clip], t: Transcript, meta: VideoMeta, info: VideoInfo | None, sc: SelectCfg,
             cache_dir: Path, report: Reporter, refresh: bool, heat,
-            marks: dict[int, Mark] | None = None) -> tuple[list[Clip], dict[str, int]]:
+            marks: dict[int, Mark] | None = None, focus: Focus | None = None) -> tuple[list[Clip], dict[str, int]]:
     from common.llm import generate_json
 
     ss = t.sentences
@@ -397,9 +486,9 @@ def _refine(clips: list[Clip], t: Transcript, meta: VideoMeta, info: VideoInfo |
     channel, about = _context(meta, info)
     prompt = REFINE_PROMPT.format(title=meta.title, channel=channel, about=about,
                                   heat_note=_notes(heat, marks), candidates="\n\n".join(blocks),
-                                  min_s=sc.min_clip_s, max_s=sc.max_clip_s)
+                                  min_s=sc.min_clip_s, max_s=sc.max_clip_s, focus_note=_focus_note(focus, refine=True))
     data, _ = generate_json(
-        prompt, REFINE_SCHEMA, models=[sc.model, *sc.fallback_models], cache_dir=cache_dir, system=SYSTEM,
+        prompt, _with_focus(REFINE_SCHEMA, focus), models=[sc.model, *sc.fallback_models], cache_dir=cache_dir, system=SYSTEM,
         refresh=refresh, temperature=sc.temperature, timeout_s=sc.timeout_s, max_retries=sc.max_retries,
         min_interval_s=sc.min_interval_s, task="shorts.refine", on_status=lambda m: report(None, m),
     )
@@ -411,7 +500,8 @@ def _refine(clips: list[Clip], t: Transcript, meta: VideoMeta, info: VideoInfo |
         orig = {"start_id": c.start_sentence, "end_id": c.end_sentence, "title": c.title, "hook": c.hook,
                 "reason": c.reason, "hook_score": c.scores.hook, "standalone_score": c.scores.standalone,
                 "payoff_score": c.scores.payoff, "energy_score": c.scores.energy,
-                "emphasis_words": c.emphasis_words, "payoff_id": c.payoff_sentence, "context": c.context}
+                "emphasis_words": c.emphasis_words, "payoff_id": c.payoff_sentence, "context": c.context,
+                "matches_focus": c.focus_match}
         if r is None:
             raw.append(orig)  # the editor skipped it: keep the first-pass version
             continue
@@ -431,7 +521,7 @@ def _refine(clips: list[Clip], t: Transcript, meta: VideoMeta, info: VideoInfo |
         raw.append({**orig, **{k: v for k, v in r.items() if v not in (None, "", [])},
                     "start_id": a, "end_id": b, "hook": hook,
                     "reason": r.get("reason") or c.reason})
-    clips2, rejected = validate(raw, ss, meta.duration, sc, heat, final=True, marks=marks)
+    clips2, rejected = validate(raw, ss, meta.duration, sc, heat, final=True, marks=marks, focus=focus)
     if dropped:
         rejected["dropped by editor pass"] = dropped
     return clips2, rejected
@@ -452,7 +542,8 @@ def candidate_blocks(clips: list[Clip], ss: list[Sentence], heat=None,
                  for j in range(lo, hi + 1)]
         missing = f"\nMissing for a cold viewer: {c.context}" if c.context else ""
         checks = "".join(f"\nCheck: {w}" for w in lint(c, ss))
-        blocks.append(f"### {cid} · {c.duration:.0f}s · first-pass score {c.score:g} · \"{c.title}\"\n"
+        fm = "" if c.focus_match is None else " · matches the request" if c.focus_match else " · not about the request"
+        blocks.append(f"### {cid} · {c.duration:.0f}s · first-pass score {c.score:g}{fm} · \"{c.title}\"\n"
                       f"Opens with: \"{_opening(c, ss)}\"{missing}{checks}\n" + "\n".join(lines))
     return blocks, cids
 
@@ -477,7 +568,8 @@ def make_windows(sentences: list[Sentence], window_s: float, overlap_s: float) -
 # ---------------------------------------------------------------- validation (pure)
 
 def validate(raw: list[dict], sentences: list[Sentence], duration: float, sc: SelectCfg, heat=None,
-             final: bool = False, marks: dict[int, Mark] | None = None) -> tuple[list[Clip], dict[str, int]]:
+             final: bool = False, marks: dict[int, Mark] | None = None,
+             focus: Focus | None = None) -> tuple[list[Clip], dict[str, int]]:
     """Turn LLM picks into clean clips: snap/fit length, keep the payoff in, cut lead-in filler, drop low
     scores and duplicates, rank. final=True (after the editor pass) also applies the hook/standalone minimums."""
     rejected: dict[str, int] = {}
@@ -539,6 +631,9 @@ def validate(raw: list[dict], sentences: list[Sentence], duration: float, sc: Se
             reject("weak hook"); continue
         if final and scores.standalone < sc.min_standalone_score:
             reject("needs context from the video"); continue
+        hit = bool(r.get("matches_focus")) if focus else None
+        if focus and focus.mode == "only" and not hit:
+            reject("outside your focus"); continue
         cands.append(Clip(
             id=clip_id(start, end), rank=0, start=start, end=end,
             start_sentence=span[0].id, end_sentence=span[-1].id,
@@ -556,10 +651,12 @@ def validate(raw: list[dict], sentences: list[Sentence], duration: float, sc: Se
             description=str(r.get("description") or "").strip()[:500],
             hashtags=[_tag(x) for x in (r.get("hashtags") or []) if _tag(x)][:6],
             heat=h,
+            focus_match=hit,
         ))
 
     kept: list[Clip] = []
-    for c in sorted(cands, key=lambda c: (-c.score, -c.scores.hook, c.start)):
+    # with a focus note, the moments asked for come first (and are the last to fall off at max_clips)
+    for c in sorted(cands, key=lambda c: (not c.focus_match if focus else False, -c.score, -c.scores.hook, c.start)):
         if any(_overlap(c, k) > sc.max_overlap_s for k in kept):
             reject("duplicate / overlapping"); continue
         if len(kept) >= sc.max_clips:

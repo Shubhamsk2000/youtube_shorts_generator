@@ -218,3 +218,23 @@ def test_framing_cant_change_while_processing(ws):
     r.store.put(server.JobState(id="vid1", source="s", title="t", created_at="x", updated_at="x",
                                 status="running", stages=server._fresh_stages()))
     assert c.put("/api/shorts/jobs/vid1/clips/c1/framing", json={"keys": []}).status_code == 409
+
+
+# ---------------------------------------------------------------- focus note
+
+def test_focus_note_is_saved_shown_and_repicks(ws):
+    d = _job_dir(ws)
+    _transcript(d)
+    c, r = _client()
+    r.store.put(server.JobState(id="vid1", source="s", title="t", created_at="x", updated_at="x",
+                                status="done", stages=[st.model_copy(update={"status": "done"})
+                                                       for st in server._fresh_stages()]))
+    assert c.get("/api/shorts/jobs/vid1").json()["focus"] is None
+    j = c.put("/api/shorts/jobs/vid1/focus", json={"text": " the  plane landing ", "mode": "only"}).json()
+    assert j["focus"] == {"text": "the plane landing", "mode": "only"}
+    assert j["status"] == "queued" and not (d / "selection.json").exists()   # picked again
+    assert [s["status"] for s in j["stages"] if s["key"] in ("select", "render")] == ["pending", "pending"]
+    # while that runs the note can't change under it... unless nothing was picked yet
+    assert c.put("/api/shorts/jobs/vid1/focus", json={"text": "x"}).status_code == 200
+    j = c.put("/api/shorts/jobs/vid1/focus", json={"text": ""}).json()
+    assert j["focus"] is None and not (d / "focus.json").exists()

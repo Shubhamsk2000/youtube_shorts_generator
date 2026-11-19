@@ -24,7 +24,7 @@ from common.paths import DATA_DIR, resolve
 from common.sysinfo import free_disk_gb
 
 from .config import LAYOUT_FILE, Config, load_config, load_job_layout, save_local, with_job_layout
-from .models import Selection, Transcript, VideoMeta, load_json, save_json
+from .models import Focus, Selection, Transcript, VideoMeta, load_json, save_json
 from common.progress import Hooks, Reporter
 from .stages import captions, download, reframe, render, select, sources, transcribe
 from common.runner import SerialRunner
@@ -510,6 +510,14 @@ def _friendly(e: BaseException) -> str:
 
 class CreateJob(BaseModel):
     url: str
+    focus: str = ""                                   # optional note: what the AI should look for
+    focus_mode: Literal["prefer", "only"] = "prefer"
+
+
+class FocusBody(BaseModel):
+    text: str
+    mode: Literal["prefer", "only"] = "prefer"
+    repick: bool = True                               # pick the moments again now (when the job is idle)
 
 
 class JobStats(BaseModel):
@@ -523,6 +531,8 @@ class JobStats(BaseModel):
 
 class JobView(JobState):
     stats: JobStats = JobStats()
+    focus: Focus | None = None     # the focus note in effect for the next pick
+    picked_focus: Focus | None = None  # the note the current picks were made with
     progress: float = 0.0          # 0-1, stages weighted by their typical share of the run
     server_time: str = ""          # lets the browser show elapsed times without clock skew
 
@@ -652,6 +662,22 @@ def _dir_size(p: Path) -> int:
     return total
 
 
+def _picked_focus(d: Path) -> Focus | None:
+    """The focus note of the current picks (read from selection.json without loading every clip)."""
+    p = d / select.OUT
+    if not p.exists():
+        return None
+    try:
+        raw = json.loads(p.read_text()).get("focus")
+        return Focus(**raw) if raw else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _same_focus_text(f: Focus | None, text: str, mode: str) -> bool:
+    return bool(f) and f.text == re.sub(r"\s+", " ", text).strip()[:select.FOCUS_MAX] and f.mode == mode
+
+
 def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:50] or "clip"
 
@@ -667,25 +693,34 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         return health.summary(cfg)
 
     def view(job: JobState) -> JobView:
-        return JobView(**job.model_dump(), stats=job_stats(cfg.workspace() / job.id),
-                       progress=weighted_progress(job.stages), server_time=_now())
+        d = cfg.workspace() / job.id
+        return JobView(**job.model_dump(), stats=job_stats(d), progress=weighted_progress(job.stages),
+                       server_time=_now(), focus=select.load_focus(d), picked_focus=_picked_focus(d))
 
     @router.get("/jobs", response_model=list[JobView])
     def list_jobs():
         store.rescan()
         return [view(j) for j in store.all()]
 
-    def start_job(source: str) -> JobState:
-        """URL or local file -> job (an existing one is resumed instead of duplicated)."""
+    def start_job(source: str, focus: str = "", focus_mode: str = "prefer") -> JobState:
+        """URL or local file -> job (an existing one is resumed instead of duplicated). A focus note is saved
+        with it; on an existing finished job a different note picks the moments again."""
         try:
             ref = download.resolve_job(source, cfg)
         except download.DownloadError as e:
             raise HTTPException(422, str(e))
         existing = store.get(ref.id)
         if existing:
+            if focus.strip() and not _same_focus_text(select.load_focus(ref.dir), focus, focus_mode):
+                select.save_focus(ref.dir, focus, focus_mode)
+                if existing.status not in ("queued", "running") and worker.current != ref.id \
+                        and (ref.dir / transcribe.OUT).exists():
+                    repick(ref.id)
+                    return store.get(ref.id)
             if existing.status in ("failed", "interrupted"):
                 worker.submit(ref.id)  # resume: finished stages are cached on disk
             return store.get(ref.id)
+        select.save_focus(ref.dir, focus, focus_mode)
         now = _now()
         store.put(JobState(id=ref.id, source=ref.source, title=ref.title, duration=ref.duration,
                            is_youtube=ref.is_youtube, created_at=now, updated_at=now,
@@ -698,10 +733,11 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         url = body.url.strip()
         if not download.is_url(url):
             raise HTTPException(422, "Paste a full video URL (https://…)")
-        return view(start_job(url))
+        return view(start_job(url, body.focus, body.focus_mode))
 
     @router.put("/uploads/{name}", response_model=JobView)
-    async def upload_video(name: str, request: Request):
+    async def upload_video(name: str, request: Request, focus: str = "",
+                           focus_mode: Literal["prefer", "only"] = "prefer"):
         """The browser streams a local video file as the request body; it is saved to data/shorts/uploads/
         (the job hard-links it, so no second copy on disk) and processed like a downloaded video."""
         name = Path(name).name
@@ -714,7 +750,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         UPLOADS.mkdir(parents=True, exist_ok=True)
         dst = UPLOADS / name
         if dst.exists() and dst.stat().st_size == size:
-            return view(start_job(str(dst)))  # same file uploaded again: reuse it (and its job)
+            return view(start_job(str(dst), focus, focus_mode))  # same file again: reuse it (and its job)
         n = 2
         while dst.exists():
             dst = UPLOADS / f"{Path(name).stem} ({n}){suffix}"
@@ -734,7 +770,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         except Exception:
             dst.unlink(missing_ok=True)
             raise HTTPException(422, "That file isn't a playable video")
-        return view(await run_in_threadpool(start_job, str(dst)))
+        return view(await run_in_threadpool(start_job, str(dst), focus, focus_mode))
 
     @router.get("/jobs/{job_id}", response_model=JobView)
     def get_job(job_id: str):
@@ -916,20 +952,37 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             worker.submit(job_id)
         return _layout_view(load_config(cfg_path), d)
 
+    def repick(job_id: str) -> None:
+        d = cfg.workspace() / job_id
+        (d / select.OUT).unlink(missing_ok=True)
+        for key in ("select", "sources", "reframe", "captions", "render"):
+            store.update(job_id, stage=key, status="pending", progress=None, eta_s=None, message=None,
+                         started_at=None, finished_at=None)
+        worker.submit(job_id)
+
     @router.post("/jobs/{job_id}/reselect", response_model=JobView)
     def reselect_job(job_id: str):
         """Ask Gemini again (e.g. after prompt changes): redo moments -> reframe -> captions -> previews."""
         job = _job_or_404(store, job_id)
         if job.status in ("queued", "running") or worker.current == job_id:
             raise HTTPException(409, "Job is already in progress")
-        d = cfg.workspace() / job_id
-        if not (d / transcribe.OUT).exists():
+        if not (cfg.workspace() / job_id / transcribe.OUT).exists():
             raise HTTPException(409, "Not transcribed yet")
-        (d / select.OUT).unlink(missing_ok=True)
-        for key in ("select", "sources", "reframe", "captions", "render"):
-            store.update(job_id, stage=key, status="pending", progress=None, eta_s=None, message=None,
-                         started_at=None, finished_at=None)
-        worker.submit(job_id)
+        repick(job_id)
+        return view(store.get(job_id))
+
+    @router.put("/jobs/{job_id}/focus", response_model=JobView)
+    def set_focus(job_id: str, body: FocusBody):
+        """Change (or clear, with empty text) what the AI looks for. With repick, the moments are picked again
+        right away when the job is idle and transcribed; otherwise the note applies to the next pick."""
+        job = _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        busy = job.status in ("queued", "running") or worker.current == job_id
+        if busy and (d / select.OUT).exists():
+            raise HTTPException(409, "This video is processing: change the focus when it's done (or stop it first)")
+        select.save_focus(d, body.text, body.mode)
+        if body.repick and not busy and (d / transcribe.OUT).exists():
+            repick(job_id)
         return view(store.get(job_id))
 
     @router.get("/jobs/{job_id}/source")

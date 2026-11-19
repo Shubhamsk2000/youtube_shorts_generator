@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent } from "react";
-import { ArrowRight, FileVideo, Link2, Upload, X } from "lucide-react";
-import { api, jobHref, uploadVideo } from "../api";
+import { ArrowRight, FileVideo, Link2, Sparkles, Upload, X } from "lucide-react";
+import { Segmented, TextArea } from "@kit/ui";
+import { api, jobHref, uploadVideo, type Focus, type FocusMode } from "../api";
 import { cx, errorText, fmtBytes, fmtEta, navigate } from "../lib";
 import { Button, ProgressBar } from "./ui";
+
+const FOCUS_MAX = 500;
+const FOCUS_EXAMPLES = ["the funniest fails", "every time they talk about money", "the plane landing and the crash", "his advice on investing"];
 
 const looksLikeVideoUrl = (s: string) =>
   /^https?:\/\/(www\.|m\.)?(youtube\.com\/(watch|shorts|live)|youtu\.be\/)/i.test(s.trim());
@@ -13,8 +17,12 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
   const [error, setError] = useState<string | null>(null);
   const [upload, setUpload] = useState<{ name: string; size: number; loaded: number; t0: number; abort: () => void } | null>(null);
   const [drag, setDrag] = useState(false);
+  const [focusOpen, setFocusOpen] = useState(false);
+  const [focusText, setFocusText] = useState("");
+  const [focusMode, setFocusMode] = useState<FocusMode>("prefer");
   const fileInput = useRef<HTMLInputElement>(null);
   const uploading = !!upload;
+  const focus: Focus | null = focusOpen && focusText.trim() ? { text: focusText.trim(), mode: focusMode } : null;
 
   useEffect(() => {  // closing the tab mid-upload loses it: ask first
     if (!uploading) return;
@@ -34,7 +42,7 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
       return;
     }
     setError(null);
-    const { done, abort } = uploadVideo(file, (loaded) => setUpload((u) => (u ? { ...u, loaded } : u)));
+    const { done, abort } = uploadVideo(file, (loaded) => setUpload((u) => (u ? { ...u, loaded } : u)), focus);
     setUpload({ name: file.name, size: file.size, loaded: 0, t0: Date.now(), abort });
     try {
       const job = await done;
@@ -68,7 +76,7 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
     setBusy(true);
     setError(null);
     try {
-      const job = await api.create(parsed.toString());
+      const job = await api.create(parsed.toString(), focus);
       navigate(jobHref(job.id));
     } catch (e) {
       setError(errorText(e));
@@ -76,10 +84,10 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
     }
   }
 
-  // Fully automatic: pasting a YouTube link starts the job immediately.
+  // Fully automatic: pasting a YouTube link starts the job immediately (not while a focus note is being written).
   function onPaste(e: ClipboardEvent<HTMLInputElement>) {
     const pasted = e.clipboardData.getData("text");
-    if (looksLikeVideoUrl(pasted) && !blocked) {
+    if (looksLikeVideoUrl(pasted) && !blocked && !focusOpen) {
       e.preventDefault();
       setUrl(pasted.trim());
       submit(pasted);
@@ -154,8 +162,16 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
       </form>
       <div className="mt-2.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-1 text-sm">
         <p className={cx("min-h-5 text-left", error ? "text-err" : "text-faint")}>
-          {error ?? blocked ?? (drag ? "Drop the video to upload it" : "Pasting a link starts processing right away.")}
+          {error ?? blocked ?? (drag ? "Drop the video to upload it" : focusOpen ? "Press Generate when your note is ready." : "Pasting a link starts processing right away.")}
         </p>
+        <button
+          type="button"
+          onClick={() => setFocusOpen(!focusOpen)}
+          aria-expanded={focusOpen}
+          className={cx("inline-flex items-center gap-1.5 rounded-lg px-1.5 py-0.5 font-medium transition hover:text-fg", focusOpen ? "text-accent" : "text-muted")}
+        >
+          <Sparkles className="size-3.5" /> {focusOpen ? "Hide focus note" : "Tell the AI what to look for"}
+        </button>
         <button
           type="button"
           onClick={() => fileInput.current?.click()}
@@ -164,6 +180,22 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
         >
           <Upload className="size-3.5" /> or upload a video file
         </button>
+        {focusOpen && (
+          <div className="fade-in w-full basis-full rounded-xl border border-line bg-surface p-3 text-left shadow-card">
+            <label htmlFor="focus-note" className="mb-1.5 block text-xs font-medium text-muted">
+              What should the shorts be about? <span className="font-normal text-faint">Optional · the AI looks for these moments first</span>
+            </label>
+            <TextArea id="focus-note" value={focusText} onChange={(e) => setFocusText(e.target.value.slice(0, FOCUS_MAX))} rows={2}
+              placeholder={`e.g. ${FOCUS_EXAMPLES.join(", ")}`} />
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+              <Segmented<FocusMode> value={focusMode} onChange={setFocusMode} options={[
+                { value: "prefer", label: "These first", hint: "These moments first, plus the video's other strong moments" },
+                { value: "only", label: "Only these", hint: "Just these moments (if nothing matches, you still get the best ones)" },
+              ]} />
+              <span className="font-mono text-[11px] text-faint">{focusText.length}/{FOCUS_MAX}</span>
+            </div>
+          </div>
+        )}
         <input
           ref={fileInput}
           type="file"

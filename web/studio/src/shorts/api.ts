@@ -26,6 +26,14 @@ export interface JobStats {
   picked_by: "gemini" | "heuristic" | null;
 }
 
+export type FocusMode = "prefer" | "only";
+
+/** The creator's note: what the AI should look for. */
+export interface Focus {
+  text: string;
+  mode: FocusMode;
+}
+
 export interface Job {
   id: string;
   source: string;
@@ -45,6 +53,8 @@ export interface Job {
   stats: JobStats;
   progress: number;
   server_time: string;
+  focus: Focus | null;        // applies to the next pick
+  picked_focus: Focus | null; // the current picks were made with this
 }
 
 export interface Check {
@@ -100,6 +110,7 @@ export interface Clip {
   show_hook?: boolean;
   context?: string;
   loop?: boolean;
+  focus_match?: boolean | null;
   description: string;
   hashtags: string[];
   heat: number | null;
@@ -214,7 +225,10 @@ export const api = {
   system: () => request<SystemInfo>(`${S}/system`, { timeoutMs: 20000 }),
   jobs: () => request<Job[]>(`${S}/jobs`),
   job: (id: string) => request<Job>(J(id)),
-  create: (url: string) => request<Job>(`${S}/jobs`, { ...json("POST", { url }), timeoutMs: 90000 }),
+  create: (url: string, focus?: Focus | null) =>
+    request<Job>(`${S}/jobs`, { ...json("POST", { url, focus: focus?.text ?? "", focus_mode: focus?.mode ?? "prefer" }), timeoutMs: 90000 }),
+  setFocus: (id: string, text: string, mode: FocusMode, repick = true) =>
+    request<Job>(`${J(id)}/focus`, json("PUT", { text, mode, repick })),
   retry: (id: string) => request<Job>(`${J(id)}/retry`, json("POST")),
   stop: (id: string) => request<Job>(`${J(id)}/stop`, json("POST")),
   remove: (id: string, exports = false) => request<void>(`${J(id)}?exports=${exports}`, json("DELETE")),
@@ -274,10 +288,12 @@ export const editorHref = (id: string, clipId: string) => `/jobs/${encodeURIComp
 export function uploadVideo(
   file: File,
   onProgress: (loaded: number, total: number) => void,
+  focus?: Focus | null,
 ): { done: Promise<Job>; abort: () => void } {
   const xhr = new XMLHttpRequest();
   const done = new Promise<Job>((resolve, reject) => {
-    xhr.open("PUT", `${S}/uploads/${encodeURIComponent(file.name)}`);
+    const q = focus?.text.trim() ? `?focus=${encodeURIComponent(focus.text.trim())}&focus_mode=${focus.mode}` : "";
+    xhr.open("PUT", `${S}/uploads/${encodeURIComponent(file.name)}${q}`);
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded, e.total);
     xhr.onload = () => {
       let body: { detail?: string } & Partial<Job> = {};

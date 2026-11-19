@@ -143,13 +143,20 @@ def export(job: str, config: Path = ConfigOpt,
 
 
 @app.command()
-def make(source: str, config: Path = ConfigOpt) -> None:
+def make(source: str, config: Path = ConfigOpt,
+         focus: str = typer.Option("", help="What the AI should look for, e.g. \"the argument about money\""),
+         only: bool = typer.Option(False, help="With --focus: pick only those moments")) -> None:
     """Run the full pipeline (stages implemented so far) on a URL or local file."""
     from . import pipeline
+    from .stages import download, select
     from common.progress import ConsoleHooks
 
     cfg = load_config(config)
-    job_dir = _guard(lambda: pipeline.run(source, cfg, ConsoleHooks()))
+    job = None
+    if focus.strip():
+        job = _guard(lambda: download.resolve_job(source, cfg))
+        select.save_focus(job.dir, focus, "only" if only else "prefer")
+    job_dir = _guard(lambda: pipeline.run(source, cfg, ConsoleHooks(), job=job))
     console.print(f"[bold green]done[/] → {job_dir}")
 
 

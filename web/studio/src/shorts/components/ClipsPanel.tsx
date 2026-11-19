@@ -11,7 +11,7 @@ import { ClipEditor } from "./ClipEditor";
 import { ModelPicker } from "./ModelPicker";
 import { Card, CardHeader } from "./ui";
 
-type Filter = "all" | "pending" | "approved" | "rejected" | "hd";
+type Filter = "all" | "pending" | "approved" | "rejected" | "hd" | "focus";
 type Sort = "rank" | "score" | "hook" | "heat" | "short" | "long" | "time";
 
 const FILTERS: { value: Filter; label: string; test: (c: Clip) => boolean }[] = [
@@ -20,6 +20,7 @@ const FILTERS: { value: Filter; label: string; test: (c: Clip) => boolean }[] = 
   { value: "approved", label: "Approved", test: (c) => c.review === "approved" },
   { value: "rejected", label: "Rejected", test: (c) => c.review === "rejected" },
   { value: "hd", label: "HD", test: (c) => !!c.final_url },
+  { value: "focus", label: "Focus", test: (c) => !!c.focus_match },
 ];
 
 const SORTS: Record<Sort, { label: string; fn: (a: Clip, b: Clip) => number }> = {
@@ -205,7 +206,7 @@ export function ClipsPanel({ job, onSeek, onJob }: { job: Job; onSeek: (t: numbe
       {clips.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 border-b border-line px-5 py-3">
           <div className="flex flex-wrap gap-0.5 rounded-lg bg-surface-2 p-0.5" role="tablist" aria-label="Filter clips">
-            {FILTERS.map((f) => (
+            {FILTERS.filter((f) => f.value !== "focus" || counts.focus > 0 || filter === "focus").map((f) => (
               <button key={f.value} role="tab" aria-selected={filter === f.value} onClick={() => setFilter(f.value)}
                 className={cx("rounded-md px-2.5 py-1 text-xs font-medium transition",
                   filter === f.value ? "bg-surface text-fg shadow-card" : "text-muted hover:text-fg")}>
@@ -410,8 +411,13 @@ function ClipCard({ clip: c, ex, outdated, onSeek, onReview, onExport, onEdit, e
             <Pencil className="size-3.5" />
           </button>
         </div>
-        {(c.hook_text || c.show_hook === false || c.loop || (c.heat != null && c.heat >= 0.6)) && (
+        {(c.hook_text || c.show_hook === false || c.loop || c.focus_match || (c.heat != null && c.heat >= 0.6)) && (
           <div className="flex flex-wrap gap-1.5">
+            {c.focus_match && (
+              <span className="inline-flex items-center gap-0.5 rounded-md bg-accent-soft px-1.5 py-0.5 text-[11px] font-medium text-accent" title="Matches your focus note">
+                <Sparkles className="size-3" /> Focus
+              </span>
+            )}
             {c.show_hook === false ? (
               <span className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[11px] font-medium text-muted" title="The first spoken line already states the premise, so no text banner is shown">
                 Spoken hook · no banner
