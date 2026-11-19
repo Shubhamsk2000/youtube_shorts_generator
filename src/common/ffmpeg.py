@@ -78,6 +78,37 @@ def video_info(path: Path) -> dict:
     }
 
 
+def duration(path: Path) -> float:
+    """Container duration in seconds (also for audio-only files)."""
+    info = probe(path)
+    d = info["format"].get("duration")
+    if d is None:
+        d = max((float(s.get("duration") or 0) for s in info.get("streams", [])), default=0)
+    return float(d or 0)
+
+
+def start_time(path: Path) -> float:
+    """First timestamp of the file (0 for most; a -copyts cut keeps its source's)."""
+    return float(probe(path)["format"].get("start_time") or 0)
+
+
+def end_time(path: Path) -> float:
+    """Timestamp where the last packet ends (any stream): exact for files whose duration field isn't."""
+    proc = subprocess.run(
+        [require("ffprobe"), "-v", "error", "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0",
+         str(path)], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise FFmpegError(proc.stderr.strip())
+    end = 0.0
+    for line in proc.stdout.splitlines():
+        parts = line.split(",")
+        try:
+            end = max(end, float(parts[0]) + (float(parts[1]) if len(parts) > 1 and parts[1] not in ("", "N/A") else 0))
+        except ValueError:
+            continue
+    return end
+
+
 def extract_audio(src: Path, dst: Path, sample_rate: int = 16000) -> None:
     """Mono 16 kHz PCM WAV, what Whisper expects."""
     tmp = dst.with_name(dst.stem + ".tmp.wav")

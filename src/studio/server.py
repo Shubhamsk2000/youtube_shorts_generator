@@ -70,7 +70,7 @@ def create_app(shorts_cfg: Path | None = None, anime_cfg: Path | None = None) ->
         return {
             "version": __version__,
             "queue": snap,
-            "disk_free_gb": round(free_disk_gb(DATA_DIR), 1),
+            "disk_free_gb": round(min(free_disk_gb(DATA_DIR), free_disk_gb(shorts.store.cfg.workspace())), 1),
             "ram_available_gb": round(available_ram_gb(), 1),
             "gemini": bool(os.getenv("GEMINI_API_KEY", "").strip()),
             "ai": _ai_route(shorts_cfg),

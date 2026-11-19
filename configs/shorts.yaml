@@ -8,6 +8,14 @@ download:
   cookies_file: data/shorts/cookies.txt  # exported YouTube cookies; used if present (needed on servers)
   min_free_disk_gb: 3.0
   live_last_min: 0          # live streams: only the last N minutes up to now (0 = whole stream from the start)
+  mode: auto                # auto: the whole video while it is <= full_max_gb, else "clips": only the AUDIO of the whole
+                            # video (≈70 MB/h) for transcribe + select, then only the picked clips' video (~1 min each).
+                            # A 24 h 1440p stream needs ≈7 GB this way instead of ≈98 GB. "full" / "clips" force one
+  full_max_gb: 6
+  clip_pad_s: 3             # each clip's own video file reaches this far beyond the clip
+  keep_source: false        # false: delete the full download once every clip has its own video file (YouTube only;
+                            # uploaded files are never deleted). Re-picks and exports then fetch just the clip ranges
+  max_hours: 36             # longest video accepted
 
 transcribe:
   model: large-v3-turbo     # most accurate that's still faster than realtime on 2 vCPU (1.8x; small.en = 2.8x, more mistakes)
@@ -17,6 +25,7 @@ transcribe:
   vad: true
   min_word_prob: 0.0        # words below this are dropped (0 = keep all)
   title_hints: true         # title + channel as Whisper hints: names spelled right, and turbo keeps its punctuation
+  chunk_min: 30             # long audio is transcribed in 30 min chunks, each saved: an interrupted run resumes
 
 sentences:
   max_words: 20             # split long run-on sentences (shorter units = clip edges closer to the hook / payoff)

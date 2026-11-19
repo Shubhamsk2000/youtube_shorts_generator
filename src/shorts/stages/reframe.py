@@ -98,7 +98,7 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
         for i, c in enumerate(todo):
             def prog(frac: float, c=c, i=i) -> None:
                 report((done + frac * c.duration) / total, f"Clip {i + 1}/{len(todo)}: tracking faces…")
-            plan = analyze(job_dir / meta.file, c, meta, rc, det, prog, tdet)
+            plan = _analyze_clip(job_dir, meta, cfg, c, rc, det, prog, tdet)
             save_json(plan, plan_path(job_dir, c))
             done += c.duration
 
@@ -117,7 +117,7 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
             det = _detector(rc)
             for i, c in enumerate(retry):
                 report(None, f"Clip {i + 1}/{len(retry)} without a cam: trying the video's facecam…")
-                plan = analyze(job_dir / meta.file, c, meta, rc, det, lambda _f: None, None, hints)
+                plan = _analyze_clip(job_dir, meta, cfg, c, rc, det, lambda _f: None, None, hints)
                 plan.texts = plans[c.id].texts  # unchanged; text detection is the slow part
                 save_json(plan, plan_path(job_dir, c))
             todo = todo or retry
@@ -136,6 +136,17 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
 
 
 # ---------------------------------------------------------------- analysis (I/O)
+
+def _analyze_clip(job_dir: Path, meta: VideoMeta, cfg: Config, c: Clip, rc: ReframeCfg, det, on_progress,
+                  text_det=None, cam_hints=None) -> ReframePlan:
+    """analyze() on the clip's own video file; the plan is keyed by the clip's real range."""
+    from . import sources
+
+    src, lc = sources.resolve(job_dir, meta, c, cfg)
+    plan = analyze(src, lc, meta, rc, det, on_progress, text_det, cam_hints)
+    plan.key = plan_key(c, rc)
+    return plan
+
 
 def ensure_model() -> Path:
     return _ensure(MODEL, MODEL_URL, MODEL_SHA256, "face")

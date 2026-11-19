@@ -69,6 +69,7 @@ def select(job: str, config: Path = ConfigOpt, force: bool = typer.Option(False,
     from .stages import reframe as rf
     from .stages import render as rd
     from .stages import select as sl
+    from .stages import sources as sr
 
     cfg = load_config(config)
     job_dir = _job_dir(job, cfg)
@@ -82,6 +83,7 @@ def select(job: str, config: Path = ConfigOpt, force: bool = typer.Option(False,
             console.print(f"[yellow]{sel.note}[/]")
         for c in sel.clips:
             console.print(f" {c.rank:>2}. [bold]{c.score:4.1f}[/] {c.start / 60:5.1f}m +{c.duration:4.1f}s  {c.title}")
+        hooks.stage_done("sources", sr.run(job_dir, meta, cfg, report=hooks.reporter("sources")))
         hooks.stage_done("reframe", rf.run(job_dir, meta, cfg, report=hooks.reporter("reframe")))
         hooks.stage_done("captions", cp.run(job_dir, cfg, report=hooks.reporter("captions")))
         hooks.stage_done("render", rd.run(job_dir, meta, cfg, report=hooks.reporter("render")))
@@ -95,6 +97,7 @@ def debug_reframe(job: str, rank: int = typer.Argument(1, help="Clip rank (1 = b
     from .models import ReframePlan, Selection, VideoMeta, load_json
     from .stages import reframe as rf
     from .stages import render as rd
+    from .stages import sources as sr
 
     cfg = load_config(config)
     job_dir = _job_dir(job, cfg)
@@ -109,7 +112,8 @@ def debug_reframe(job: str, rank: int = typer.Argument(1, help="Clip rank (1 = b
         raise typer.Exit(1)
     plan = load_json(ReframePlan, p)
     out = job_dir / rf.REFRAME_DIR / f"{clip.id}.debug.mp4"
-    rd.render_debug(job_dir / meta.file, out, clip, meta, plan)
+    src, local = _guard(lambda: sr.resolve(job_dir, meta, clip, cfg))
+    rd.render_debug(src, out, local, meta, plan)
     for s in plan.shots:
         console.print(f" {s.start / plan.fps:6.2f}s  {s.mode:<6} {s.why}")
     console.print(f"[green]debug video:[/] {out}")
@@ -180,6 +184,7 @@ def _guard(fn):
     """Show pipeline errors as one clean message instead of a traceback."""
     from .export import ExportError
     from .stages.download import DownloadError
+    from .stages.sources import SourceError
     from common.ffmpeg import FFmpegError
     from common.lock import JobBusyError
     from common.llm import LLMError
@@ -187,7 +192,7 @@ def _guard(fn):
 
     try:
         return fn()
-    except (DownloadError, FFmpegError, StageProcessError, JobBusyError, LLMError, ExportError) as e:
+    except (DownloadError, FFmpegError, StageProcessError, JobBusyError, LLMError, ExportError, SourceError) as e:
         console.print(f"[red]error:[/] {e}")
         raise typer.Exit(1)
     except KeyboardInterrupt:

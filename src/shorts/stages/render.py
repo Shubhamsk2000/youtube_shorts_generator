@@ -35,6 +35,7 @@ from .canvas import Canvas, canvas, canvas_key
 from .reframe import (crop_to_aspect, effective_plan, pip_band, pip_geometry, plan_path, screen_crop,
                       split_panel_frac)
 from .select import OUT as SELECTION
+from . import sources
 
 CLIPS_DIR = "clips"
 FLASH_FADE_S = 0.03
@@ -122,13 +123,13 @@ def render_clip(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config, rs: Render
     cv = canvas(cfg, rs.width, rs.height, c, job_dir)
     keep, flash = load_edits(job_dir, c)
     keep = keep if cfg.pacing.enabled else None
-    src = job_dir / meta.file
+    src, lc = sources.resolve(job_dir, meta, c, cfg)  # the clip's own video file, on that file's timeline
     measured = None
     if two_pass_loudness:
         on_progress(0.0)
-        measured = measure_loudness(src, c, keep, cfg.audio, flash)
+        measured = measure_loudness(src, lc, keep, cfg.audio, flash)
     tmp = dst.with_name(dst.stem + ".tmp.mp4")
-    _render(src, tmp, c, meta, rs, plan, cfg.reframe, cfg.audio, keep, ass, measured, on_progress, flash, cv)
+    _render(src, tmp, lc, meta, rs, plan, cfg.reframe, cfg.audio, keep, ass, measured, on_progress, flash, cv)
     tmp.replace(dst)
 
 

@@ -20,6 +20,17 @@ class DownloadCfg(_Strict):
     cookies_file: Path = Path("data/shorts/cookies.txt")  # used only if it exists
     min_free_disk_gb: float = 3.0
     live_last_min: float = 0.0   # live streams: only the last N minutes up to now (0 = from the start)
+    # How the source is fetched:
+    #   "full"  = download the whole video (as before)
+    #   "clips" = download only the AUDIO of the whole video (for transcribe + select), then only the video
+    #             of the picked clips (each its own small file). For long streams that would never fit on disk.
+    #   "auto"  = "full" while the whole video is at most full_max_gb (and fits the disk), else "clips"
+    mode: Literal["auto", "full", "clips"] = "auto"
+    full_max_gb: float = 6.0
+    clip_pad_s: float = 3.0      # clip video files reach this far beyond the clip on each side
+    keep_source: bool = False    # False: delete the full download once every clip has its own video file
+                                 # (YouTube only; uploaded local files are never deleted)
+    max_hours: float = 36.0      # longest source accepted (the 16 kHz audio of 37 h hits the 4 GB WAV limit)
 
 
 class TranscribeCfg(_Strict):
@@ -30,6 +41,8 @@ class TranscribeCfg(_Strict):
     vad: bool = True
     min_word_prob: float = 0.0
     title_hints: bool = True   # pass the video title / channel to Whisper so names and terms are spelled right
+    chunk_min: float = 30.0    # audio longer than 1.5x this is transcribed in chunks of this length, each saved
+                               # as it finishes, so an interrupted multi-hour stream resumes where it stopped
 
 
 class SentenceCfg(_Strict):
