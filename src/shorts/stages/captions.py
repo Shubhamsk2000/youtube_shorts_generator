@@ -13,12 +13,13 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..config import CaptionCfg, Config, HookCfg
+from ..config import CaptionCfg, Config, HookCfg, with_job_layout
 from ..text import merge_fragments
 from ..models import Clip, ReframePlan, Selection, Transcript, VideoMeta, load_json
 from common.progress import Reporter
 from . import pacing
-from .reframe import pip_bottom, plan_path, split_panel_frac, visible_text_boxes
+from .canvas import canvas
+from .reframe import effective_plan, pip_bottom, plan_path, split_panel_frac, visible_text_boxes
 from .select import OUT as SELECTION
 
 CAPTIONS_DIR = "captions"
@@ -51,6 +52,7 @@ def run(job_dir: Path, cfg: Config, *, report: Reporter | None = None) -> str:
     out_dir = job_dir / CAPTIONS_DIR
     out_dir.mkdir(exist_ok=True)
     (job_dir / pacing.EDITS_DIR).mkdir(exist_ok=True)
+    cfg = with_job_layout(cfg, job_dir)
     sel = load_json(Selection, job_dir / SELECTION)
     t = load_json(Transcript, job_dir / "transcript.json")
     meta = load_json(VideoMeta, job_dir / "meta.json")
@@ -88,7 +90,9 @@ def build_clip(job_dir: Path, cfg: Config, t: Transcript, meta: VideoMeta, c: Cl
                ) -> tuple[list[pacing.Span] | None, pacing.Span | None, int]:
     """Pacing + cold open + captions for one clip -> edits/<id>.json and captions/<id>.ass.
     Returns (keep, flash, caption lines); no .ass is left when the clip has neither captions nor a hook."""
+    cfg = with_job_layout(cfg, job_dir)
     cc = cfg.captions
+    cv = canvas(cfg, W, H, c)  # tweet card: everything sits inside its video window
     keep = None
     audio = (pacing.ClipAudio(job_dir / "audio.wav", c.start, c.duration)
              if cfg.pacing.enabled or cfg.cold_open.enabled else None)
@@ -100,31 +104,50 @@ def build_clip(job_dir: Path, cfg: Config, t: Transcript, meta: VideoMeta, c: Cl
 
     lines = build_lines(edit_words(clip_words(t, c, cc), keep, c.duration, cc, lead), cc) if cc.enabled else []
     hook = hook_text(c) if cfg.hook.enabled and (c.show_hook or not cfg.hook.auto) else ""
+    if cv.framed:
+        hook = ""  # the tweet text is the hook
     p = ass_path(job_dir, c)
     if not lines and not hook:
         p.unlink(missing_ok=True)
         return keep, flash, 0
     plan_p = plan_path(job_dir, c)
     plan = load_json(ReframePlan, plan_p) if cfg.reframe.enabled and plan_p.exists() else None
+    plan = effective_plan(plan, cfg.reframe) if plan is not None else None
+    win_aspect = cv.win[2] / cv.win[3]
+
+    def seam(shot) -> int | None:
+        """Stacked facecam shot -> y (canvas px) of the line between the cam panel and the gameplay."""
+        if shot.mode == "split" and shot.cams and cfg.reframe.screen_layout == "split":
+            return cv.y(split_panel_frac(shot.cams, meta.width, meta.height, cfg.reframe, win_aspect))
+        return None
 
     def line_y(start: float) -> int | None:
         """Facecam split shot -> caption centred on the seam between cam and screen; otherwise moved off
         any burned-in text it would cover. None = the default position."""
+        default = cv.y(cc.position) - round(cc.size * 0.6) if cv.framed else None
         if plan is None:
-            return None
+            return default
         fi = int(pacing.unmap(max(0.0, start - lead), keep) * plan.fps)
         shot = plan.shot_at(fi)
-        if shot.mode == "split" and shot.cams and cfg.reframe.screen_layout == "split":
-            return round(split_panel_frac(shot.cams, meta.width, meta.height, cfg.reframe) * H)
+        if (y := seam(shot)) is not None:
+            return y
+        if cv.framed:  # source text positions aren't mapped into the card window
+            return default
         return avoid_y(visible_text_boxes(plan, fi, cfg.reframe), cc)
 
     hook_min_y = None
-    if hook and plan is not None:  # keep the hook clear of a corner cam on screen while it shows
+    if hook and plan is not None:  # keep the hook clear of the facecam (corner or top panel) while it shows
         spans = [(0, int(pacing.unmap(min(cfg.hook.duration_s, c.duration), keep) * plan.fps) + 1)]
         if flash:  # the cold open plays first, from the payoff's frames
             spans.append((int(flash[0] * plan.fps), int(flash[1] * plan.fps) + 1))
-        bottoms = [b for sh in plan.shots if any(sh.start < e and s < sh.end for s, e in spans)
-                   if (b := pip_bottom(sh, plan.src_w, plan.src_h, cfg.reframe, H)) is not None]
+        bottoms = []
+        for sh in plan.shots:
+            if not any(sh.start < e and s < sh.end for s, e in spans):
+                continue
+            if (b := pip_bottom(sh, plan.src_w, plan.src_h, cfg.reframe, H)) is not None:
+                bottoms.append(b)
+            elif (y := seam(sh)) is not None:  # below the caption line that sits on the seam
+                bottoms.append(y + round(cc.size * 0.6))
         hook_min_y = max(bottoms) if bottoms else None
     text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead, hook_min_y=hook_min_y)
     if not p.exists() or p.read_text() != text:  # unchanged files keep their render cache valid

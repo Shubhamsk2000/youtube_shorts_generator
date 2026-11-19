@@ -28,7 +28,7 @@ import numpy as np
 
 from common.paths import MODELS_DIR
 
-from ..config import Config, ReframeCfg
+from ..config import Config, ReframeCfg, with_job_layout
 from ..models import Clip, FaceSample, ReframePlan, Selection, Shot, TextSample, VideoMeta, load_json, save_json
 from common.progress import Reporter
 from common.ffmpeg import require
@@ -68,6 +68,7 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, report: Reporter | None 
     out_dir = job_dir / REFRAME_DIR
     out_dir.mkdir(exist_ok=True)
     sel = load_json(Selection, job_dir / SELECTION)
+    cfg = with_job_layout(cfg, job_dir)
     rc = cfg.reframe
     if not rc.enabled:
         for f in out_dir.glob("*.json"):
@@ -819,17 +820,56 @@ def split_shot(a: int, b: int, cams: list[list[float]], ss: list[FaceSample]) ->
     return Shot(start=a, end=b, mode="split", cams=cams, face_x=fx, face_y=fy, why="facecam over screen")
 
 
-def split_panel_frac(cams: list[list[float]], src_w: int, src_h: int, rc: ReframeCfg) -> float:
+def split_panel_frac(cams: list[list[float]], src_w: int, src_h: int, rc: ReframeCfg,
+                     out_aspect: float = 9 / 16) -> float:
     """Height of the cam panel in a SPLIT layout, as a fraction of the output height.
 
     Sized so the cam is cropped as little as possible, within [split_cam_min, split_cam_max].
+    out_aspect = width/height of the area the layout fills (9:16, or a tweet card's video window).
     """
+    lo, hi = sorted((rc.split_cam_min, rc.split_cam_max))
     if not cams:
-        return rc.split_cam_min
+        return lo
     aspects = [(c[2] - c[0]) * src_w / max(1e-6, (c[3] - c[1]) * src_h) for c in cams]
-    slot = 9 / len(cams)  # output is 9 wide x 16 tall
-    want = slot / (sum(aspects) / len(aspects)) / 16
-    return float(np.clip(want, rc.split_cam_min, rc.split_cam_max))
+    want = out_aspect / len(cams) / (sum(aspects) / len(aspects))
+    return float(np.clip(want, lo, hi))
+
+
+# ---------------------------------------------------------------- smart layout (pure, render time)
+
+def _same_cams(a: Shot, b: Shot) -> bool:
+    return len(a.cams) == len(b.cams) and all(_iou(x, y) > 0.6 for x, y in zip(a.cams, b.cams))
+
+
+def effective_plan(plan: ReframePlan, rc: ReframeCfg) -> ReframePlan:
+    """The framing actually drawn, shot by shot (reframe.smart_layout); the saved plan stays the analysis.
+
+    * a stream (some shots show the facecam): shots with no face are the game on its own -> the whole frame
+      over the background (FIT) instead of a centre crop that throws away two thirds of it;
+    * a short blip without the cam between two shots with the same cam keeps the facecam layout, so the
+      layout doesn't jump for a fraction of a second.
+    """
+    if not rc.smart_layout or rc.screen_layout == "track" or not plan.shots:
+        return plan
+    orig = plan.shots
+    stream = bool(plan.cam_hints) or any(s.mode == "split" and s.cams for s in orig)
+    if not stream:
+        return plan
+    blip = rc.smart_blip_s * plan.fps
+    shots = []
+    for k, s in enumerate(orig):
+        prev = orig[k - 1] if k else None
+        nxt = orig[k + 1] if k + 1 < len(orig) else None
+        if s.mode == "split":
+            shots.append(s)
+        elif (s.end - s.start < blip and prev and nxt and prev.mode == nxt.mode == "split"
+              and prev.cams and _same_cams(prev, nxt)):
+            shots.append(prev.model_copy(update={"start": s.start, "end": s.end, "why": "short blip: cam kept"}))
+        elif s.mode == "center":
+            shots.append(Shot(start=s.start, end=s.end, mode="fit", why="gameplay only: whole frame"))
+        else:
+            shots.append(s)
+    return plan.model_copy(update={"shots": shots})
 
 
 # ---------------------------------------------------------------- facecam layouts (pure)
