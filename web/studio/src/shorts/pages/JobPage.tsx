@@ -2,6 +2,7 @@ import { useState } from "react";
 import { ArrowLeft, CircleAlert, ExternalLink, RotateCcw, Trash2 } from "lucide-react";
 import { api, isActive, isExporting } from "../api";
 import { ClipsPanel } from "../components/ClipsPanel";
+import { LayoutPanel } from "../components/LayoutPanel";
 import { Pipeline } from "../components/Pipeline";
 import { Player, type Seek } from "../components/Player";
 import { TranscriptPanel } from "../components/TranscriptPanel";
@@ -132,7 +133,10 @@ export function JobPage({ id }: { id: string }) {
 
       <div className="mt-6 grid gap-5 lg:grid-cols-[minmax(0,1fr)_340px]">
         <aside className="lg:sticky lg:top-20 lg:order-2 lg:self-start">
-          <Pipeline job={job} />
+          <div className="space-y-5">
+            <Pipeline job={job} />
+            <LayoutPanel job={job} onJob={setData} />
+          </div>
         </aside>
         <div className="min-w-0 space-y-5 lg:order-1">
           <Player job={job} seek={seek} />
