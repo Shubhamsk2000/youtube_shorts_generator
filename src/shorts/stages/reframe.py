@@ -300,11 +300,17 @@ def visible_text_boxes(plan: ReframePlan, fi: int, rc: ReframeCfg) -> list[tuple
         return [(x0, top + y0 * fg, x1, top + y1 * fg) for x0, y0, x1, y1 in near.boxes]
     cw = crop_width(plan.src_w, plan.src_h)
     x = shot.x[min(max(fi - shot.start, 0), len(shot.x) - 1)] if shot.x else 0.5
+    a = shot.a[min(max(fi - shot.start, 0), len(shot.a) - 1)] if shot.a else 9 / 16
+    top, fg = 0.0, 1.0                                # the window's band in the output (fractions of its height)
+    if a > 9 / 16 * 1.01:                             # wider window (editor): full width, band around fit_y
+        cw = min(1.0, a * plan.src_h / plan.src_w)
+        fg = min(1.0, 9 / 16 / (cw * plan.src_w / plan.src_h))
+        top = min(max(rc.fit_y - fg / 2, 0.0), 1.0 - fg)
     left = min(max(x - cw / 2, 0.0), 1.0 - cw)
     for x0, y0, x1, y1 in near.boxes:
         if x1 <= left or x0 >= left + cw:
             continue  # cropped away
-        out.append((max(0.0, (x0 - left) / cw), y0, min(1.0, (x1 - left) / cw), y1))
+        out.append((max(0.0, (x0 - left) / cw), top + y0 * fg, min(1.0, (x1 - left) / cw), top + y1 * fg))
     return out
 
 

@@ -4,6 +4,8 @@ Frames are decoded by ffmpeg at the source height (never above the output height
 frame in numpy and resized ONCE to the output size (Lanczos), then piped into a second ffmpeg that
 sharpens lightly, burns in captions and muxes the audio:
   TRACK/CENTER  moving 9:16 crop window
+  MANUAL        the window set in the clip editor: 9:16 fills the screen, a wider one (13:16, 1:1, 16:9 ...)
+                is scaled to full width over a blurred copy of the frame
   FIT           whole frame over a blurred copy of itself
   SPLIT         facecam + gameplay/screen: "pip" = gameplay full frame, cam in a top corner;
                 "split" = cam panel on top, the screen underneath (reframe.screen_layout)
@@ -32,7 +34,8 @@ from common import ffmpeg
 from .captions import ass_path, refresh_clip
 from .pacing import edits_path, kept_duration, load_edits
 from .canvas import Canvas, canvas, canvas_key
-from .reframe import (crop_to_aspect, effective_plan, pip_band, pip_geometry, plan_path, screen_crop,
+from . import framing
+from .reframe import (crop_to_aspect, pip_band, pip_geometry, plan_path, screen_crop,
                       split_panel_frac)
 from .select import OUT as SELECTION
 from . import sources
@@ -53,7 +56,7 @@ def clip_file(job_dir: Path, clip: Clip, cfg: Config, rs: RenderCfg | None = Non
     key = json.dumps([round(clip.start, 3), round(clip.end, 3), rs.model_dump(mode="json"),
                       cfg.audio.model_dump(), _digest(plan_path(job_dir, clip)), _digest(ass_path(job_dir, clip)),
                       _digest(edits_path(job_dir, clip)), cfg.reframe.model_dump(mode="json"),
-                      canvas_key(cfg, clip), "v6"],
+                      canvas_key(cfg, clip), _digest(framing.framing_path(job_dir, clip)), "v7"],
                      sort_keys=True)
     return f"{clip.id}-{hashlib.sha1(key.encode()).hexdigest()[:6]}.mp4"
 
@@ -117,9 +120,7 @@ def render_clip(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config, rs: Render
     refresh_if_stale(job_dir, cfg, c)
     ass = ass_path(job_dir, c)
     ass = ass if (cfg.captions.enabled or cfg.hook.enabled) and ass.exists() else None
-    plan_p = plan_path(job_dir, c)
-    plan = load_json(ReframePlan, plan_p) if cfg.reframe.enabled and plan_p.exists() else None
-    plan = effective_plan(plan, cfg.reframe) if plan is not None else None
+    plan = framing.load_plan(job_dir, c, cfg, meta)
     cv = canvas(cfg, rs.width, rs.height, c, job_dir)
     keep, flash = load_edits(job_dir, c)
     keep = keep if cfg.pacing.enabled else None
@@ -326,14 +327,37 @@ def compose(frame: np.ndarray, shot: Shot | None, i: int, out_w: int, out_h: int
         if rc.screen_layout == "pip":
             return compose_pip(frame, shot, out_w, out_h, rc, cv2, interp)
         return compose_split(frame, shot, out_w, out_h, meta, rc, cv2, interp)
-    cw = min(sw, round(sh * out_w / out_h))
     x = 0.5
     if shot is not None and shot.x:
-        x = shot.x[min(i - shot.start, len(shot.x) - 1)]
+        x = shot.x[min(max(i - shot.start, 0), len(shot.x) - 1)]
+    if shot is not None and shot.a:
+        a = shot.a[min(max(i - shot.start, 0), len(shot.a) - 1)]
+        if a > out_w / out_h * 1.01:
+            return compose_wide(frame, x, a, out_w, out_h, rc, cv2, interp)
+    cw = min(sw, round(sh * out_w / out_h))
     left = int(np.clip(round(x * sw - cw / 2), 0, sw - cw))
     ch = min(sh, round(cw * out_h / out_w))
     top = (sh - ch) // 2
     return _resize(frame[top:top + ch, left:left + cw], out_w, out_h, cv2, interp)
+
+
+def wide_band(a: float, out_w: int, out_h: int, rc: ReframeCfg) -> tuple[int, int]:
+    """(top, height) px of a window of shape `a` (wider than the output) scaled to the full output width."""
+    h = min(out_h, max(2, round(out_w / a / 2) * 2))
+    return int(np.clip(round(rc.fit_y * out_h - h / 2), 0, out_h - h)), h
+
+
+def compose_wide(frame: np.ndarray, x: float, a: float, out_w: int, out_h: int, rc: ReframeCfg, cv2,
+                 interp=None) -> np.ndarray:
+    """A full-height window of shape `a` centred on x, at full output width over a blurred copy of the frame."""
+    sh, sw = frame.shape[:2]
+    cw = min(sw, max(2, round(sh * a)))
+    left = int(np.clip(round(x * sw - cw / 2), 0, sw - cw))
+    a = cw / sh  # the whole frame is the widest there is
+    bg = blurred_bg(frame, out_w, out_h, rc, cv2)
+    y, h = wide_band(a, out_w, out_h, rc)
+    bg[y:y + h] = _resize(frame[:, left:left + cw], out_w, h, cv2, interp)
+    return bg
 
 
 def blurred_bg(frame: np.ndarray, out_w: int, out_h: int, rc: ReframeCfg, cv2) -> np.ndarray:

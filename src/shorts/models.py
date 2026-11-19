@@ -127,8 +127,10 @@ class TextSample(BaseModel):
 class Shot(BaseModel):
     start: int                     # first frame (inclusive)
     end: int                       # last frame (exclusive)
-    mode: str                      # "track" | "fit" | "center" | "split"
+    mode: str                      # "track" | "fit" | "center" | "split" | "manual" (set in the clip editor)
     x: list[float] | None = None   # crop centre per frame (fraction of width); None for fit/split
+    a: list[float] = []            # window shape per frame (width/height); [] = the output's shape. Wider than
+                                   # the output: scaled to full width over a blurred copy of the frame
     why: str = ""
     cams: list[list[float]] = []   # split: facecam boxes [x0, y0, x1, y1] (fractions), shown on top
     face_y: list[float] = []       # split: face centre y inside each cam (fraction of the cam box)
