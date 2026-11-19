@@ -3,7 +3,8 @@
 The analysis (reframe/<clip_id>.json) is never changed: "reset to auto" just removes keys. Each key pins the
 window at one source frame of the clip:
 
-    x  centre of the window, fraction of the source width
+    x  centre of the window, fraction of the source width; null = keep following the automatic framing (face
+       tracking), so a key can widen the window without freezing it
     a  window shape, width/height: the output's own shape (9:16) fills the screen like an automatic crop; a wider
        window (13:16, 1:1 ... up to the whole 16:9 frame) is scaled to the short's full width and shown over a
        blurred copy of the frame
@@ -28,7 +29,7 @@ MAX_KEYS = 2000
 
 class Key(BaseModel):
     f: int        # source frame inside the clip
-    x: float      # window centre, fraction of the source width
+    x: float | None = None  # window centre, fraction of the source width; None = the automatic path
     a: float = OUT_ASPECT  # window width / height
 
 
@@ -81,7 +82,7 @@ def clean(keys: list[Key], n_frames: int, src_w: int, src_h: int) -> list[Key]:
             raise ValueError(f"Keyframe at frame {k.f} is outside the clip (0-{n_frames - 1})")
         a = round(min(max(k.a, OUT_ASPECT), hi_a), 4)
         half = window_width(a, src_w, src_h) / 2
-        x = round(min(max(k.x, half), 1 - half), 4)
+        x = None if k.x is None else round(min(max(k.x, half), 1 - half), 4)
         by_f[k.f] = Key(f=k.f, x=x, a=a)
     return [by_f[f] for f in sorted(by_f)]
 
@@ -90,22 +91,27 @@ def _ease(t: float) -> float:
     return t * t * (3 - 2 * t)  # smoothstep: no sudden start or stop between keys
 
 
-def interpolate(keys: list[Key], frames: range) -> tuple[list[float], list[float]]:
-    """Per-frame (x, a) over `frames` from keys sorted by frame (all inside or around the range)."""
+def interpolate(keys: list[Key], frames: range, auto_x=lambda f: 0.5,
+                src_w: int = 16, src_h: int = 9) -> tuple[list[float], list[float]]:
+    """Per-frame (x, a) over `frames` from keys sorted by frame (all inside or around the range).
+    A key without x uses the automatic path at that frame (auto_x), so tracking continues under it."""
     xs, as_ = [], []
     j = 0
     for f in frames:
         while j + 1 < len(keys) and keys[j + 1].f <= f:
             j += 1
         k0 = keys[j]
+        x0 = auto_x(f) if k0.x is None else k0.x
         if f <= k0.f or j + 1 >= len(keys):
-            xs.append(k0.x)
-            as_.append(k0.a)
-            continue
-        k1 = keys[j + 1]
-        t = _ease((f - k0.f) / (k1.f - k0.f))
-        xs.append(round(k0.x + (k1.x - k0.x) * t, 4))
-        as_.append(round(k0.a + (k1.a - k0.a) * t, 4))
+            x, a = x0, k0.a
+        else:
+            k1 = keys[j + 1]
+            t = _ease((f - k0.f) / (k1.f - k0.f))
+            x1 = auto_x(f) if k1.x is None else k1.x
+            x, a = x0 + (x1 - x0) * t, k0.a + (k1.a - k0.a) * t
+        half = window_width(a, src_w, src_h) / 2  # a wider window has less room to move
+        xs.append(round(min(max(x, half), 1 - half), 4))
+        as_.append(round(a, 4))
     return xs, as_
 
 
@@ -122,7 +128,12 @@ def apply(plan: ReframePlan, fr: Framing | None) -> ReframePlan:
         if not mine:
             shots.append(s)
             continue
-        xs, as_ = interpolate(mine, range(s.start, end))
+        path = s.x if s.x and s.mode in ("track", "center", "manual") else None
+
+        def auto_x(f: int, s=s, path=path) -> float:
+            return path[min(max(f - s.start, 0), len(path) - 1)] if path else 0.5
+
+        xs, as_ = interpolate(mine, range(s.start, end), auto_x, plan.src_w, plan.src_h)
         shots.append(Shot(start=s.start, end=end, mode="manual", x=xs, a=as_, why="set in the editor"))
     return plan.model_copy(update={"shots": shots})
 

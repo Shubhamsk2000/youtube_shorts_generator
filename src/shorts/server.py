@@ -537,7 +537,7 @@ class ClipEdit(BaseModel):
 
 class FramingKey(BaseModel):
     f: int
-    x: float
+    x: float | None = None    # None = keep following the automatic framing
     a: float = 9 / 16
 
 

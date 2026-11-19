@@ -1,12 +1,12 @@
 import { useMemo, useState, type KeyboardEvent } from "react";
 import {
-  Check, CheckCheck, CircleAlert, Clock, Copy, Download, FileArchive, Flame, FolderOpen, LoaderCircle, Pencil,
+  Check, CheckCheck, CircleAlert, Clock, Copy, Crop, Download, FileArchive, Flame, FolderOpen, LoaderCircle, Pencil,
   RefreshCw, Sparkles, Square, Undo2, X,
 } from "lucide-react";
 import { useConfirm, useToast } from "@kit/feedback";
 import { Kbd, Select } from "@kit/ui";
-import { api, isActive, isExporting, type Clip, type ClipsData, type ExportState, type Job, type Review } from "../api";
-import { copyText, cx, errorText, fmtDuration, fmtTime, plural, useStored, usePoll } from "../lib";
+import { api, editorHref, isActive, isExporting, type Clip, type ClipsData, type ExportState, type Job, type Review } from "../api";
+import { copyText, cx, errorText, fmtDuration, fmtTime, Link, navigate, plural, useStored, usePoll } from "../lib";
 import { ClipEditor } from "./ClipEditor";
 import { ModelPicker } from "./ModelPicker";
 import { Card, CardHeader } from "./ui";
@@ -252,6 +252,7 @@ export function ClipsPanel({ job, onSeek, onJob }: { job: Job; onSeek: (t: numbe
               onReview={(r) => setReview(c, r)}
               onExport={() => exportClips([c.id])}
               onEdit={() => setEditing(c)}
+              editHref={editorHref(job.id, c.id)}
             />
           ))}
         </div>
@@ -331,7 +332,7 @@ function ExportBanner({ ex, onCancel, zipUrl }: { ex: ExportState | null; onCanc
   );
 }
 
-function ClipCard({ clip: c, ex, outdated, onSeek, onReview, onExport, onEdit }: {
+function ClipCard({ clip: c, ex, outdated, onSeek, onReview, onExport, onEdit, editHref }: {
   clip: Clip;
   ex: ExportState | null;
   outdated: boolean;
@@ -339,6 +340,7 @@ function ClipCard({ clip: c, ex, outdated, onSeek, onReview, onExport, onEdit }:
   onReview: (r: Review) => void;
   onExport: () => void;
   onEdit: () => void;
+  editHref: string;
 }) {
   const toast = useToast();
   const exportActive = !!ex && (ex.status === "running" || ex.status === "queued");
@@ -351,6 +353,7 @@ function ClipCard({ clip: c, ex, outdated, onSeek, onReview, onExport, onEdit }:
     if (k === "a") onReview("approved");
     else if (k === "x" || k === "r") onReview("rejected");
     else if (k === "e") onEdit();
+    else if (k === "enter" || k === "o") navigate(editHref);
     else return;
     e.preventDefault();
   }
@@ -373,7 +376,14 @@ function ClipCard({ clip: c, ex, outdated, onSeek, onReview, onExport, onEdit }:
     >
       <div className="relative aspect-[9/16] bg-black">
         {c.ready && c.url ? (
-          <video src={`${c.url}#t=0.1`} controls preload="metadata" playsInline className="absolute inset-0 size-full" />
+          <Link to={editHref} className="group absolute inset-0 block" title="Open the editor: framing, window shape, hook" tabIndex={-1}>
+            <video src={`${c.url}#t=0.1`} muted loop preload="metadata" playsInline className="absolute inset-0 size-full"
+              onMouseEnter={(e) => { e.currentTarget.play().catch(() => {}); }}
+              onMouseLeave={(e) => { e.currentTarget.pause(); }} />
+            <span className="pointer-events-none absolute inset-x-0 bottom-3 mx-auto flex w-fit items-center gap-1.5 rounded-lg bg-black/70 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 backdrop-blur transition group-hover:opacity-100 group-focus-visible:opacity-100">
+              <Crop className="size-3.5" /> Open editor
+            </span>
+          </Link>
         ) : outdated ? (
           <div className="absolute inset-0 grid place-items-center bg-surface-2 p-4 text-center">
             <span className="text-xs text-muted"><RefreshCw className="mx-auto mb-2 size-4" />Preview out of date<br />Re-render to see it</span>
@@ -393,6 +403,9 @@ function ClipCard({ clip: c, ex, outdated, onSeek, onReview, onExport, onEdit }:
       <div className="flex flex-1 flex-col gap-2.5 p-3.5">
         <div className="flex items-start gap-1.5">
           <h3 className="min-w-0 flex-1 text-sm leading-snug font-semibold text-balance break-words">{c.title}</h3>
+          <Link to={editHref} className="-mt-0.5 shrink-0 rounded-md p-1 text-faint transition hover:bg-surface-2 hover:text-fg" title="Open the editor: framing, window shape, hook (Enter)" aria-label="Open the clip editor">
+            <Crop className="size-3.5" />
+          </Link>
           <button onClick={onEdit} className="-mt-0.5 shrink-0 rounded-md p-1 text-faint transition hover:bg-surface-2 hover:text-fg" title="Edit title, hook, description, hashtags (E)" aria-label="Edit clip">
             <Pencil className="size-3.5" />
           </button>

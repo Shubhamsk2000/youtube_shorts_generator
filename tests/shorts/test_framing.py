@@ -101,3 +101,13 @@ def test_manual_keys_without_an_analysis():
     c = clip()
     out = framing.apply(framing.base_plan(meta(), c), Framing(keys=[Key(f=0, x=0.3)]))
     assert out.shots[0].mode == "manual" and out.shots[0].end == 300
+
+
+def test_a_key_without_x_widens_but_keeps_tracking():
+    path = [0.1 + 0.001 * i for i in range(300)]
+    p = plan([Shot(start=0, end=300, mode="track", x=path)])
+    s = framing.apply(p, Framing(keys=[Key(f=0, x=None, a=0.8125)])).shots[0]
+    assert s.mode == "manual" and set(s.a) == {0.8125}
+    half = 0.8125 * 1080 / 1920 / 2
+    assert s.x[200] == pytest.approx(max(path[200], half), abs=1e-4)  # still follows the face path
+    assert s.x[0] == pytest.approx(half, abs=1e-4)                   # pushed inward: the wider window must fit

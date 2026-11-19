@@ -5,3 +5,9 @@
 .phone {
   aspect-ratio: 9 / 16;
 }
+
+/* clip editor timeline: pauses that pacing removes */
+.hatch {
+  background-image: repeating-linear-gradient(135deg, var(--line-strong) 0 3px, transparent 3px 7px);
+  background-color: rgb(0 0 0 / 0.08);
+}

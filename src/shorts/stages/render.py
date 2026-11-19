@@ -53,11 +53,14 @@ def clip_file(job_dir: Path, clip: Clip, cfg: Config, rs: RenderCfg | None = Non
     """Cache name: changes whenever the range, settings, framing, captions or edits change."""
     cfg = with_job_layout(cfg, job_dir)
     rs = rs or cfg.preview
-    key = json.dumps([round(clip.start, 3), round(clip.end, 3), rs.model_dump(mode="json"),
-                      cfg.audio.model_dump(), _digest(plan_path(job_dir, clip)), _digest(ass_path(job_dir, clip)),
-                      _digest(edits_path(job_dir, clip)), cfg.reframe.model_dump(mode="json"),
-                      canvas_key(cfg, clip), _digest(framing.framing_path(job_dir, clip)), "v7"],
-                     sort_keys=True)
+    parts = [round(clip.start, 3), round(clip.end, 3), rs.model_dump(mode="json"),
+             cfg.audio.model_dump(), _digest(plan_path(job_dir, clip)), _digest(ass_path(job_dir, clip)),
+             _digest(edits_path(job_dir, clip)), cfg.reframe.model_dump(mode="json"),
+             canvas_key(cfg, clip), "v6"]
+    fr = framing.framing_path(job_dir, clip)
+    if fr.exists():  # only clips framed in the editor: every other preview and HD file keeps its name
+        parts.append(_digest(fr))
+    key = json.dumps(parts, sort_keys=True)
     return f"{clip.id}-{hashlib.sha1(key.encode()).hexdigest()[:6]}.mp4"
 
 

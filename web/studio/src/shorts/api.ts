@@ -121,6 +121,44 @@ export interface ClipsData {
 
 export type ClipEdit = Partial<Pick<Clip, "title" | "hook_text" | "show_hook" | "description" | "hashtags">>;
 
+/** One window keyframe from the clip editor (source frame inside the clip). x null = follow the auto framing. */
+export interface FrameKey {
+  f: number;
+  x: number | null;
+  a: number;
+}
+
+export interface EditorShot {
+  start: number;
+  end: number;
+  mode: "track" | "fit" | "center" | "split" | "manual";
+  why: string;
+  x: number[] | null;
+  cams: number[][];
+}
+
+export interface EditorData {
+  fps: number;
+  n_frames: number;
+  src_w: number;
+  src_h: number;
+  analysed: boolean;
+  shots: EditorShot[];
+  faces: { f: number; faces: number[][] }[];
+  keys: FrameKey[];
+  keep: [number, number][] | null;
+  flash: [number, number] | null;
+  layout: { out_w: number; out_h: number; fit_y: number; fit_dim: number; screen_layout: ScreenLayout; background: Background; max_aspect: number };
+  hook: { enabled: boolean; auto: boolean; text: string; position: number; duration_s: number; size: number; max_chars_per_line: number };
+  captions: { enabled: boolean; position: number; size: number };
+  clip: Clip;
+  prev: string | null;
+  next: string | null;
+  index: number;
+  count: number;
+  proxy_url: string;
+}
+
 export type ScreenLayout = "split" | "pip" | "track";
 export type Background = "blur" | "tweet";
 
@@ -191,6 +229,11 @@ export const api = {
   layout: (id: string) => request<Layout>(`${J(id)}/layout`),
   setLayout: (id: string, l: Pick<Layout, "screen_layout" | "cam_size" | "background" | "smart_layout">) =>
     request<Layout>(`${J(id)}/layout`, json("PUT", l)),
+  editor: (id: string, clipId: string) => request<EditorData>(`${J(id)}/clips/${encodeURIComponent(clipId)}/editor`),
+  warmProxy: (id: string, clipId: string) =>
+    request<void>(`${J(id)}/clips/${encodeURIComponent(clipId)}/proxy`, { method: "POST", timeoutMs: 300000 }),
+  setFraming: (id: string, clipId: string, keys: FrameKey[]) =>
+    request<{ keys: FrameKey[]; rerender: boolean }>(`${J(id)}/clips/${encodeURIComponent(clipId)}/framing`, json("PUT", { keys })),
   reselect: (id: string) => request<Job>(`${J(id)}/reselect`, json("POST")),
   review: (id: string, clipId: string, review: Review) =>
     request<{ id: string; review: Review }>(`${J(id)}/clips/${encodeURIComponent(clipId)}/review`, json("PUT", { review })),
@@ -225,6 +268,7 @@ export function clockSkew(job: Job | undefined, receivedAt: number | undefined):
 export const thumbnailUrl = (job: Job) => (job.is_youtube ? `https://i.ytimg.com/vi/${job.id}/hqdefault.jpg` : null);
 
 export const jobHref = (id: string) => `/jobs/${encodeURIComponent(id)}`;
+export const editorHref = (id: string, clipId: string) => `/jobs/${encodeURIComponent(id)}/clips/${encodeURIComponent(clipId)}`;
 
 /** Streams a local video to the server (XHR: fetch has no upload progress). Resolves with the new job. */
 export function uploadVideo(
