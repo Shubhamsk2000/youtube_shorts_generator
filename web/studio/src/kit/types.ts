@@ -8,6 +8,8 @@ export interface Stage {
   message: string | null;
   started_at: string | null;
   finished_at: string | null;
+  eta_s?: number | null;
+  weight?: number;
 }
 
 export interface Check {
@@ -17,10 +19,14 @@ export interface Check {
   required: boolean;
 }
 
-/** 0-1 across all stages (running stages count by their own progress). */
+/** 0-1 across all stages, each weighted by its typical share of the run (running stages count by their progress). */
 export function stagesProgress(stages: Stage[]): number {
   const real = stages.filter((s) => s.status !== "planned");
-  if (!real.length) return 0;
-  const sum = real.reduce((a, s) => a + (s.status === "done" ? 1 : s.status === "running" ? (s.progress ?? 0) : 0), 0);
-  return sum / real.length;
+  const total = real.reduce((a, s) => a + (s.weight ?? 1), 0);
+  if (!total) return 0;
+  const got = real.reduce(
+    (a, s) => a + (s.weight ?? 1) * (s.status === "done" ? 1 : s.status === "running" ? (s.progress ?? 0) : 0),
+    0,
+  );
+  return got / total;
 }

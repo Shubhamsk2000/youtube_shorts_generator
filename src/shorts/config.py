@@ -221,6 +221,20 @@ class ExportCfg(_Strict):
         return resolve(self.dir)
 
 
+class CardCfg(_Strict):
+    """The tweet card around the video (reframe.background: tweet). YOUR channel, never someone else's account."""
+    theme: Literal["dark", "light"] = "dark"
+    name: str = "Your Channel"       # display name
+    handle: str = "@yourchannel"
+    avatar: Path | None = None       # square image (png/jpg); none = initial in a coloured circle
+    verified: bool = True
+    footer: Literal["date", "none"] = "date"
+    font: str = "Inter"
+    text_size: int = 46              # tweet text, on a 1080x1920 canvas
+    max_lines: int = 4
+    center_y: float = 0.44           # vertical centre of the card (fraction of the height)
+
+
 class Config(_Strict):
     workspace_dir: Path = Path("data/shorts/workspace")
     download: DownloadCfg = DownloadCfg()
@@ -235,15 +249,85 @@ class Config(_Strict):
     pacing: PacingCfg = PacingCfg()
     audio: AudioCfg = AudioCfg()
     export: ExportCfg = ExportCfg()
+    card: CardCfg = CardCfg()
 
     def workspace(self) -> Path:
         return resolve(self.workspace_dir)
 
 
-def load_config(path: Path | None = None) -> Config:
+LOCAL = CONFIG_DIR / "shorts.local.yaml"  # written by Studio's Settings page; wins over shorts.yaml (git-ignored)
+
+
+_DEFAULT = object()
+
+
+def load_config(path: Path | None = None, *, local=_DEFAULT) -> Config:
+    """configs/shorts.yaml (or `path`) with the UI's overrides from configs/shorts.local.yaml on top
+    (local=None: shorts.yaml only)."""
     path = path or CONFIG_DIR / "shorts.yaml"
-    data = yaml.safe_load(path.read_text()) if path.exists() else {}
-    return Config.model_validate(data or {})
+    local = LOCAL if local is _DEFAULT else local
+    data = (yaml.safe_load(path.read_text()) if path.exists() else {}) or {}
+    if local is not None and local.exists():
+        data = merge(data, yaml.safe_load(local.read_text()) or {})
+    return Config.model_validate(data)
+
+
+def merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def read_local(local: Path | None = None) -> dict:
+    local = local or LOCAL
+    try:
+        data = yaml.safe_load(local.read_text()) or {}
+    except FileNotFoundError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_local(data: dict, local: Path | None = None) -> None:
+    """Replace configs/shorts.local.yaml (empty sections dropped), atomically."""
+    local = local or LOCAL
+    data = {k: v for k, v in data.items() if v not in ({}, None)}
+    tmp = local.with_suffix(".tmp")
+    tmp.write_text("# Saved by Studio (Settings / Channel card). Wins over shorts.yaml. Delete a line to go back.\n"
+                   + (yaml.safe_dump(data, sort_keys=False, allow_unicode=True) if data else ""))
+    tmp.replace(local)
+
+
+def save_local(section: str, values: dict, local: Path | None = None) -> None:
+    """Merge values into one section of configs/shorts.local.yaml."""
+    data = read_local(local)
+    data[section] = {**(data.get(section) or {}), **values}
+    write_local(data, local)
+
+
+def migrate_legacy_card(local: Path | None = None) -> bool:
+    """The channel card used to live in configs/anime.local.yaml (the removed anime app). Carry it over once,
+    with its avatar (data/anime/avatar.png -> data/shorts/avatar.png). True when something was migrated."""
+    import shutil
+
+    old = CONFIG_DIR / "anime.local.yaml"
+    if not old.exists() or (read_local(local).get("card")):
+        return False
+    card = (yaml.safe_load(old.read_text()) or {}).get("card") or {}
+    if not isinstance(card, dict) or not card:
+        return False
+    if card.get("avatar"):
+        src = resolve(Path(card["avatar"]))
+        dst = resolve(Path("data/shorts/avatar.png"))
+        if src.exists() and src != dst:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            card["avatar"] = "data/shorts/avatar.png"
+        elif not src.exists():
+            card["avatar"] = None
+    allowed = set(CardCfg.model_fields)
+    save_local("card", {k: v for k, v in card.items() if k in allowed}, local)
+    return True
 
 
 # ---------------------------------------------------------------- per-video layout (Studio's Layout panel)

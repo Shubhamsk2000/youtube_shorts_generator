@@ -118,10 +118,11 @@ scripts/ssh.sh 'cd yt_video_gen && bash scripts/server/setup.sh'
 starts Studio as a service that also starts on every boot. It is safe to run again. It ends with
 `Studio is running on the server`.
 
-### Step 7. Copy your secrets and channel card (laptop, 1 min)
+### Step 7. Copy your secrets and settings (laptop, 1 min)
 
-Git deliberately does not carry these. One command **on the laptop** copies `.env` (Gemini key),
-`configs/anime.local.yaml` (channel card) and `data/anime/avatar.png`, and restarts Studio so it uses them:
+Git deliberately does not carry these. One command **on the laptop** copies `.env` (AI keys),
+`configs/shorts.local.yaml` (Studio's Settings, incl. the channel card), `configs/llm.local.yaml` (the AI model
+you picked), `data/shorts/avatar.png` and `data/shorts/cookies.txt`, and restarts Studio so it uses them:
 
 ```bash
 exit                          # if you are still on the server
@@ -141,14 +142,14 @@ scripts/tunnel.sh             # leave it running
 Open **http://localhost:8800**. This is the server's Studio (your laptop's own Studio, if running, stays on 8000).
 Ctrl+C in that terminal closes the tunnel; the server keeps working.
 
-Send media up, and the first runs download their models (Whisper ~250–480 MB) into the server's `.cache/`:
+The first run downloads the Whisper model (~1.6 GB) into the server's `.cache/`. Paste YouTube links in Studio, or
+send your own videos up:
 
 ```bash
-scripts/send.sh anime  "data/anime/episodes/[Anime Time] My Hero Academia - 01.mkv"
-scripts/send.sh music  ~/Music/track.mp3 --mood hype
+scripts/send.sh "~/Videos/my stream.mp4"     # -> data/shorts/uploads/ on the server
 ```
 
-(Uploading through the Studio pages works too; `send.sh` is faster and resumes if the connection drops.)
+(Uploading through Studio works too; `send.sh` is faster for big files and resumes if the connection drops.)
 
 ---
 
@@ -167,20 +168,19 @@ scripts/send.sh music  ~/Music/track.mp3 --mood hype
 
 ```
 ~/yt_video_gen/data/                      (on the server)
-├── shorts/exports/<video id>/            long video → shorts
-│     01_<title>.mp4, 01_<title>.txt …
-└── anime/exports/<episode>/              anime edits
-      01_<title>.mp4, 01_<title>.txt …
+└── shorts/exports/<video title>-<id>/
+      01-<title>.mp4, 01-<title>.txt …
 ```
 
-Each `.mp4` has a `.txt` beside it with the title, description and hashtags (and the song for song edits), ready to
-paste into YouTube. To copy them to the laptop (instance running):
+Each `.mp4` has a `.txt` beside it with the title, description and hashtags, ready to paste into YouTube. Through
+the tunnel, the project page's **Download all HD** gives you one `.zip`; to copy everything new instead
+(instance running):
 
 ```bash
 scripts/fetch-exports.sh
 ```
 
-They land in `data/server-exports/shorts/…` and `data/server-exports/anime/…` in the project. Only files never
+They land in `data/server-exports/shorts/…` in the project. Only files never
 fetched before are downloaded (a list of fetched files is kept in `data/server-exports/.fetched-*.txt`), even if
 you deleted or moved your local copies: `--mark-seen` marks everything on the server as fetched, `--all` ignores
 the list.
@@ -188,8 +188,8 @@ the list.
 ### Disk space
 
 Fixed cost before any media: Ubuntu + ffmpeg + Node ~5 GB, the Python environment (PyTorch, Whisper, OpenCV) and
-its pip cache ~5-6 GB, models ~1-2 GB, swap 2 GB: **~13 GB**. Then each anime episode is 0.3-1.5 GB plus ~1 GB of
-work files, a long YouTube video 1-3 GB with its work files. A full disk makes a running render fail, so clean
+its pip cache ~5-6 GB, models ~1-2 GB, swap 2 GB: **~13 GB**. Then each long YouTube video is 1-3 GB with its work
+files (long streams in clips mode much less). Studio → **System** shows what each project uses. A full disk makes a running render fail, so clean
 up once your exports are on the laptop:
 
 ```bash
@@ -197,7 +197,8 @@ scripts/ssh.sh 'df -h / && du -sh yt_video_gen/data/*/*'                 # what 
 scripts/ssh.sh 'rm -rf yt_video_gen/data/shorts/exports/<video id>'       # an export you already fetched
 ```
 
-Finished episodes and videos: delete them in Studio (their work files are the big part).
+Finished videos: delete them in Studio (System → Storage, or the project's delete button); their work files are
+the big part.
 
 **Long videos and streams** never need the whole video on disk. With `download.mode: auto` (the default in
 `configs/shorts.yaml`) a video bigger than `full_max_gb` (6 GB) is fetched audio-first: the whole soundtrack
@@ -257,14 +258,14 @@ what changed, restarts Studio and checks it came back. If a job is running it st
 | Python code (`src/`) | restart: automatic |
 | A dependency (`pyproject.toml`) | `pip install`: automatic (slower) |
 | The UI (`web/`) | `npm ci` + build: automatic (about 1 min) |
-| `configs/shorts.yaml`, `configs/anime.yaml`, `configs/llm.yaml` | travel with git: automatic (`llm.yaml` is re-read without a restart) |
+| `configs/shorts.yaml`, `configs/llm.yaml` | travel with git: automatic (`llm.yaml` is re-read without a restart) |
 | `deploy/studio.service` | reinstalled: automatic |
 | `scripts/server/setup.sh` (new system package, font…) | run it again: `scripts/ssh.sh 'cd yt_video_gen && bash scripts/server/setup.sh'` |
-| `.env` (Gemini key, other AI providers' keys), channel card, avatar | not in git: `scripts/sync-settings.sh` |
-| Songs, episodes | not in git: `scripts/send.sh` |
+| `.env` (AI keys), Studio Settings (`configs/shorts.local.yaml`), avatar | not in git: `scripts/sync-settings.sh` |
+| Your own video files | not in git: `scripts/send.sh` (or upload in Studio) |
 
-Tip: the channel card can also be edited directly in the server's Studio (*Channel* page); then it lives only on
-the server.
+Tip: Settings and the channel card can also be edited directly in the server's Studio; then they live only on the
+server (`sync-settings.sh` would overwrite them with the laptop's copy).
 
 ### Something broke after a deploy: roll back
 
@@ -286,7 +287,7 @@ Fix the code on the laptop, push, then `scripts/deploy.sh` brings the server bac
 | Tunnel says *address already in use* | `scripts/tunnel.sh 8801` and open http://localhost:8801 |
 | Studio page doesn't load | `scripts/ssh.sh 'systemctl status studio --no-pager; journalctl -u studio -n 50 --no-pager'` |
 | A job failed | its error shows on the job page; full log: the `journalctl` line above |
-| Disk full | `scripts/ssh.sh 'df -h / && du -sh yt_video_gen/data/*/*'`; delete finished episodes in Studio (keeps exports), or remove old `data/*/exports` after fetching; or grow the disk (below) |
+| Disk full | `scripts/ssh.sh 'df -h / && du -sh yt_video_gen/data/*/*'`; delete finished projects in Studio → System (keeps exports unless you tick the box), or remove old `data/*/exports` after fetching; or grow the disk (below) |
 | `setup.sh`: *The disk is only 23 GB* | a 24 GiB volume shows as ~23 GB (Ubuntu keeps ~1 GB for boot); grow it to 40 (below) |
 | *Missing .deploy.env* | you ran a laptop script on the server: `exit` first |
 

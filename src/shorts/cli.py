@@ -155,10 +155,10 @@ def make(source: str, config: Path = ConfigOpt) -> None:
 
 @app.command()
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
-    """Start the Studio web UI (both apps): http://127.0.0.1:8000."""
+    """Start the Studio web UI: http://127.0.0.1:8000."""
     from studio.cli import serve as studio_serve
 
-    studio_serve(host=host, port=port, shorts_config=None, anime_config=None)
+    studio_serve(host=host, port=port, shorts_config=None)
 
 
 def _job_dir(job: str, cfg) -> Path:

@@ -57,7 +57,7 @@ def run_checks(cfg: Config) -> list[Check]:
     if ws.is_symlink() and not ws.exists():  # workspace on a data disk that isn't mounted
         checks.append(Check("Workspace disk", False, f"{ws} -> {os.readlink(ws)} is missing: mount the data disk "
                                                      "(sudo mount -a)"))
-    disk = free_disk_gb(ws)
+    disk = disk_free(cfg)
     checks.append(Check("Free disk", disk >= 6, f"{disk:.1f} GB free (long streams: audio ≈ 70 MB/h + clips "
                                                  "≈ 2-3 GB, see download.mode)", required=False))
     ram = available_ram_gb()
@@ -67,11 +67,17 @@ def run_checks(cfg: Config) -> list[Check]:
     return checks
 
 
+def disk_free(cfg: Config) -> float:
+    """Free space where the pipeline writes: the tighter of data/ and the workspace (may be another disk)."""
+    from common.paths import DATA_DIR
+    return min(free_disk_gb(DATA_DIR), free_disk_gb(cfg.workspace()))
+
+
 def summary(cfg: Config) -> dict:
     checks = run_checks(cfg)
     return {
         "ready": all(c.ok for c in checks if c.required),
-        "disk_free_gb": round(free_disk_gb(cfg.workspace()), 1),
+        "disk_free_gb": round(disk_free(cfg), 1),
         "ram_available_gb": round(available_ram_gb(), 1),
         "checks": [asdict(c) for c in checks],
     }

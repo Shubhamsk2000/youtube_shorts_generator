@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yt-video-gen"
 version = "0.1.0"
-description = "Vertical short-video tools: long YouTube video -> shorts, anime episode -> edits"
+description = "Long YouTube video -> vertical shorts (face-tracked 9:16, word-by-word captions)"
 requires-python = ">=3.10"
 dependencies = [
     "typer>=0.12",
@@ -21,8 +21,7 @@ dependencies = [
     "numpy>=1.26",
     "fastapi>=0.115",
     "uvicorn>=0.30",
-    "pillow>=10",     # anime: tweet-card template
-    "pysubs2>=1.7",   # anime: read SRT/ASS subtitle tracks
+    "pillow>=10",     # tweet-card background
 ]
 
 [project.optional-dependencies]
@@ -30,7 +29,6 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 shorts = "shorts.cli:app"
-anime = "anime.cli:app"
 studio = "studio.cli:app"
 
 [tool.setuptools.packages.find]

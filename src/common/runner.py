@@ -1,7 +1,7 @@
-"""One background thread that runs every heavy task of both apps, one at a time.
+"""One background thread that runs every heavy task, one at a time.
 
 The pipelines are CPU and RAM bound (2 vCPU / 4 GB on the server): two at once would only be slower and
-could run out of memory. Each app keeps its own job state; this only decides what runs next.
+could run out of memory. The app keeps its own job state; this only decides what runs next.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from typing import Callable
 
 @dataclass
 class Task:
-    app: str          # "shorts" | "anime"
+    app: str          # "shorts"
     job_id: str
     kind: str         # "pipeline" | "render" | "export" ...
     fn: Callable[[], None] = field(repr=False)
@@ -42,6 +42,15 @@ class SerialRunner:
                 "queued": [{"app": t.app, "job_id": t.job_id, "kind": t.kind, "queued_at": t.queued_at}
                            for t in self._q],
             }
+
+    def drop(self, app: str, job_id: str, kind: str | None = None) -> int:
+        """Remove a job's waiting tasks (all kinds, or one kind). The running task is not touched."""
+        with self._cv:
+            keep = deque(t for t in self._q if not (t.app == app and t.job_id == job_id
+                                                   and (kind is None or t.kind == kind)))
+            n = len(self._q) - len(keep)
+            self._q = keep
+            return n
 
     def busy_with(self, app: str, job_id: str) -> bool:
         with self._cv:

@@ -11,6 +11,7 @@ from common.llm_providers import LLMError, extract_json, openai_schema
 def cfg(tmp_path, monkeypatch):
     f = tmp_path / "llm.yaml"
     monkeypatch.setattr(llm, "CONFIG_FILE", f)
+    monkeypatch.setattr(llm, "LOCAL_FILE", tmp_path / "llm.local.yaml")  # not the model picked in your Studio
     llm._cfg_cache.update(mtime=None, cfg=None)
 
     def write(text: str):
@@ -34,7 +35,7 @@ providers:
 """)
     p, models = llm._resolve("shorts.select", False, ["gemini-a"])
     assert p.name == "nvidia" and models == ["meta/llama"]
-    p2, models2 = llm._resolve("anime.select", False, ["gemini-a"])
+    p2, models2 = llm._resolve("shorts.other", False, ["gemini-a"])
     assert p2.kind == "gemini" and models2 == ["gemini-a"]
 
 

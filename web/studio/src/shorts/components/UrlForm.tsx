@@ -1,7 +1,7 @@
-import { useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent } from "react";
+import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent } from "react";
 import { ArrowRight, FileVideo, Link2, Upload, X } from "lucide-react";
-import { api, uploadVideo } from "../api";
-import { cx, navigate } from "../lib";
+import { api, jobHref, uploadVideo } from "../api";
+import { cx, errorText, fmtBytes, fmtEta, navigate } from "../lib";
 import { Button, ProgressBar } from "./ui";
 
 const looksLikeVideoUrl = (s: string) =>
@@ -11,9 +11,17 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [upload, setUpload] = useState<{ name: string; size: number; p: number; abort: () => void } | null>(null);
+  const [upload, setUpload] = useState<{ name: string; size: number; loaded: number; t0: number; abort: () => void } | null>(null);
   const [drag, setDrag] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const uploading = !!upload;
+
+  useEffect(() => {  // closing the tab mid-upload loses it: ask first
+    if (!uploading) return;
+    const warn = (e: BeforeUnloadEvent) => e.preventDefault();
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [uploading]);
 
   async function sendFile(file: File) {
     if (busy || upload || blocked) return;
@@ -21,14 +29,18 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
       setError("That isn't a video file (mp4, mkv, mov, webm…)");
       return;
     }
+    if (file.size === 0) {
+      setError("That file is empty");
+      return;
+    }
     setError(null);
-    const { done, abort } = uploadVideo(file, (p) => setUpload((u) => (u ? { ...u, p } : u)));
-    setUpload({ name: file.name, size: file.size, p: 0, abort });
+    const { done, abort } = uploadVideo(file, (loaded) => setUpload((u) => (u ? { ...u, loaded } : u)));
+    setUpload({ name: file.name, size: file.size, loaded: 0, t0: Date.now(), abort });
     try {
       const job = await done;
-      navigate(`/shorts/jobs/${job.id}`);
+      navigate(jobHref(job.id));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
       setUpload(null);
     }
   }
@@ -43,17 +55,23 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
   async function submit(value = url) {
     const v = value.trim();
     if (!v || busy) return;
-    if (!/^https?:\/\//i.test(v)) {
-      setError("Paste a full link, like https://youtube.com/watch?v=…");
+    let parsed: URL | null = null;
+    try {
+      parsed = new URL(/^https?:\/\//i.test(v) ? v : `https://${v}`);
+    } catch {
+      /* not a URL */
+    }
+    if (!parsed || !parsed.hostname.includes(".")) {
+      setError("That doesn't look like a link. Paste one like https://youtube.com/watch?v=…");
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      const job = await api.create(v);
-      navigate(`/shorts/jobs/${job.id}`);
+      const job = await api.create(parsed.toString());
+      navigate(jobHref(job.id));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
       setBusy(false);
     }
   }
@@ -69,7 +87,11 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
   }
 
   if (upload) {
-    const pct = Math.round(upload.p * 100);
+    const p = upload.size ? upload.loaded / upload.size : 0;
+    const pct = Math.floor(p * 100);
+    const secs = (Date.now() - upload.t0) / 1000;
+    const rate = secs > 1 ? upload.loaded / secs : 0;
+    const left = rate > 0 ? (upload.size - upload.loaded) / rate : null;
     return (
       <div className="w-full">
         <div className="rounded-2xl border border-line-strong bg-surface p-4 shadow-card">
@@ -77,17 +99,19 @@ export function UrlForm({ blocked }: { blocked?: string | null }) {
             <FileVideo className="size-[18px] shrink-0 text-accent" />
             <span className="min-w-0 flex-1 truncate text-left text-[15px] font-medium">{upload.name}</span>
             <span className="font-mono text-xs text-muted">
-              {upload.p < 1 ? `${pct}% of ${(upload.size / 1e6).toFixed(0)} MB` : "Starting…"}
+              {p < 1 ? `${pct}% · ${fmtBytes(upload.loaded)} of ${fmtBytes(upload.size)}` : "Checking the file…"}
             </span>
-            {upload.p < 1 && (
+            {p < 1 && (
               <button onClick={upload.abort} aria-label="Cancel upload" className="rounded-lg p-1 text-muted hover:bg-surface-2 hover:text-fg">
                 <X className="size-4" />
               </button>
             )}
           </div>
-          <ProgressBar value={upload.p} active />
+          <ProgressBar value={p} active />
         </div>
-        <p className="mt-2.5 min-h-5 px-1 text-sm text-faint">Uploading to this machine: processing starts as soon as it's in.</p>
+        <p className="mt-2.5 min-h-5 px-1 text-sm text-faint">
+          {rate > 0 && p < 1 ? `${fmtBytes(rate)}/s · ${fmtEta(left) ?? ""} · ` : ""}Processing starts as soon as it's in. Keep this tab open.
+        </p>
       </div>
     );
   }

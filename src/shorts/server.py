@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import threading
@@ -9,7 +10,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
@@ -17,12 +18,12 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import export as exporter
-from . import health, pipeline
+from . import health, pipeline, settings
 from common import ffmpeg
-from common.paths import DATA_DIR
+from common.paths import DATA_DIR, resolve
 from common.sysinfo import free_disk_gb
 
-from .config import LAYOUT_FILE, Config, load_config, load_job_layout, with_job_layout
+from .config import LAYOUT_FILE, Config, load_config, load_job_layout, save_local, with_job_layout
 from .models import Selection, Transcript, VideoMeta, load_json, save_json
 from common.progress import Hooks, Reporter
 from .stages import captions, download, reframe, render, select, sources, transcribe
@@ -32,6 +33,7 @@ from common.lock import job_lock, lock_owner
 JOB_FILE = "job.json"
 REVIEWS_FILE = exporter.REVIEWS_FILE
 UPLOADS = DATA_DIR / "shorts" / "uploads"
+AVATAR = DATA_DIR / "shorts" / "avatar.png"   # the channel card picture (Settings → Channel card)
 UPLOAD_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
 
 JobStatus = Literal["queued", "running", "done", "failed", "interrupted"]
@@ -46,6 +48,8 @@ class StageState(BaseModel):
     message: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    eta_s: float | None = None     # running: estimated seconds left in this stage (from its own pace)
+    weight: float = 1.0            # share of a typical run (overall progress is weighted by it)
 
 
 class ExportState(BaseModel):
@@ -74,6 +78,11 @@ class JobState(BaseModel):
     height: int | None = None
     fps: float | None = None
     export: ExportState | None = None
+    stopping: bool = False         # Stop was pressed; takes effect at the stage's next progress update
+
+
+class JobCancelled(Exception):
+    """Raised from a progress callback when the job was stopped."""
 
 
 def _now() -> str:
@@ -81,7 +90,7 @@ def _now() -> str:
 
 
 def _fresh_stages() -> list[StageState]:
-    return [StageState(key=s.key, label=s.label, status="pending" if s.implemented else "planned")
+    return [StageState(key=s.key, label=s.label, status="pending" if s.implemented else "planned", weight=s.weight)
             for s in pipeline.STAGES]
 
 
@@ -119,6 +128,7 @@ class JobStore:
                 if (d / JOB_FILE).exists():
                     job = load_json(JobState, d / JOB_FILE)
                     job.stages = _merge_stage_defs(job.stages)
+                    job.stopping = False
                     if job.status in ("queued", "running"):  # server died mid-job
                         job.status = "interrupted"
                         for s in job.stages:
@@ -184,7 +194,7 @@ def _merge_stage_defs(saved: list[StageState]) -> list[StageState]:
     out = []
     for sd in pipeline.STAGES:
         s = by_key.get(sd.key) or StageState(key=sd.key, label=sd.label, status="pending")
-        s.label = sd.label
+        s.label, s.weight, s.eta_s = sd.label, sd.weight, None
         if not sd.implemented:
             s.status = "planned"
         elif s.status == "planned":
@@ -254,15 +264,22 @@ def _job_from_cli_dir(d: Path, cfg: Config) -> JobState:
 
 
 class StoreHooks(Hooks):
-    def __init__(self, store: JobStore, job_id: str):
-        self.store, self.job_id = store, job_id
+    def __init__(self, store: JobStore, job_id: str, cancelled=lambda: False):
+        self.store, self.job_id, self.cancelled = store, job_id, cancelled
+        self._t0: dict[str, float] = {}
+
+    def _check(self) -> None:
+        if self.cancelled():
+            raise JobCancelled()
 
     def stage_start(self, stage: str) -> None:
-        self.store.update(self.job_id, stage=stage, status="running", progress=None,
+        self._check()
+        self._t0[stage] = time.monotonic()
+        self.store.update(self.job_id, stage=stage, status="running", progress=None, eta_s=None,
                           message=None, started_at=_now(), finished_at=None)
 
     def stage_done(self, stage: str, message: str | None = None) -> None:
-        self.store.update(self.job_id, stage=stage, status="done", progress=1.0,
+        self.store.update(self.job_id, stage=stage, status="done", progress=1.0, eta_s=None,
                           message=message, finished_at=_now())
         if stage == "download":
             meta = load_json(VideoMeta, self.store.cfg.workspace() / self.job_id / download.META)
@@ -271,7 +288,12 @@ class StoreHooks(Hooks):
 
     def reporter(self, stage: str) -> Reporter:
         def report(fraction: float | None = None, message: str | None = None) -> None:
-            fields = {"progress": fraction}
+            self._check()
+            fields: dict = {"progress": None if fraction is None else max(0.0, min(1.0, fraction))}
+            el = time.monotonic() - self._t0.get(stage, time.monotonic())
+            f = fields["progress"]
+            # an estimate only once there is enough of the stage to go on (early rates are noisy)
+            fields["eta_s"] = round(el * (1 - f) / f) if f is not None and f >= 0.03 and el >= 5 else None
             if message:
                 fields["message"] = message
             self.store.update(self.job_id, stage=stage, force_save=False, **fields)
@@ -284,10 +306,55 @@ class Worker:
     def __init__(self, store: JobStore, cfg: Config, runner: SerialRunner, cfg_path: Path | None = None):
         self.store, self.cfg, self.cfg_path, self.runner = store, cfg, cfg_path, runner
         self.current: str | None = None
+        self._cancel: set[str] = set()       # pipeline runs asked to stop
+        self._cancel_export: set[str] = set()
 
     def submit(self, job_id: str) -> None:
-        self.store.update(job_id, status="queued", error=None)
+        self._cancel.discard(job_id)
+        self.runner.drop("shorts", job_id, "pipeline")  # already waiting: keep one queued run, not two
+        self.store.update(job_id, status="queued", error=None, stopping=False)
         self.runner.submit("shorts", job_id, "pipeline", lambda: self._handle("run", job_id))
+
+    def stop(self, job_id: str) -> str:
+        """Stop a job's pipeline run (queued: removed at once; running: at its next progress update).
+        Returns "stopped" | "stopping" | "idle"."""
+        job = self.store.get(job_id)
+        if not job:
+            return "idle"
+        if job.status == "queued" and self.runner.drop("shorts", job_id, "pipeline"):
+            self._mark_stopped(job_id)
+            return "stopped"
+        if job.status in ("queued", "running"):
+            self._cancel.add(job_id)
+            self.store.update(job_id, stopping=True)
+            return "stopping"
+        return "idle"
+
+    def stop_export(self, job_id: str) -> str:
+        job = self.store.get(job_id)
+        ex = job.export if job else None
+        if not ex or ex.status not in ("queued", "running"):
+            return "idle"
+        if ex.status == "queued" and self.runner.drop("shorts", job_id, "export"):
+            with self.store.lock:
+                e = self.store.jobs[job_id].export
+                e.status, e.queue, e.current, e.message, e.finished_at = "failed", [], None, "Export cancelled", _now()
+                self.store.update(job_id)
+            return "stopped"
+        self._cancel_export.add(job_id)
+        with self.store.lock:
+            self.store.jobs[job_id].export.queue = []
+            self.store.jobs[job_id].export.message = "Cancelling after this step…"
+            self.store.update(job_id)
+        return "stopping"
+
+    def _mark_stopped(self, job_id: str) -> None:
+        job = self.store.get(job_id)
+        running = next((s for s in job.stages if s.status == "running"), None) if job else None
+        if running:
+            self.store.update(job_id, stage=running.key, status="pending", progress=None, eta_s=None,
+                              message="Stopped: resume to continue from here", finished_at=None)
+        self.store.update(job_id, status="interrupted", error=None, stopping=False)
 
     def submit_export(self, job_id: str, clip_ids: list[str]) -> None:
         """Queue clips for HD export; clicks while an export runs are added to the same queue."""
@@ -328,6 +395,8 @@ class Worker:
                     store.update(job_id)
 
                 def report(fraction=None, message=None, left=left):
+                    if job_id in self._cancel_export:
+                        raise JobCancelled()
                     with store.lock:
                         ex().progress = fraction
                         if message:
@@ -347,13 +416,17 @@ class Worker:
                 e.message = f"{n_done} clip{'s' * (n_done != 1)} exported"
                 store.update(job_id)
         except Exception as err:
-            traceback.print_exc()
+            cancelled = job_id in self._cancel_export
+            if not cancelled:
+                traceback.print_exc()
             with store.lock:
                 e = ex()
                 e.status, e.current, e.queue, e.finished_at = "failed", None, [], _now()
-                e.message = str(err) or type(err).__name__
+                e.message = (f"Export cancelled · {n_done} finished" if cancelled
+                             else _friendly(err))
                 store.update(job_id)
         finally:
+            self._cancel_export.discard(job_id)
             self.current = None
 
     def _handle(self, kind: str, job_id: str) -> None:
@@ -371,26 +444,90 @@ class Worker:
             self.store.update(job_id, status="failed", error=f"configs/shorts.yaml is invalid: {e}")
             self.current = None
             return
-        hooks = StoreHooks(self.store, job_id)
+        hooks = StoreHooks(self.store, job_id, cancelled=lambda: job_id in self._cancel)
         try:
             ref = download.JobRef(job.id, self.cfg.workspace() / job.id, job.source,
                                   job.title, job.duration, job.is_youtube)
             pipeline.run(job.source, self.cfg, hooks, job=ref)
-            self.store.update(job_id, status="done")
+            self.store.update(job_id, status="done", stopping=False)
         except Exception as e:
+            if job_id in self._cancel:  # stopped (the stop may surface wrapped in another error)
+                self._mark_stopped(job_id)
+                return
             traceback.print_exc()
             running = next((s for s in self.store.get(job_id).stages if s.status == "running"), None)
             if running:
-                self.store.update(job_id, stage=running.key, status="failed", finished_at=_now())
-            self.store.update(job_id, status="failed", error=str(e) or type(e).__name__)
+                self.store.update(job_id, stage=running.key, status="failed", eta_s=None, finished_at=_now(),
+                                  message=_friendly(e))
+            self.store.update(job_id, status="failed", error=_friendly(e), stopping=False)
         finally:
+            self._cancel.discard(job_id)
             self.current = None
+
+
+def _friendly(e: BaseException) -> str:
+    """One readable line (plus the tool's own message) instead of a bare exception name."""
+    msg = (str(e) or "").strip()
+    name = type(e).__name__
+    hints = {
+        "LLMError": "The AI provider failed",
+        "DownloadError": "Download failed",
+        "FFmpegError": "ffmpeg failed",
+        "StageProcessError": "A processing step crashed (often out of memory)",
+        "JobBusyError": "This video is busy",
+        "SourceError": "Couldn't get the clip's video",
+        "ExportError": "Export failed",
+        "MemoryError": "Ran out of memory",
+        "OSError": "File system error",
+    }
+    if name in hints and not msg.lower().startswith(hints[name].lower()):
+        return f"{hints[name]}: {msg}" if msg else hints[name]
+    if isinstance(e, OSError) and getattr(e, "errno", None) == 28:
+        return "Disk full: free some space (delete old projects) and resume"
+    return msg or name
 
 
 # ---------------------------------------------------------------- API
 
 class CreateJob(BaseModel):
     url: str
+
+
+class JobStats(BaseModel):
+    clips: int = 0
+    approved: int = 0
+    rejected: int = 0
+    exported: int = 0              # clips with an HD file
+    clip_seconds: float = 0.0      # total length of all clips
+    picked_by: str | None = None   # "gemini" | "heuristic"
+
+
+class JobView(JobState):
+    stats: JobStats = JobStats()
+    progress: float = 0.0          # 0-1, stages weighted by their typical share of the run
+    server_time: str = ""          # lets the browser show elapsed times without clock skew
+
+
+class ClipEdit(BaseModel):
+    title: str | None = None
+    hook_text: str | None = None
+    show_hook: bool | None = None
+    description: str | None = None
+    hashtags: list[str] | None = None
+
+
+class BulkReview(BaseModel):
+    clip_ids: list[str]
+    review: Literal["approved", "rejected"] | None
+
+
+class CardEdit(BaseModel):
+    name: str | None = None
+    handle: str | None = None
+    theme: Literal["dark", "light"] | None = None
+    verified: bool | None = None
+    footer: Literal["date", "none"] | None = None
+    remove_avatar: bool = False
 
 
 class ExportBody(BaseModel):
@@ -417,6 +554,73 @@ def _layout_view(cfg: Config, job_dir: Path) -> dict:
 
 
 _load_reviews = exporter.load_reviews
+_stats_cache: dict[str, tuple[tuple, JobStats]] = {}
+
+
+def _mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def job_stats(d: Path) -> JobStats:
+    """Clip counts for one job (cached until selection, reviews or HD files change)."""
+    sel_p, rev_p, fin = d / select.OUT, d / REVIEWS_FILE, d / exporter.FINAL_DIR
+    key = (_mtime(sel_p), _mtime(rev_p), _mtime(fin))
+    hit = _stats_cache.get(d.name)
+    if hit and hit[0] == key:
+        return hit[1]
+    st = JobStats()
+    if sel_p.exists():
+        try:
+            sel = load_json(Selection, sel_p)
+            reviews = _load_reviews(d)
+            ids = {c.id for c in sel.clips}
+            hd = {f.name.split("-")[0] for f in fin.iterdir()   # finished renders only, not a stopped .tmp.mp4
+                  if f.suffix == ".mp4" and not f.name.endswith(".tmp.mp4")} if fin.is_dir() else set()
+            st = JobStats(clips=len(sel.clips), approved=sum(reviews.get(i) == "approved" for i in ids),
+                          rejected=sum(reviews.get(i) == "rejected" for i in ids), exported=len(ids & hd),
+                          clip_seconds=round(sum(c.duration for c in sel.clips), 1), picked_by=sel.source)
+        except Exception:  # noqa: BLE001  (a half-written file: counts come next poll)
+            pass
+    _stats_cache[d.name] = (key, st)
+    return st
+
+
+def weighted_progress(stages: list[StageState]) -> float:
+    real = [s for s in stages if s.status != "planned"]
+    total = sum(s.weight for s in real)
+    if not total:
+        return 0.0
+    got = sum(s.weight * (1.0 if s.status == "done" else (s.progress or 0) if s.status == "running" else 0)
+              for s in real)
+    return round(got / total, 4)
+
+
+def _dir_size(p: Path) -> int:
+    """Bytes under p; hard links (exports share the HD renders' data) are counted once."""
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    stack = [p]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(Path(e.path))
+                        elif e.is_file(follow_symlinks=False):
+                            st = e.stat(follow_symlinks=False)
+                            if (st.st_dev, st.st_ino) not in seen:
+                                seen.add((st.st_dev, st.st_ino))
+                                total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
 
 
 def _slug(s: str) -> str:
@@ -433,10 +637,14 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
     def system():
         return health.summary(cfg)
 
-    @router.get("/jobs", response_model=list[JobState])
+    def view(job: JobState) -> JobView:
+        return JobView(**job.model_dump(), stats=job_stats(cfg.workspace() / job.id),
+                       progress=weighted_progress(job.stages), server_time=_now())
+
+    @router.get("/jobs", response_model=list[JobView])
     def list_jobs():
         store.rescan()
-        return store.all()
+        return [view(j) for j in store.all()]
 
     def start_job(source: str) -> JobState:
         """URL or local file -> job (an existing one is resumed instead of duplicated)."""
@@ -456,14 +664,14 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         worker.submit(ref.id)
         return store.get(ref.id)
 
-    @router.post("/jobs", response_model=JobState)
+    @router.post("/jobs", response_model=JobView)
     def create_job(body: CreateJob):
         url = body.url.strip()
         if not download.is_url(url):
             raise HTTPException(422, "Paste a full video URL (https://…)")
-        return start_job(url)
+        return view(start_job(url))
 
-    @router.put("/uploads/{name}", response_model=JobState)
+    @router.put("/uploads/{name}", response_model=JobView)
     async def upload_video(name: str, request: Request):
         """The browser streams a local video file as the request body; it is saved to data/shorts/uploads/
         (the job hard-links it, so no second copy on disk) and processed like a downloaded video."""
@@ -477,7 +685,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         UPLOADS.mkdir(parents=True, exist_ok=True)
         dst = UPLOADS / name
         if dst.exists() and dst.stat().st_size == size:
-            return start_job(str(dst))  # same file uploaded again: reuse it (and its job)
+            return view(start_job(str(dst)))  # same file uploaded again: reuse it (and its job)
         n = 2
         while dst.exists():
             dst = UPLOADS / f"{Path(name).stem} ({n}){suffix}"
@@ -497,29 +705,54 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         except Exception:
             dst.unlink(missing_ok=True)
             raise HTTPException(422, "That file isn't a playable video")
-        return await run_in_threadpool(start_job, str(dst))
+        return view(await run_in_threadpool(start_job, str(dst)))
 
-    @router.get("/jobs/{job_id}", response_model=JobState)
+    @router.get("/jobs/{job_id}", response_model=JobView)
     def get_job(job_id: str):
         store.rescan()
-        return _job_or_404(store, job_id)
+        return view(_job_or_404(store, job_id))
 
-    @router.post("/jobs/{job_id}/retry", response_model=JobState)
+    @router.post("/jobs/{job_id}/stop", response_model=JobView)
+    def stop_job(job_id: str):
+        """Stop processing. Finished stages stay cached: Resume continues from the stopped stage."""
+        job = _job_or_404(store, job_id)
+        if job.status not in ("queued", "running"):
+            raise HTTPException(409, "This video isn't processing")
+        worker.stop(job_id)
+        return view(store.get(job_id))
+
+    @router.post("/jobs/{job_id}/export/stop", response_model=JobView)
+    def stop_export(job_id: str):
+        job = _job_or_404(store, job_id)
+        if worker.stop_export(job_id) == "idle":
+            raise HTTPException(409, "No export is running")
+        return view(store.get(job_id))
+
+    @router.post("/jobs/{job_id}/retry", response_model=JobView)
     def retry_job(job_id: str):
         job = _job_or_404(store, job_id)
         if job.status in ("queued", "running"):
             raise HTTPException(409, "Job is already in progress")
         worker.submit(job_id)
-        return store.get(job_id)
+        return view(store.get(job_id))
 
     @router.delete("/jobs/{job_id}", status_code=204)
-    def delete_job(job_id: str):
+    def delete_job(job_id: str, exports: bool = False):
+        """Delete the project's working files; with exports=true also its exported HD clips."""
         job = _job_or_404(store, job_id)
         if job.status in ("queued", "running") or worker.current == job_id:
             raise HTTPException(409, "Can't delete a job while it's processing")
         if owner := lock_owner(cfg.workspace() / job_id):
             raise HTTPException(409, f"Can't delete: this video is being processed from the terminal (PID {owner})")
+        if exports and (cfg.workspace() / job_id / download.META).exists():
+            try:
+                out = exporter.export_dir(load_config(cfg_path), load_json(VideoMeta, cfg.workspace() / job_id / download.META))
+                if out.is_dir() and out.resolve().parent == load_config(cfg_path).export.out_dir().resolve():
+                    shutil.rmtree(out)
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(500, f"Couldn't delete the exported files: {_friendly(e)}") from None
         store.remove(job_id)
+        _stats_cache.pop(job_id, None)
         d = (cfg.workspace() / job_id).resolve()
         if d.parent == cfg.workspace().resolve() and d.is_dir():
             shutil.rmtree(d)
@@ -547,6 +780,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         sel = load_json(Selection, d / select.OUT)
         reviews = _load_reviews(d)
         live = load_config(cfg_path)
+        meta = load_json(VideoMeta, d / download.META) if (d / download.META).exists() else None
         clips = []
         for c in sel.clips:
             f = render.clip_file(d, c, live)
@@ -555,7 +789,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             clips.append({**c.model_dump(), "duration": round(c.duration, 2),
                           "review": reviews.get(c.id), "ready": ready,
                           "url": f"/api/shorts/jobs/{job_id}/clips/{c.id}/video?v={f[-10:-4]}" if ready else None,
-                          "final_url": f"/api/shorts/jobs/{job_id}/clips/{c.id}/final?v={hd.stem[-6:]}" if hd.exists() else None})
+                          "final_url": f"/api/shorts/jobs/{job_id}/clips/{c.id}/final?v={hd.stem[-6:]}" if hd.exists() else None,
+                          "upload_text": exporter.upload_text(c, meta) if meta else ""})
         return {"source": sel.source, "model": sel.model, "note": sel.note, "candidates": sel.candidates,
                 "rejected": sel.rejected, "clips": clips}
 
@@ -587,7 +822,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             tmp.replace(d / REVIEWS_FILE)
         return {"id": clip_id, "review": body.review}
 
-    @router.post("/jobs/{job_id}/export", response_model=JobState)
+    @router.post("/jobs/{job_id}/export", response_model=JobView)
     def export_job(job_id: str, body: ExportBody):
         """HD export of the given clips (default: all approved ones). Adds to a running export's queue."""
         _job_or_404(store, job_id)
@@ -606,7 +841,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             if not wanted:
                 raise HTTPException(404, "Unknown clip")
         worker.submit_export(job_id, wanted)
-        return store.get(job_id)
+        return view(store.get(job_id))
 
     @router.get("/jobs/{job_id}/clips/{clip_id}/final")
     def get_clip_final(job_id: str, clip_id: str):
@@ -652,7 +887,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             worker.submit(job_id)
         return _layout_view(load_config(cfg_path), d)
 
-    @router.post("/jobs/{job_id}/reselect", response_model=JobState)
+    @router.post("/jobs/{job_id}/reselect", response_model=JobView)
     def reselect_job(job_id: str):
         """Ask Gemini again (e.g. after prompt changes): redo moments -> reframe -> captions -> previews."""
         job = _job_or_404(store, job_id)
@@ -663,10 +898,10 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             raise HTTPException(409, "Not transcribed yet")
         (d / select.OUT).unlink(missing_ok=True)
         for key in ("select", "sources", "reframe", "captions", "render"):
-            store.update(job_id, stage=key, status="pending", progress=None, message=None,
+            store.update(job_id, stage=key, status="pending", progress=None, eta_s=None, message=None,
                          started_at=None, finished_at=None)
         worker.submit(job_id)
-        return store.get(job_id)
+        return view(store.get(job_id))
 
     @router.get("/jobs/{job_id}/source")
     def get_source(job_id: str):
@@ -678,6 +913,261 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         if meta.mode != "full" or meta.source_deleted or not (d / meta.file).exists():
             raise HTTPException(404, "The full video isn't kept for this job: only each clip's own video")
         return FileResponse(d / meta.file)
+
+    def write_reviews(d: Path, reviews: dict) -> None:
+        tmp = d / (REVIEWS_FILE + ".tmp")
+        tmp.write_text(json.dumps(reviews, indent=1))
+        tmp.replace(d / REVIEWS_FILE)
+
+    @router.put("/jobs/{job_id}/reviews")
+    def set_reviews(job_id: str, body: BulkReview):
+        """Approve / reject / clear several clips at once."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        if not (d / select.OUT).exists():
+            raise HTTPException(409, "No clips yet")
+        ids = {c.id for c in load_json(Selection, d / select.OUT).clips}
+        wanted = [c for c in body.clip_ids if c in ids]
+        with store.lock:
+            reviews = _load_reviews(d)
+            for cid in wanted:
+                if body.review is None:
+                    reviews.pop(cid, None)
+                else:
+                    reviews[cid] = body.review
+            write_reviews(d, reviews)
+        return {"updated": len(wanted), "review": body.review}
+
+    def resubmit_render(job_id: str, stages=("reframe", "captions", "render")) -> None:
+        for key in stages:
+            store.update(job_id, stage=key, status="pending", progress=None, eta_s=None, message=None,
+                         started_at=None, finished_at=None)
+        worker.submit(job_id)
+
+    def idle_or_409(job: JobState, what: str) -> None:
+        if job.status in ("queued", "running") or worker.current == job.id:
+            raise HTTPException(409, f"This video is processing: {what} when it's done (or stop it first)")
+
+    @router.patch("/jobs/{job_id}/clips/{clip_id}")
+    def edit_clip(job_id: str, clip_id: str, body: ClipEdit):
+        """Edit a clip's title, on-screen hook, description or hashtags. Changes that show in the video (hook
+        text / banner on or off) re-render that clip's preview; existing HD files are re-exported on demand."""
+        job = _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        if not (d / select.OUT).exists():
+            raise HTTPException(409, "No clips yet")
+        changes = body.model_dump(exclude_none=True)
+        if not changes:
+            raise HTTPException(422, "Nothing to change")
+        for k in ("title", "hook_text", "description"):
+            if k in changes:
+                changes[k] = changes[k].strip()
+        if "title" in changes and not changes["title"]:
+            raise HTTPException(422, "The title can't be empty")
+        if len(changes.get("title", "")) > 100:
+            raise HTTPException(422, "Titles are limited to 100 characters on YouTube")
+        if len(changes.get("hook_text", "")) > 120:
+            raise HTTPException(422, "Keep the hook under 120 characters: it has to be read in 3 seconds")
+        if len(changes.get("description", "")) > 4500:
+            raise HTTPException(422, "Description is too long (YouTube's limit is 5000 characters)")
+        if "hashtags" in changes:
+            tags = []
+            for t in changes["hashtags"]:
+                t = re.sub(r"[^\w]", "", t.strip().lstrip("#"), flags=re.UNICODE)
+                if t and f"#{t}" not in tags:
+                    tags.append(f"#{t}")
+            changes["hashtags"] = tags[:15]
+        with store.lock:
+            sel = load_json(Selection, d / select.OUT)
+            clip = next((c for c in sel.clips if c.id == clip_id), None)
+            if not clip:
+                raise HTTPException(404, "Unknown clip")
+            visual_before = (captions.hook_text(clip), clip.show_hook)
+            for k, v in changes.items():
+                setattr(clip, k, v)
+            visual = (captions.hook_text(clip), clip.show_hook) != visual_before
+            if visual:
+                idle_or_409(job, "change the on-screen text")
+            save_json(sel, d / select.OUT)
+        rerender = False
+        if visual:
+            live = with_job_layout(load_config(cfg_path), d)
+            try:
+                captions.refresh_clip(d, live, clip)
+                rerender = True
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(500, f"Saved, but the captions couldn't be rebuilt: {_friendly(e)}") from None
+            resubmit_render(job_id, ("render",))
+        return {"clip": {**clip.model_dump(), "duration": round(clip.duration, 2)}, "rerender": rerender}
+
+    @router.post("/jobs/{job_id}/rerender", response_model=JobView)
+    def rerender(job_id: str):
+        """Rebuild framing, captions and previews with the current settings (moments and transcript are kept)."""
+        job = _job_or_404(store, job_id)
+        idle_or_409(job, "re-render")
+        if not (cfg.workspace() / job_id / select.OUT).exists():
+            raise HTTPException(409, "No clips yet")
+        resubmit_render(job_id, ("sources", "reframe", "captions", "render"))
+        return view(store.get(job_id))
+
+    @router.get("/jobs/{job_id}/exports.zip")
+    def download_zip(job_id: str):
+        """Every exported clip of this video (mp4 + upload text) as one zip, streamed (no temp copy on disk)."""
+        from fastapi.responses import StreamingResponse
+        import zipfile
+
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        if not (d / download.META).exists():
+            raise HTTPException(404, "Nothing exported yet")
+        out = exporter.export_dir(load_config(cfg_path), load_json(VideoMeta, d / download.META))
+        files = sorted(f for f in out.iterdir() if f.suffix in (".mp4", ".txt")) if out.is_dir() else []
+        if not files:
+            raise HTTPException(404, "Nothing exported yet: export some clips first")
+
+        class Sink:
+            def __init__(self):
+                self.buf = bytearray()
+
+            def write(self, b):
+                self.buf += b
+                return len(b)
+
+            def flush(self):
+                pass
+
+        def gen():
+            sink = Sink()
+            with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True) as z:  # mp4 doesn't compress
+                for f in files:
+                    with z.open(f.name, "w", force_zip64=f.stat().st_size > 2**31) as zf, f.open("rb") as src:
+                        while chunk := src.read(1 << 20):
+                            zf.write(chunk)
+                            if len(sink.buf) >= 1 << 20:
+                                yield bytes(sink.buf)
+                                sink.buf.clear()
+                    yield bytes(sink.buf)
+                    sink.buf.clear()
+            yield bytes(sink.buf)
+
+        return StreamingResponse(gen(), media_type="application/zip", headers={
+            "Content-Disposition": f'attachment; filename="{out.name}.zip"'})
+
+    @router.get("/storage")
+    def storage():
+        """Disk used per project (workspace + its exports) and in total. Walks the folders: call on demand."""
+        live = load_config(cfg_path)
+        rows = []
+        for j in store.all():
+            d = live.workspace() / j.id
+            ws = _dir_size(d) if d.is_dir() else 0
+            ex = 0
+            if (d / download.META).exists():
+                try:
+                    out = exporter.export_dir(live, load_json(VideoMeta, d / download.META))
+                    ex = _dir_size(out) if out.is_dir() else 0
+                except Exception:  # noqa: BLE001
+                    pass
+            rows.append({"id": j.id, "title": j.title, "status": j.status, "created_at": j.created_at,
+                         "workspace_bytes": ws, "exports_bytes": ex})
+        rows.sort(key=lambda r: r["workspace_bytes"] + r["exports_bytes"], reverse=True)
+        up = _dir_size(UPLOADS) if UPLOADS.is_dir() else 0
+        return {"projects": rows, "uploads_bytes": up,
+                "total_bytes": sum(r["workspace_bytes"] + r["exports_bytes"] for r in rows) + up,
+                "disk_free_gb": round(health.disk_free(live), 1)}
+
+    # --- settings (configs/shorts.local.yaml)
+
+    @router.get("/settings")
+    def get_settings():
+        return settings.view(cfg_path)
+
+    @router.put("/settings")
+    def put_settings(changes: dict[str, Any]):
+        try:
+            return settings.update(changes, cfg_path)
+        except settings.SettingsError as e:
+            raise HTTPException(422, str(e)) from None
+
+    def card_view() -> dict:
+        c = load_config(cfg_path).card
+        avatar = resolve(c.avatar) if c.avatar else None
+        return {"name": c.name, "handle": c.handle, "theme": c.theme, "verified": c.verified,
+                "footer": c.footer, "has_avatar": bool(avatar and avatar.exists())}
+
+    @router.get("/settings/card")
+    def get_card():
+        return card_view()
+
+    @router.put("/settings/card")
+    def put_card(body: CardEdit):
+        vals = body.model_dump(exclude_none=True, exclude={"remove_avatar"})
+        if "name" in vals:
+            vals["name"] = vals["name"].strip()
+            if not vals["name"] or len(vals["name"]) > 50:
+                raise HTTPException(422, "Display name: 1-50 characters")
+        if "handle" in vals:
+            h = vals["handle"].strip().lstrip("@")
+            if not re.fullmatch(r"[\w.\-]{1,30}", h):
+                raise HTTPException(422, "Handle: letters, numbers, dots, dashes or underscores (max 30)")
+            vals["handle"] = "@" + h
+        if body.remove_avatar:
+            vals["avatar"] = None
+            AVATAR.unlink(missing_ok=True)
+        save_local("card", vals)
+        return card_view()
+
+    @router.put("/settings/avatar")
+    async def put_avatar(request: Request):
+        from io import BytesIO
+
+        from PIL import Image, UnidentifiedImageError
+
+        data = await request.body()
+        if not data:
+            raise HTTPException(422, "Empty file")
+        if len(data) > 15_000_000:
+            raise HTTPException(413, "Image too large (max 15 MB)")
+        try:
+            im = Image.open(BytesIO(data))
+            im.load()
+            im = im.convert("RGBA")
+        except (UnidentifiedImageError, OSError, ValueError):
+            raise HTTPException(422, "That file isn't an image Studio can read (use PNG or JPG)") from None
+        side = min(im.size)
+        im = im.crop(((im.width - side) // 2, (im.height - side) // 2,
+                      (im.width + side) // 2, (im.height + side) // 2)).resize((512, 512), Image.LANCZOS)
+        AVATAR.parent.mkdir(parents=True, exist_ok=True)
+        im.save(AVATAR)
+        save_local("card", {"avatar": str(AVATAR.relative_to(DATA_DIR.parent))})
+        return card_view()
+
+    @router.get("/settings/card/preview")
+    def card_preview(text: str = "nobody was ready for what he said next", v: str = ""):
+        from io import BytesIO
+
+        from fastapi.responses import Response
+        from PIL import Image
+
+        from .card import layout, render_card
+
+        cc = load_config(cfg_path).card
+        lay = layout(cc, 1080, 1920, 1920, 1080, text[:200])
+        tmp = DATA_DIR.parent / ".cache" / "tmp" / f"card-preview-{threading.get_ident()}.png"
+        render_card(cc, lay, tmp)
+        im = Image.open(tmp)
+        x, y, w, h = lay.card
+        pad = 40
+        ox, oy = max(0, x - pad), max(0, y - pad)
+        crop = im.crop((ox, oy, min(im.width, x + w + pad), min(im.height, y + h + pad)))
+        bg = Image.new("RGBA", crop.size, (0, 0, 0, 0))
+        vx, vy, vw, vh = lay.video
+        bg.paste((60, 64, 82, 255), (vx - ox, vy - oy, vx - ox + vw, vy - oy + vh))
+        bg.alpha_composite(crop)
+        tmp.unlink(missing_ok=True)
+        buf = BytesIO()
+        bg.save(buf, "PNG")
+        return Response(buf.getvalue(), media_type="image/png", headers={"Cache-Control": "no-store"})
 
     router.store, router.worker = store, worker  # read by the Studio's queue view
     return router

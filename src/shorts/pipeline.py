@@ -15,17 +15,20 @@ class StageDef:
     key: str
     label: str
     implemented: bool
+    weight: float = 1.0   # share of a typical run's wall time (overall progress is weighted by it)
 
 
+# weights: measured on a 2 vCPU server, 20-40 min source, ~15 clips (transcription dominates)
 STAGES = [
-    StageDef("download", "Download", True),
-    StageDef("transcribe", "Transcribe", True),
-    StageDef("select", "Find moments", True),
-    StageDef("sources", "Clip video", True),
-    StageDef("reframe", "Reframe to 9:16", True),
-    StageDef("captions", "Pacing & captions", True),
-    StageDef("render", "Render previews", True),
+    StageDef("download", "Download", True, 0.10),
+    StageDef("transcribe", "Transcribe", True, 0.38),
+    StageDef("select", "Find moments", True, 0.10),
+    StageDef("sources", "Clip video", True, 0.04),
+    StageDef("reframe", "Reframe to 9:16", True, 0.14),
+    StageDef("captions", "Pacing & captions", True, 0.03),
+    StageDef("render", "Render previews", True, 0.21),
 ]
+WEIGHTS = {s.key: s.weight for s in STAGES}
 
 
 def run(source: str, cfg: Config, hooks: Hooks, job: download.JobRef | None = None) -> Path:

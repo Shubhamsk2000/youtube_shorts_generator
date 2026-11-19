@@ -7,7 +7,7 @@
 #   scripts/fetch-exports.sh --all        ignore the record, download everything missing locally
 source "$(dirname "$0")/_server.sh"
 mode=${1:-new}
-for kind in shorts anime; do
+for kind in shorts; do
   src="$APP_DIR/data/$kind/exports"
   dest="$ROOT/data/server-exports/$kind"
   seen="$ROOT/data/server-exports/.fetched-$kind.txt"
