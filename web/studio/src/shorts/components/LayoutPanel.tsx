@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { Segmented } from "@kit/ui";
 import { api, isActive, type Background, type Job, type Layout, type ScreenLayout } from "../api";
 import { Button, Card, CardHeader } from "./ui";
-import { Link } from "../lib";
+import { useToast } from "@kit/feedback";
+import { errorText, Link } from "../lib";
 
 type Draft = Pick<Layout, "screen_layout" | "cam_size" | "background" | "smart_layout">;
 
@@ -65,14 +66,19 @@ export function LayoutPanel({ job, onJob }: { job: Job; onJob: (j: Job) => void 
   const [draft, setDraft] = useState<Draft | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const toast = useToast();
 
   useEffect(() => {
+    let live = true;
     api.layout(job.id).then((l) => {
+      if (!live) return;
       setSaved(l);
       setDraft({ screen_layout: l.screen_layout, cam_size: l.cam_size, background: l.background, smart_layout: l.smart_layout });
-    }, (e) => setErr(e instanceof Error ? e.message : String(e)));
+    }, (e) => live && setErr(errorText(e)));
+    return () => { live = false; };
   }, [job.id]);
 
+  if (err && !saved) return <Card><CardHeader title="Layout" /><p className="p-5 text-xs text-err">{err}</p></Card>;
   if (!draft || !saved) return null;
   const dirty =
     draft.screen_layout !== saved.screen_layout ||
@@ -88,8 +94,9 @@ export function LayoutPanel({ job, onJob }: { job: Job; onJob: (j: Job) => void 
     try {
       setSaved(await api.setLayout(job.id, draft!));
       onJob(await api.job(job.id));
+      toast.ok("Layout saved · re-rendering previews");
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(errorText(e));
     } finally {
       setBusy(false);
     }
@@ -97,7 +104,7 @@ export function LayoutPanel({ job, onJob }: { job: Job; onJob: (j: Job) => void 
 
   return (
     <Card>
-      <CardHeader title="Layout" aside={saved.custom ? "This video" : "Defaults from shorts.yaml"} />
+      <CardHeader title="Layout" aside={saved.custom ? "Custom for this video" : <Link to="/settings" className="hover:text-fg">Defaults</Link>} />
       <div className="space-y-4 p-5">
         <div className="flex justify-center">
           <Preview d={draft} />
@@ -127,7 +134,7 @@ export function LayoutPanel({ job, onJob }: { job: Job; onJob: (j: Job) => void 
             hint={
               draft.background === "tweet" ? (
                 <>
-                  Video inside your <Link to="/settings/channel" className="text-accent hover:underline">Channel card</Link>,
+                  Video inside your <Link to="/settings?tab=card" className="text-accent hover:underline">Channel card</Link>,
                   hook text as the tweet
                 </>
               ) : (
@@ -157,6 +164,7 @@ export function LayoutPanel({ job, onJob }: { job: Job; onJob: (j: Job) => void 
             <Button onClick={apply} loading={busy} disabled={!dirty || running}>
               Apply &amp; re-render
             </Button>
+            {dirty && !busy && <Button variant="ghost" onClick={() => setDraft({ screen_layout: saved.screen_layout, cam_size: saved.cam_size, background: saved.background, smart_layout: saved.smart_layout })}>Undo</Button>}
             {running && <span className="text-xs text-muted">Available when processing finishes</span>}
           </div>
         </div>

@@ -6,12 +6,12 @@
 #   2. media         if the call sends audio or video (only Gemini can take those)
 #   3. default       everything else
 # A route's `models:` are tried in order (the next one on quota / overload). If a route has no models:
-#   Gemini uses each app's own models (configs/shorts.yaml, anime.yaml),
+#   Gemini uses the models in configs/shorts.yaml (select.model + fallback_models),
 #   any other provider uses the `models:` listed under its entry in `providers:`.
 #
 # A model chosen in the UI is saved to configs/llm.local.yaml and wins over tasks: below.
 #
-# Task names: shorts.select, shorts.refine, anime.select, anime.watch, anime.music_mood
+# Task names: shorts.select, shorts.refine
 
 default:
   provider: gemini

@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
 import { LoaderCircle } from "lucide-react";
 import { cx } from "./lib";
 
@@ -182,4 +182,43 @@ export function PageHeader({ eyebrow, title, children, aside }: {
       {aside}
     </header>
   );
+}
+
+const FIELD =
+  "w-full rounded-xl border border-line bg-bg px-3 py-2 text-sm outline-none transition placeholder:text-faint " +
+  "focus:border-accent/60 focus:ring-2 focus:ring-accent/20 disabled:opacity-50 aria-[invalid=true]:border-err/60";
+
+export function Input({ className, ...rest }: InputHTMLAttributes<HTMLInputElement>) {
+  return <input {...rest} className={cx(FIELD, "h-9", className)} />;
+}
+
+export function TextArea({ className, ...rest }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  return <textarea {...rest} className={cx(FIELD, "min-h-20 resize-y leading-relaxed", className)} />;
+}
+
+export function Select({ className, children, ...rest }: SelectHTMLAttributes<HTMLSelectElement>) {
+  return (
+    <select {...rest} className={cx(FIELD.replace("w-full ", ""), "h-9 cursor-pointer appearance-none bg-[length:16px] bg-[right_0.6rem_center] bg-no-repeat pr-8", className)}
+      style={{ backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a1a1aa' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")" }}>
+      {children}
+    </select>
+  );
+}
+
+/** A labelled number. `hint` shows on hover. */
+export function Stat({ label, value, sub, hint, tone }: {
+  label: string; value: ReactNode; sub?: ReactNode; hint?: string; tone?: "ok" | "warn" | "err";
+}) {
+  return (
+    <div className="min-w-0 rounded-2xl border border-line bg-surface px-4 py-3 shadow-card" title={hint}>
+      <div className="truncate text-xs font-medium text-muted">{label}</div>
+      <div className={cx("mt-1 truncate font-mono text-xl font-semibold tracking-tight tabular-nums",
+        tone === "ok" && "text-ok", tone === "warn" && "text-warn", tone === "err" && "text-err")}>{value}</div>
+      {sub && <div className="mt-0.5 truncate text-xs text-faint">{sub}</div>}
+    </div>
+  );
+}
+
+export function Kbd({ children }: { children: ReactNode }) {
+  return <kbd className="rounded border border-line-strong bg-surface-2 px-1 font-mono text-[10px] text-muted">{children}</kbd>;
 }

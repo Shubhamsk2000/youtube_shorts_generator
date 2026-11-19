@@ -1,15 +1,10 @@
-export type StageStatus = "pending" | "running" | "done" | "failed" | "planned";
-export type JobStatus = "queued" | "running" | "done" | "failed" | "interrupted";
+import { ApiError, json, request } from "@kit/http";
+import { stagesProgress, type Stage } from "@kit/types";
 
-export interface Stage {
-  key: string;
-  label: string;
-  status: StageStatus;
-  progress: number | null;
-  message: string | null;
-  started_at: string | null;
-  finished_at: string | null;
-}
+export { ApiError };
+export type { Stage };
+export type StageStatus = Stage["status"];
+export type JobStatus = "queued" | "running" | "done" | "failed" | "interrupted";
 
 export interface ExportState {
   status: "queued" | "running" | "done" | "failed";
@@ -20,6 +15,15 @@ export interface ExportState {
   finished_at: string | null;
   queue: string[];
   current: string | null;
+}
+
+export interface JobStats {
+  clips: number;
+  approved: number;
+  rejected: number;
+  exported: number;
+  clip_seconds: number;
+  picked_by: "gemini" | "heuristic" | null;
 }
 
 export interface Job {
@@ -37,6 +41,10 @@ export interface Job {
   height: number | null;
   fps: number | null;
   export: ExportState | null;
+  stopping: boolean;
+  stats: JobStats;
+  progress: number;
+  server_time: string;
 }
 
 export interface Check {
@@ -99,6 +107,7 @@ export interface Clip {
   ready: boolean;
   url: string | null;
   final_url: string | null;
+  upload_text: string;
 }
 
 export interface ClipsData {
@@ -110,6 +119,8 @@ export interface ClipsData {
   clips: Clip[];
 }
 
+export type ClipEdit = Partial<Pick<Clip, "title" | "hook_text" | "show_hook" | "description" | "hashtags">>;
+
 export type ScreenLayout = "split" | "pip" | "track";
 export type Background = "blur" | "tweet";
 
@@ -119,85 +130,111 @@ export interface Layout {
   cam_range: [number, number];
   background: Background;
   smart_layout: boolean;
-  custom: boolean; // this video has its own layout (else the shorts.yaml defaults)
+  custom: boolean; // this video has its own layout (else the defaults)
 }
 
-export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
-    super(message);
-  }
+export interface SettingField {
+  key: string;
+  label: string;
+  type: "bool" | "int" | "float" | "choice" | "color";
+  help: string;
+  min: number | null;
+  max: number | null;
+  step: number | null;
+  unit: string;
+  options: { value: string; label: string }[];
+  applies: "new" | "render" | "export";
+  value: unknown;
+  default: unknown;
+  custom: boolean;
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...init });
-  } catch {
-    throw new ApiError("Can't reach the server. Is `shorts serve` running?", 0);
-  }
-  if (!res.ok) {
-    let msg = res.statusText || `Request failed (${res.status})`;
-    try {
-      const body = await res.json();
-      if (typeof body.detail === "string") msg = body.detail;
-    } catch {
-      /* non-JSON error */
-    }
-    throw new ApiError(msg, res.status);
-  }
-  return res.status === 204 ? (undefined as T) : res.json();
+export interface SettingsData {
+  groups: { id: string; label: string; help: string; fields: SettingField[] }[];
 }
+
+export interface CardSettings {
+  name: string;
+  handle: string;
+  theme: "dark" | "light";
+  verified: boolean;
+  footer: "date" | "none";
+  has_avatar: boolean;
+}
+
+export interface StorageData {
+  projects: { id: string; title: string; status: JobStatus; created_at: string; workspace_bytes: number; exports_bytes: number }[];
+  uploads_bytes: number;
+  total_bytes: number;
+  disk_free_gb: number;
+}
+
+const S = "/api/shorts";
+const J = (id: string) => `${S}/jobs/${encodeURIComponent(id)}`;
 
 export const api = {
-  system: () => req<SystemInfo>("/api/shorts/system"),
-  jobs: () => req<Job[]>("/api/shorts/jobs"),
-  job: (id: string) => req<Job>(`/api/shorts/jobs/${encodeURIComponent(id)}`),
-  create: (url: string) => req<Job>("/api/shorts/jobs", { method: "POST", body: JSON.stringify({ url }) }),
-  retry: (id: string) => req<Job>(`/api/shorts/jobs/${encodeURIComponent(id)}/retry`, { method: "POST" }),
-  remove: (id: string) => req<void>(`/api/shorts/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  transcript: (id: string) => req<TranscriptData>(`/api/shorts/jobs/${encodeURIComponent(id)}/transcript`),
-  clips: (id: string) => req<ClipsData>(`/api/shorts/jobs/${encodeURIComponent(id)}/clips`),
-  exportClips: (id: string, clipIds: string[] | null) =>
-    req<Job>(`/api/shorts/jobs/${encodeURIComponent(id)}/export`, {
-      method: "POST",
-      body: JSON.stringify({ clip_ids: clipIds }),
-    }),
-  layout: (id: string) => req<Layout>(`/api/shorts/jobs/${encodeURIComponent(id)}/layout`),
+  system: () => request<SystemInfo>(`${S}/system`, { timeoutMs: 20000 }),
+  jobs: () => request<Job[]>(`${S}/jobs`),
+  job: (id: string) => request<Job>(J(id)),
+  create: (url: string) => request<Job>(`${S}/jobs`, { ...json("POST", { url }), timeoutMs: 90000 }),
+  retry: (id: string) => request<Job>(`${J(id)}/retry`, json("POST")),
+  stop: (id: string) => request<Job>(`${J(id)}/stop`, json("POST")),
+  remove: (id: string, exports = false) => request<void>(`${J(id)}?exports=${exports}`, json("DELETE")),
+  transcript: (id: string) => request<TranscriptData>(`${J(id)}/transcript`, { timeoutMs: 60000 }),
+  clips: (id: string) => request<ClipsData>(`${J(id)}/clips`),
+  editClip: (id: string, clipId: string, body: ClipEdit) =>
+    request<{ clip: Clip; rerender: boolean }>(`${J(id)}/clips/${encodeURIComponent(clipId)}`, json("PATCH", body)),
+  exportClips: (id: string, clipIds: string[] | null) => request<Job>(`${J(id)}/export`, json("POST", { clip_ids: clipIds })),
+  stopExport: (id: string) => request<Job>(`${J(id)}/export/stop`, json("POST")),
+  zipUrl: (id: string) => `${J(id)}/exports.zip`,
+  rerender: (id: string) => request<Job>(`${J(id)}/rerender`, json("POST")),
+  layout: (id: string) => request<Layout>(`${J(id)}/layout`),
   setLayout: (id: string, l: Pick<Layout, "screen_layout" | "cam_size" | "background" | "smart_layout">) =>
-    req<Layout>(`/api/shorts/jobs/${encodeURIComponent(id)}/layout`, { method: "PUT", body: JSON.stringify(l) }),
-  reselect: (id: string) => req<Job>(`/api/shorts/jobs/${encodeURIComponent(id)}/reselect`, { method: "POST" }),
+    request<Layout>(`${J(id)}/layout`, json("PUT", l)),
+  reselect: (id: string) => request<Job>(`${J(id)}/reselect`, json("POST")),
   review: (id: string, clipId: string, review: Review) =>
-    req<{ id: string; review: Review }>(
-      `/api/shorts/jobs/${encodeURIComponent(id)}/clips/${encodeURIComponent(clipId)}/review`,
-      { method: "PUT", body: JSON.stringify({ review }) },
-    ),
+    request<{ id: string; review: Review }>(`${J(id)}/clips/${encodeURIComponent(clipId)}/review`, json("PUT", { review })),
+  reviews: (id: string, clipIds: string[], review: Review) =>
+    request<{ updated: number }>(`${J(id)}/reviews`, json("PUT", { clip_ids: clipIds, review })),
+  storage: () => request<StorageData>(`${S}/storage`, { timeoutMs: 120000 }),
+  settings: () => request<SettingsData>(`${S}/settings`),
+  saveSettings: (changes: Record<string, unknown>) => request<SettingsData>(`${S}/settings`, json("PUT", changes)),
+  card: () => request<CardSettings>(`${S}/settings/card`),
+  saveCard: (body: Partial<CardSettings> & { remove_avatar?: boolean }) => request<CardSettings>(`${S}/settings/card`, json("PUT", body)),
+  uploadAvatar: (file: File) => request<CardSettings>(`${S}/settings/avatar`, { method: "PUT", body: file, timeoutMs: 60000 }),
+  cardPreview: (text: string, v: number) => `${S}/settings/card/preview?text=${encodeURIComponent(text)}&v=${v}`,
 };
 
 export const isActive = (s: JobStatus) => s === "queued" || s === "running";
 export const isExporting = (j: Job) => j.export?.status === "queued" || j.export?.status === "running";
 
-/** Average progress across implemented stages, 0..1. */
+/** 0..1, stages weighted by their typical share of a run (same formula as the server's `progress`). */
 export function overallProgress(job: Job): number {
-  const real = job.stages.filter((s) => s.status !== "planned");
-  if (!real.length) return 0;
-  const sum = real.reduce(
-    (acc, s) => acc + (s.status === "done" ? 1 : s.status === "running" ? (s.progress ?? 0) : 0),
-    0,
-  );
-  return sum / real.length;
+  return job.stages?.length ? stagesProgress(job.stages) : job.progress ?? 0;
 }
 
 export const currentStage = (job: Job) => job.stages.find((s) => s.status === "running");
 
-export const thumbnailUrl = (job: Job) =>
-  job.is_youtube ? `https://i.ytimg.com/vi/${job.id}/hqdefault.jpg` : null;
+/** Server clock minus browser clock, in ms (0 if unknown). */
+export function clockSkew(job: Job | undefined, receivedAt: number | undefined): number {
+  if (!job?.server_time || !receivedAt) return 0;
+  const t = new Date(job.server_time).getTime();
+  return isFinite(t) ? t - receivedAt : 0;
+}
+
+export const thumbnailUrl = (job: Job) => (job.is_youtube ? `https://i.ytimg.com/vi/${job.id}/hqdefault.jpg` : null);
+
+export const jobHref = (id: string) => `/jobs/${encodeURIComponent(id)}`;
 
 /** Streams a local video to the server (XHR: fetch has no upload progress). Resolves with the new job. */
-export function uploadVideo(file: File, onProgress: (f: number) => void): { done: Promise<Job>; abort: () => void } {
+export function uploadVideo(
+  file: File,
+  onProgress: (loaded: number, total: number) => void,
+): { done: Promise<Job>; abort: () => void } {
   const xhr = new XMLHttpRequest();
   const done = new Promise<Job>((resolve, reject) => {
-    xhr.open("PUT", `/api/shorts/uploads/${encodeURIComponent(file.name)}`);
-    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
+    xhr.open("PUT", `${S}/uploads/${encodeURIComponent(file.name)}`);
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded, e.total);
     xhr.onload = () => {
       let body: { detail?: string } & Partial<Job> = {};
       try {
@@ -205,11 +242,11 @@ export function uploadVideo(file: File, onProgress: (f: number) => void): { done
       } catch {
         /* not json */
       }
-      if (xhr.status < 300) resolve(body as Job);
-      else reject(new Error(typeof body.detail === "string" ? body.detail : `Upload failed (${xhr.status})`));
+      if (xhr.status >= 200 && xhr.status < 300) resolve(body as Job);
+      else reject(new ApiError(typeof body.detail === "string" ? body.detail : `Upload failed (${xhr.status})`, xhr.status));
     };
-    xhr.onerror = () => reject(new Error("Upload failed: connection lost"));
-    xhr.onabort = () => reject(new Error("Upload cancelled"));
+    xhr.onerror = () => reject(new ApiError("Upload failed: the connection to Studio was lost", 0));
+    xhr.onabort = () => reject(new ApiError("Upload cancelled", -1));
     xhr.send(file);
   });
   return { done, abort: () => xhr.abort() };

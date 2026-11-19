@@ -1,1 +1,1 @@
-"""Code shared by the `shorts` (long video -> shorts) and `anime` (anime edits) apps."""
+"""Code shared by the shorts app and the Studio server: AI routing, ffmpeg helpers, job lock, runner."""

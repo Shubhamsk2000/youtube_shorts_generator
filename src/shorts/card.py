@@ -1,6 +1,6 @@
-"""The tweet-card template: a full-canvas transparent PNG laid over the blurred background.
+"""The tweet-card template (reframe.background: tweet): a full-canvas transparent PNG over the blurred background.
 
-The card has a rounded transparent window where the episode plays; the video is overlaid UNDER the
+The card has a rounded transparent window where the clip plays; the video is overlaid UNDER the
 card, so the window gives it rounded corners for free. Everything is drawn at 2x and downscaled for
 smooth edges. `layout()` is the single source of truth for where things go (render.py uses it too).
 """

@@ -1,24 +1,29 @@
 import { Check, LoaderCircle, X } from "lucide-react";
-import { cx, elapsed } from "./lib";
+import { cx, fmtDuration, fmtEta, secondsBetween, useNow } from "./lib";
 import { stagesProgress, type Stage } from "./types";
 import { Card, CardHeader, ProgressBar } from "./ui";
 
-export function Pipeline({ stages, title = "Pipeline" }: { stages: Stage[]; title?: string }) {
-  const pct = Math.round(stagesProgress(stages) * 100);
+/** `skew`: server clock minus browser clock (ms), so elapsed times are right even if the clocks differ. */
+export function Pipeline({ stages, title = "Pipeline", skew = 0 }: { stages: Stage[]; title?: string; skew?: number }) {
+  const pct = Math.floor(stagesProgress(stages) * 100);
+  const running = stages.some((s) => s.status === "running");
+  const now = useNow(1000, running) + skew;
   return (
     <Card>
-      <CardHeader title={title} aside={<span className="font-mono">{pct}%</span>} />
+      <CardHeader title={title} aside={<span className="font-mono" title="Weighted by how long each step usually takes">{pct}%</span>} />
       <ol className="px-5 py-4">
         {stages.map((s, i) => (
-          <StageRow key={s.key} stage={s} last={i === stages.length - 1} />
+          <StageRow key={s.key} stage={s} last={i === stages.length - 1} now={now} />
         ))}
       </ol>
     </Card>
   );
 }
 
-function StageRow({ stage: s, last }: { stage: Stage; last: boolean }) {
-  const time = s.status === "done" || s.status === "running" ? elapsed(s.started_at, s.finished_at) : null;
+function StageRow({ stage: s, last, now }: { stage: Stage; last: boolean; now: number }) {
+  const secs = s.status === "done" || s.status === "running" ? secondsBetween(s.started_at, s.finished_at, now) : null;
+  const time = secs != null && secs >= 1 ? fmtDuration(secs) : null;
+  const eta = s.status === "running" ? fmtEta(s.eta_s) : null;
   return (
     <li className="relative flex gap-3.5 pb-5 last:pb-0">
       {!last && (
@@ -52,6 +57,12 @@ function StageRow({ stage: s, last }: { stage: Stage; last: boolean }) {
         {s.status === "running" && (
           <div className="mt-2">
             <ProgressBar value={s.progress} active />
+            {(s.progress != null || eta) && (
+              <div className="mt-1 flex justify-between font-mono text-[11px] text-faint">
+                <span>{s.progress != null ? `${Math.floor(s.progress * 100)}%` : ""}</span>
+                <span>{eta}</span>
+              </div>
+            )}
           </div>
         )}
         {s.message && s.status !== "planned" && (
