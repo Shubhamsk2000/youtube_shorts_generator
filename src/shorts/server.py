@@ -25,7 +25,7 @@ from common.sysinfo import free_disk_gb
 from .config import LAYOUT_FILE, Config, load_config, load_job_layout, with_job_layout
 from .models import Selection, Transcript, VideoMeta, load_json, save_json
 from common.progress import Hooks, Reporter
-from .stages import captions, download, reframe, render, select, transcribe
+from .stages import captions, download, reframe, render, select, sources, transcribe
 from common.runner import SerialRunner
 from common.lock import job_lock, lock_owner
 
@@ -199,6 +199,14 @@ def _reconcile(job: JobState, d: Path, cfg: Config) -> None:
     if by["select"].status != "done" or not (d / select.OUT).exists():
         return
     sel = load_json(Selection, d / select.OUT)
+    src = by.get("sources")
+    if src and src.status == "pending" and (d / download.META).exists():
+        meta = load_json(VideoMeta, d / download.META)
+        idx = sources.load_index(d)
+        have = all((e := idx.clips.get(c.id)) and (sources.sources_dir(d) / e.file).exists() for c in sel.clips)
+        if have or sources.full_source(d, meta):  # older jobs read their clips from the full download
+            src.status, src.progress = "done", 1.0
+            src.message = f"{len(sel.clips)} clip videos" if have else "From the full download"
     rf = by["reframe"]
     if rf.status == "pending" and (not cfg.reframe.enabled or all(
             reframe.plan_path(d, c).exists() for c in sel.clips)):
@@ -654,7 +662,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         if not (d / transcribe.OUT).exists():
             raise HTTPException(409, "Not transcribed yet")
         (d / select.OUT).unlink(missing_ok=True)
-        for key in ("select", "reframe", "captions", "render"):
+        for key in ("select", "sources", "reframe", "captions", "render"):
             store.update(job_id, stage=key, status="pending", progress=None, message=None,
                          started_at=None, finished_at=None)
         worker.submit(job_id)
@@ -667,6 +675,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         if not (d / download.META).exists():
             raise HTTPException(404, "Not downloaded yet")
         meta = load_json(VideoMeta, d / download.META)
+        if meta.mode != "full" or meta.source_deleted or not (d / meta.file).exists():
+            raise HTTPException(404, "The full video isn't kept for this job: only each clip's own video")
         return FileResponse(d / meta.file)
 
     router.store, router.worker = store, worker  # read by the Studio's queue view

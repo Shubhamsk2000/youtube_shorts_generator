@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .config import Config
 from common.progress import Hooks
-from .stages import captions, download, reframe, render, select, transcribe
+from .stages import captions, download, reframe, render, select, sources, transcribe
 from common.lock import job_lock
 
 
@@ -21,6 +21,7 @@ STAGES = [
     StageDef("download", "Download", True),
     StageDef("transcribe", "Transcribe", True),
     StageDef("select", "Find moments", True),
+    StageDef("sources", "Clip video", True),
     StageDef("reframe", "Reframe to 9:16", True),
     StageDef("captions", "Pacing & captions", True),
     StageDef("render", "Render previews", True),
@@ -41,6 +42,10 @@ def run(source: str, cfg: Config, hooks: Hooks, job: download.JobRef | None = No
         hooks.stage_start("select")
         _, summary = select.run(job_dir, meta, cfg, report=hooks.reporter("select"))
         hooks.stage_done("select", summary)
+
+        hooks.stage_start("sources")
+        summary = sources.run(job_dir, meta, cfg, report=hooks.reporter("sources"))
+        hooks.stage_done("sources", summary)
 
         hooks.stage_start("reframe")
         summary = reframe.run(job_dir, meta, cfg, report=hooks.reporter("reframe"))

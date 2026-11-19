@@ -199,6 +199,29 @@ scripts/ssh.sh 'rm -rf yt_video_gen/data/shorts/exports/<video id>'       # an e
 
 Finished episodes and videos: delete them in Studio (their work files are the big part).
 
+**Long videos and streams** never need the whole video on disk. With `download.mode: auto` (the default in
+`configs/shorts.yaml`) a video bigger than `full_max_gb` (6 GB) is fetched audio-first: the whole soundtrack
+(≈70 MB per hour, plus a 16 kHz WAV for Whisper, ≈115 MB per hour), then only the picked clips' video, about a
+minute each (stage *Clip video*). A 24 h 1440p stream needs ≈7 GB this way instead of ≈98 GB. Shorter videos are
+downloaded whole, each clip is cut out of the download, and the download is deleted (`keep_source: false`), so a
+finished job keeps only its transcript, the clip videos and the renders. Whisper runs at about 1.8× realtime on
+2 vCPU (a 24 h stream takes ~13 h). It saves every 30 min chunk as it goes, so Resume continues from the last
+saved chunk.
+
+#### A second disk for media
+
+Attach an extra EBS volume (EC2 → *Volumes* → *Create volume*, gp3, same availability zone → *Attach* to the
+instance), then on the server:
+
+```bash
+bash scripts/server/attach-data-disk.sh     # formats it only if it is blank, mounts /mnt/data, moves the workspace
+df -h /mnt/data
+```
+
+`data/shorts/workspace` and `data/shorts/uploads` then live on that disk (symlinks; nothing else changes).
+If the volume is ever detached, `shorts doctor` reports *Workspace disk … is missing* and new jobs fail instead
+of filling the root disk.
+
 ---
 
 ## Part 3: when you change the code

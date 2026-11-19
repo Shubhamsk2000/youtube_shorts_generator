@@ -17,7 +17,11 @@ class VideoMeta(BaseModel):
     height: int
     fps: float
     vcodec: str | None = None
-    file: str  # filename inside the job dir
+    file: str  # filename inside the job dir (the full video; in "clips" mode the full-length audio only)
+    mode: str = "full"            # "full": the whole video was downloaded; "clips": audio only, clip video on demand
+    source_deleted: bool = False  # the full download was removed once every clip had its own video file
+    video_format: str | None = None  # yt-dlp format ids: clip videos fetched later use the same streams
+    audio_format: str | None = None
 
 
 class Word(BaseModel):

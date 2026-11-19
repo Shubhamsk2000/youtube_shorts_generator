@@ -43,6 +43,11 @@ Gemini picks moments (find pass + editor pass, YouTube "Most replayed" data when
 face tracking (facecam-over-gameplay gets a split layout), tightened pauses, word-by-word captions, an on-screen hook,
 loudness at −14 LUFS. Finished files: `data/shorts/exports/<video>/`. Settings: `configs/shorts.yaml`.
 
+Long videos and live streams (up to 36 h): when the whole video wouldn't fit comfortably (`download.mode: auto`),
+only its audio is downloaded for transcription and picking, then only the picked clips' video, each into its own
+file (`workspace/<id>/sources/`). Smaller videos are downloaded whole, the clips are cut out, and the full download
+is deleted. Whisper saves each 30 min chunk as it goes, so a stopped job resumes where it was.
+
 ## Anime edits (episode → edits)
 
 In Studio → Anime: drop an episode (or put it in `data/anime/episodes/`), choose single scenes, montage or
@@ -96,7 +101,7 @@ Every AI call goes through `src/common/llm.py`; how each provider is called live
 ```
 src/common/       shared: AI doorway (llm.py) + providers (llm_providers.py), ffmpeg helpers, job lock, runner, paths
 src/studio/       the Studio server: mounts both APIs (/api/shorts, /api/anime), queue status, serves web/studio
-src/shorts/       long video → shorts (stages/, cli.py, server.py)
+src/shorts/       long video → shorts (stages/: download, transcribe, select, sources, reframe, captions, render)
 src/anime/        anime edits (stages/ incl. amv.py, music.py, card.py, cli.py)
 configs/          shorts.yaml, anime.yaml, llm.yaml (which AI provider answers what)
 web/studio/       the one React app: src/kit (components + theme), src/shorts, src/anime, src/app (shell, home)

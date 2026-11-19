@@ -53,8 +53,13 @@ def run_checks(cfg: Config) -> list[Check]:
         except ImportError as e:
             checks.append(Check(mod, False, str(e)))
 
-    disk = free_disk_gb(cfg.workspace())
-    checks.append(Check("Free disk", disk >= 6, f"{disk:.1f} GB free (a 4K source ≈ 1-2 GB)", required=False))
+    ws = cfg.workspace()
+    if ws.is_symlink() and not ws.exists():  # workspace on a data disk that isn't mounted
+        checks.append(Check("Workspace disk", False, f"{ws} -> {os.readlink(ws)} is missing: mount the data disk "
+                                                     "(sudo mount -a)"))
+    disk = free_disk_gb(ws)
+    checks.append(Check("Free disk", disk >= 6, f"{disk:.1f} GB free (long streams: audio ≈ 70 MB/h + clips "
+                                                 "≈ 2-3 GB, see download.mode)", required=False))
     ram = available_ram_gb()
     checks.append(Check("Available RAM", ram >= 1.5, f"{ram:.1f} GB", required=False))
     checks.append(Check("Gemini API key", bool(os.getenv("GEMINI_API_KEY")),
