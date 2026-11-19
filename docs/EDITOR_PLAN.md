@@ -21,8 +21,11 @@ Overrides live in `framing/<clip_id>.json`, apart from the analysis (`reframe/<c
 "Reset to auto" is just deleting keys):
 
 ```json
-{"keys": [{"f": 0, "x": 0.41, "a": 0.8125}, {"f": 96, "x": 0.55, "a": 0.8125}]}
+{"keys": [{"f": 0, "x": 0.41, "a": 0.8125}, {"f": 96, "x": null, "a": 0.8125}]}
 ```
+
+`x: null` = keep following the automatic framing (face tracking) and only set the shape, so a shot can be widened
+without freezing it. "Use this shape for the whole clip" adds such keys to every shot.
 
 - `f` = source frame inside the clip (the same frame numbers the plan and the renderer use).
 - A shot (between two camera cuts) **with** keys is manual: `x` and `a` ease between its keys and hold before the
@@ -33,7 +36,7 @@ Overrides live in `framing/<clip_id>.json`, apart from the analysis (`reframe/<c
 
 ## Steps
 
-### 1. Backend: framing overrides + renderer  ✔ when tests pass
+### 1. Backend: framing overrides + renderer  ✔ done
 - `models.Shot`: optional per-frame `a` (window aspect).
 - `stages/framing.py`: load/save/validate overrides, apply them to a plan, `load_plan()` used by render + captions.
 - `render.compose()`: a window wider than the output → scaled to full width over `blurred_bg()`.
@@ -41,15 +44,17 @@ Overrides live in `framing/<clip_id>.json`, apart from the analysis (`reframe/<c
 - `render.clip_file()`: cache key includes the override file.
 - Tests: apply/interpolate, compose sizes, text-box mapping, cache key changes.
 
-### 2. Backend: editor API
+### 2. Backend: editor API  ✔ done
 - `GET  /jobs/{id}/clips/{cid}/editor`: fps, size, frame count, shots (mode, why, auto x path), face samples,
   pacing cuts, overrides, output + layout constants, neighbours (prev/next clip).
 - `GET  /jobs/{id}/clips/{cid}/proxy`: small 16:9 H.264 of the clip range (built once, cached in `editor/`;
   browsers can't play every `.mkv`, and a short keyframe interval makes scrubbing smooth).
-- `PUT  /jobs/{id}/clips/{cid}/framing`: validate + save keys, rebuild captions, queue that clip's render.
-- `DELETE /jobs/{id}/clips/{cid}/framing`: back to automatic.
+- `POST /jobs/{id}/clips/{cid}/proxy`: build it ahead of time (the page warms the next clip's).
+- `PUT  /jobs/{id}/clips/{cid}/framing`: validate + save keys (empty list = automatic again), rebuild captions,
+  queue that clip's render. Allowed while the job is only re-rendering: a running render renders once more after.
+- Preview / HD file names only change for clips that have keyframes, so existing previews and exports stay valid.
 
-### 3. Web: editor page `/jobs/{id}/clips/{cid}`
+### 3. Web: editor page `/jobs/{id}/clips/{cid}`  ✔ done
 - Clicking a clip's preview (or an Edit framing button) opens it.
 - Left: 16:9 video, the window drawn over it (outside dimmed). Drag the middle = move, drag an edge = wider/narrower.
   Every drag sets a keyframe at the current frame.
@@ -63,17 +68,17 @@ Overrides live in `framing/<clip_id>.json`, apart from the analysis (`reframe/<c
   shot, Ctrl+Z / Ctrl+Shift+Z undo/redo, Ctrl+S save.
 - Unsaved-changes guard, prev/next clip.
 
-### 4. AI focus prompt
+### 4. AI focus prompt  ✔ done
 - Home: "Tell the AI what to look for (optional)" under the link box; when it's open, pasting a link doesn't
   auto-start (so the note isn't skipped). Mode: *Prefer* (default: these first, plus the other strong moments) or
   *Only these*.
-- Stored as `focus.json` in the project; `shorts make --focus "..."` for the CLI.
+- Stored as `focus.json` in the project; `shorts make --focus "..." [--only]` for the CLI.
 - Both Gemini passes get the note; the schema gains `matches_focus`; matches are ranked first and never dropped
   by `max_clips`; clips show a "Focus" badge.
 - Project page: the note can be edited later → **Re-pick moments** (the transcript is reused).
 - The prompt cache is keyed on the full request, so a different note never reuses old picks.
 
-### 5. Wrap up
+### 5. Wrap up  ✔ done
 - `pytest`, `npm run build`, run it against a local project, README section, PR into `main`.
 
 ## Later (not in this pass)

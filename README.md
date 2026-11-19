@@ -23,14 +23,25 @@ cd web && npm install --cache ../.cache/npm && npm run build && cd ..
 
 Deploying to AWS and updating it after code changes: **[docs/DEPLOY.md](docs/DEPLOY.md)**.
 
-- **Projects**: paste a link or upload a file. Totals across all projects (clips, to review, approved, exported,
+- **Projects**: paste a link or upload a file. Optionally **tell the AI what to look for** ("every time they talk
+  about money"): *These first* picks those moments first plus the other strong ones, *Only these* picks just them
+  (if nothing matches you still get the best moments). Matching clips get a **Focus** badge and filter. The note can
+  be changed on the project page and the moments picked again (the transcript is reused). Totals across all projects (clips, to review, approved, exported,
   disk), search, filter (processing / to review / ready / failed) and sort.
 - **Project page**: weighted overall progress with elapsed time and the current step's time left, **Stop** (finished
   steps are kept, Resume continues), Retry, **Re-render** with the current settings, delete (optionally with the
   exported files). Clips can be filtered, sorted (score, hook, most replayed, length, order in the video), approved in
   bulk, and edited: title, on-screen hook, banner on/off, description and hashtags (on-screen changes re-render just
   that preview). Copy the upload text, export HD one by one or all approved, cancel an export, download every HD clip
-  as one `.zip`. Keyboard on a focused clip: <kbd>A</kbd> approve, <kbd>X</kbd> reject, <kbd>E</kbd> edit.
+  as one `.zip`. Keyboard on a focused clip: <kbd>A</kbd> approve, <kbd>X</kbd> reject, <kbd>E</kbd> edit,
+  <kbd>Enter</kbd> open the editor.
+- **Clip editor** (click a preview): the full 16:9 clip with the window that becomes the short drawn on top, next to
+  a live 9:16 preview. Drag the window to move it, drag its edges to make it wider (9:16 fills the screen; 3:4,
+  13:16, 1:1 ... up to the whole 16:9 frame are shown full-width over a blurred copy of the video). Every change is a
+  keyframe: the window moves smoothly between keyframes and jumps at camera cuts; shots without keyframes keep the
+  automatic framing. A wider window can keep following faces. Also: hook text, banner, title, approve/reject,
+  undo/redo, Shorts safe zones, and the pauses that pacing removes on the timeline. Saving re-renders that clip.
+  Keyframes live in `framing/<clip>.json` (the face analysis is never changed: "Reset" removes keyframes).
 - **Settings**: moment picking, captions, hook banner, pacing, layout defaults, export quality, download. Saved to
   `configs/shorts.local.yaml` (git-ignored) on top of `configs/shorts.yaml`; every value is validated before it is
   saved, and each can be reset to the `shorts.yaml` default. **Channel card** (tab): name, handle, picture and theme
