@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import export as exporter
-from . import health, pipeline, settings
+from . import editor, health, pipeline, settings
 from common import ffmpeg
 from common.paths import DATA_DIR, resolve
 from common.sysinfo import free_disk_gb
@@ -307,6 +307,7 @@ class Worker:
         self.store, self.cfg, self.cfg_path, self.runner = store, cfg, cfg_path, runner
         self.current: str | None = None
         self._cancel: set[str] = set()       # pipeline runs asked to stop
+        self._again: set[str] = set()        # a clip changed while the job was rendering: run once more after
         self._cancel_export: set[str] = set()
 
     def submit(self, job_id: str) -> None:
@@ -314,6 +315,18 @@ class Worker:
         self.runner.drop("shorts", job_id, "pipeline")  # already waiting: keep one queued run, not two
         self.store.update(job_id, status="queued", error=None, stopping=False)
         self.runner.submit("shorts", job_id, "pipeline", lambda: self._handle("run", job_id))
+
+    def rerender(self, job_id: str) -> None:
+        """Re-render previews whose inputs changed (a clip edit). A running job renders again when it's done;
+        a queued one already will."""
+        job = self.store.get(job_id)
+        if job and (job.status == "running" or self.current == job_id):
+            self._again.add(job_id)
+            return
+        self.store.update(job_id, stage="render", status="pending", progress=None, eta_s=None, message=None,
+                          started_at=None, finished_at=None)
+        if not job or job.status != "queued":
+            self.submit(job_id)
 
     def stop(self, job_id: str) -> str:
         """Stop a job's pipeline run (queued: removed at once; running: at its next progress update).
@@ -450,6 +463,11 @@ class Worker:
                                   job.title, job.duration, job.is_youtube)
             pipeline.run(job.source, self.cfg, hooks, job=ref)
             self.store.update(job_id, status="done", stopping=False)
+            if job_id in self._again:  # an edit landed after the render had passed that clip
+                self._again.discard(job_id)
+                self.store.update(job_id, stage="render", status="pending", progress=None, eta_s=None,
+                                  message=None, started_at=None, finished_at=None)
+                self.submit(job_id)
         except Exception as e:
             if job_id in self._cancel:  # stopped (the stop may surface wrapped in another error)
                 self._mark_stopped(job_id)
@@ -462,6 +480,7 @@ class Worker:
             self.store.update(job_id, status="failed", error=_friendly(e), stopping=False)
         finally:
             self._cancel.discard(job_id)
+            self._again.discard(job_id)  # failed or stopped: Retry renders everything that's stale anyway
             self.current = None
 
 
@@ -514,6 +533,16 @@ class ClipEdit(BaseModel):
     show_hook: bool | None = None
     description: str | None = None
     hashtags: list[str] | None = None
+
+
+class FramingKey(BaseModel):
+    f: int
+    x: float
+    a: float = 9 / 16
+
+
+class FramingBody(BaseModel):
+    keys: list[FramingKey]
 
 
 class BulkReview(BaseModel):
@@ -944,6 +973,12 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
                          started_at=None, finished_at=None)
         worker.submit(job_id)
 
+    def renders_only_or_409(job: JobState, what: str) -> None:
+        """Clip edits are fine while the job is only (re-)rendering previews; not while it picks or frames."""
+        busy = job.status in ("queued", "running") or worker.current == job.id
+        if busy and any(st.status not in ("done", "planned") for st in job.stages if st.key != "render"):
+            raise HTTPException(409, f"This video is processing: {what} when it's done (or stop it first)")
+
     def idle_or_409(job: JobState, what: str) -> None:
         if job.status in ("queued", "running") or worker.current == job.id:
             raise HTTPException(409, f"This video is processing: {what} when it's done (or stop it first)")
@@ -987,7 +1022,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
                 setattr(clip, k, v)
             visual = (captions.hook_text(clip), clip.show_hook) != visual_before
             if visual:
-                idle_or_409(job, "change the on-screen text")
+                renders_only_or_409(job, "change the on-screen text")
             save_json(sel, d / select.OUT)
         rerender = False
         if visual:
@@ -997,8 +1032,94 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
                 rerender = True
             except Exception as e:  # noqa: BLE001
                 raise HTTPException(500, f"Saved, but the captions couldn't be rebuilt: {_friendly(e)}") from None
-            resubmit_render(job_id, ("render",))
+            worker.rerender(job_id)
         return {"clip": {**clip.model_dump(), "duration": round(clip.duration, 2)}, "rerender": rerender}
+
+    def clip_or_404(d: Path, clip_id: str):
+        if not (d / select.OUT).exists():
+            raise HTTPException(409, "No clips yet")
+        sel = load_json(Selection, d / select.OUT)
+        clip = next((c for c in sel.clips if c.id == clip_id), None)
+        if not clip:
+            raise HTTPException(404, "Unknown clip")
+        return sel, clip
+
+    def meta_or_409(d: Path) -> VideoMeta:
+        if not (d / download.META).exists():
+            raise HTTPException(409, "Not downloaded yet")
+        return load_json(VideoMeta, d / download.META)
+
+    @router.get("/jobs/{job_id}/clips/{clip_id}/editor")
+    def get_editor(job_id: str, clip_id: str):
+        """What the clip editor draws: automatic framing per shot, manual keys, faces, removed pauses."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        sel, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        live = load_config(cfg_path)
+        order = sorted(sel.clips, key=lambda c: c.rank)
+        k = next(i for i, c in enumerate(order) if c.id == clip_id)
+        f = render.clip_file(d, clip, live)
+        ready = (d / render.CLIPS_DIR / f).exists()
+        return {
+            **editor.view(d, meta, clip, live),
+            "clip": {**clip.model_dump(), "duration": round(clip.duration, 2),
+                     "review": _load_reviews(d).get(clip.id), "ready": ready,
+                     "url": f"/api/shorts/jobs/{job_id}/clips/{clip.id}/video?v={f[-10:-4]}" if ready else None},
+            "prev": order[k - 1].id if k > 0 else None,
+            "next": order[k + 1].id if k + 1 < len(order) else None,
+            "index": k + 1,
+            "count": len(order),
+            "proxy_url": f"/api/shorts/jobs/{job_id}/clips/{clip.id}/proxy",
+        }
+
+    @router.get("/jobs/{job_id}/clips/{clip_id}/proxy")
+    async def get_proxy(job_id: str, clip_id: str):
+        """The clip's full 16:9 frame as a small mp4 for the editor (made on first open, then cached)."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        _, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        try:
+            p = await run_in_threadpool(editor.ensure_proxy, d, meta, clip, load_config(cfg_path))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Couldn't prepare the editor video: {_friendly(e)}") from None
+        return FileResponse(p, media_type="video/mp4", headers={"Cache-Control": "private, max-age=86400"})
+
+    @router.post("/jobs/{job_id}/clips/{clip_id}/proxy", status_code=204)
+    async def warm_proxy(job_id: str, clip_id: str):
+        """Build the editor video ahead of time (the page warms the next clip's while you edit this one)."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        _, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        try:
+            await run_in_threadpool(editor.ensure_proxy, d, meta, clip, load_config(cfg_path))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Couldn't prepare the editor video: {_friendly(e)}") from None
+
+    @router.put("/jobs/{job_id}/clips/{clip_id}/framing")
+    def set_framing(job_id: str, clip_id: str, body: FramingBody):
+        """Save the window keys from the editor (empty list = automatic again) and re-render that clip."""
+        job = _job_or_404(store, job_id)
+        renders_only_or_409(job, "change the framing")
+        d = cfg.workspace() / job_id
+        _, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        live = with_job_layout(load_config(cfg_path), d)
+        before = render.clip_file(d, clip, live)
+        try:
+            fr = editor.save_keys(d, meta, clip, live, [editor.framing.Key(**k.model_dump()) for k in body.keys])
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+        try:
+            captions.refresh_clip(d, live, clip)  # captions move off burned-in text through the new window
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Saved, but the captions couldn't be rebuilt: {_friendly(e)}") from None
+        rerender = render.clip_file(d, clip, live) != before
+        if rerender:
+            worker.rerender(job_id)
+        return {"keys": [k.model_dump() for k in fr.keys], "rerender": rerender}
 
     @router.post("/jobs/{job_id}/rerender", response_model=JobView)
     def rerender(job_id: str):
