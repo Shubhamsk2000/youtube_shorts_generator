@@ -47,7 +47,7 @@ def _ai_route(shorts_cfg: Path | None) -> dict:
 
 def create_app(shorts_cfg: Path | None = None) -> FastAPI:
     from shorts.config import migrate_legacy_card
-    from shorts.health import disk_free
+    from shorts.health import disk_free, disks
     from shorts.server import make_router as shorts_router
 
     try:
@@ -90,6 +90,7 @@ def create_app(shorts_cfg: Path | None = None) -> FastAPI:
             "version": __version__,
             "queue": snap,
             "disk_free_gb": round(disk_free(shorts.store.cfg), 1),
+            "disks": disks(shorts.store.cfg),
             "ram_available_gb": round(available_ram_gb(), 1),
             "gemini": bool(os.getenv("GEMINI_API_KEY", "").strip()),
             "ai": _ai_route(shorts_cfg),

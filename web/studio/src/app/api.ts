@@ -11,7 +11,8 @@ export interface QueueTask {
 export interface Status {
   version: string;
   queue: { current: QueueTask | null; queued: QueueTask[] };
-  disk_free_gb: number;
+  disk_free_gb: number; // where projects live
+  disks?: { holds: string[]; path: string; free_gb: number }[];
   ram_available_gb: number;
   gemini: boolean;
   ai?: { provider: string | null; models?: string[]; key_set: boolean; error?: string };

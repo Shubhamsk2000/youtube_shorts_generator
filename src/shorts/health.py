@@ -68,9 +68,30 @@ def run_checks(cfg: Config) -> list[Check]:
 
 
 def disk_free(cfg: Config) -> float:
-    """Free space where the pipeline writes: the tighter of data/ and the workspace (may be another disk)."""
-    from common.paths import DATA_DIR
-    return min(free_disk_gb(DATA_DIR), free_disk_gb(cfg.workspace()))
+    """Free space where projects live (the workspace: downloads, transcripts, renders). It may be its own
+    disk (data disk symlinked in); the pipeline's own space checks use this one too."""
+    return free_disk_gb(cfg.workspace())
+
+
+def disks(cfg: Config) -> list[dict]:
+    """Each distinct disk Studio writes to, with what it holds."""
+    import os
+    places = [("Projects", cfg.workspace()), ("Uploads", cfg.workspace().parent / "uploads"),
+              ("Exports", cfg.export.out_dir())]
+    out: dict[int, dict] = {}
+    for label, p in places:
+        q = p
+        while not q.exists() and q != q.parent:
+            q = q.parent
+        try:
+            dev = os.stat(q).st_dev
+        except OSError:
+            continue
+        if dev in out:
+            out[dev]["holds"].append(label)
+        else:
+            out[dev] = {"holds": [label], "path": str(q.resolve()), "free_gb": round(free_disk_gb(q), 1)}
+    return list(out.values())
 
 
 def summary(cfg: Config) -> dict:

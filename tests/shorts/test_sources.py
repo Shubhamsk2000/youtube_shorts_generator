@@ -464,3 +464,42 @@ def test_older_finished_job_stays_done(tmp_path):
     assert next(s for s in job.stages if s.key == "sources").status == "pending"
     server._reconcile(job, d, Config.model_validate({"reframe": {"enabled": False}, "captions": {"enabled": False}}))
     assert next(s for s in job.stages if s.key == "sources").status == "done"
+
+
+def test_a_vanished_stream_fragment_is_resumed_one_piece_at_a_time(monkeypatch):
+    import yt_dlp
+
+    calls = []
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def process_info(self, info):
+            calls.append(self.opts.get("concurrent_fragment_downloads"))
+            if len(calls) == 1:
+                raise yt_dlp.utils.DownloadError(
+                    "Unable to download video: [Errno 2] No such file or directory: '/w/x/source_audio.m4a.part-Frag15761'")
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    msgs = []
+    dl._process(FakeYDL({"concurrent_fragment_downloads": 8}), {"concurrent_fragment_downloads": 8}, {},
+                lambda f=None, m=None: msgs.append(m))
+    assert calls == [8, 1] and "resuming" in msgs[0]
+
+
+def test_other_download_errors_are_not_retried(monkeypatch):
+    import yt_dlp
+
+    class Boom:
+        def process_info(self, info):
+            raise yt_dlp.utils.DownloadError("Private video")
+
+    with pytest.raises(yt_dlp.utils.DownloadError):
+        dl._process(Boom(), {}, {}, lambda f=None, m=None: None)

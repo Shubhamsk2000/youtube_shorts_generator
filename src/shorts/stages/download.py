@@ -267,8 +267,9 @@ def _download_youtube(url: str, job: JobRef, cfg: Config, report: Reporter) -> V
             report(None, "Merging audio and video…" if expected.get("mode") == "full" else "Finishing…")
 
     base = _ydl_opts(cfg)
+    full_opts = {**base, "outtmpl": str(job.dir / "source.%(ext)s"), "progress_hooks": [hook]}
     try:
-        with yt_dlp.YoutubeDL({**base, "outtmpl": str(job.dir / "source.%(ext)s"), "progress_hooks": [hook]}) as ydl:
+        with yt_dlp.YoutubeDL(full_opts) as ydl:
             report(None, "Picking best format…")
             info = ydl.extract_info(url, download=False)
             _reject_upcoming(info)
@@ -289,7 +290,7 @@ def _download_youtube(url: str, job: JobRef, cfg: Config, report: Reporter) -> V
                     report(0.0, f"Live stream: downloading {what} at {info.get('height') or '?'}p ≈{need / 1e9:.2f} GB")
                 else:
                     report(0.0, f"Downloading {info.get('height') or '?'}p ≈{need / 1e9:.2f} GB")
-                ydl.process_info(info)
+                _process(ydl, full_opts, info, report)
     except yt_dlp.utils.DownloadError as e:
         raise DownloadError(_clean_ytdlp_error(e)) from e
 
@@ -342,7 +343,7 @@ def _download_audio(url: str, job: JobRef, cfg: Config, report: Reporter, hook, 
             need = _estimate_size(info, last_s)
             expected["total"], expected["what"] = need, "Audio: "
             report(0.0, f"Long video, {why}")
-            ydl.process_info(info)
+            _process(ydl, opts, info, report)
     except yt_dlp.utils.DownloadError as e:
         raise DownloadError(_clean_ytdlp_error(e)) from e
     got = [p for p in job.dir.glob(f"{AUDIO_SRC}.*") if p.suffix not in {".part", ".ytdl"}]
@@ -476,6 +477,31 @@ def download_range(info: dict, cfg: Config, x0: float, x1: float, dst: Path, *,
         raise DownloadError("yt-dlp finished but the clip file is missing")
     path = max(got, key=lambda p: p.stat().st_size)
     return path, float(r0 or 0.0)
+
+
+def _missing_fragment(e: Exception) -> bool:
+    """yt-dlp lost a stream piece's temp file (happens now and then with concurrent fragment downloads of
+    very long streams): resumable from its .ytdl progress file."""
+    return bool(re.search(r"No such file or directory: .*\.part-Frag\d+", str(e)))
+
+
+def _process(ydl, opts: dict, info: dict, report: Reporter, attempts: int = 3) -> None:
+    """ydl.process_info(info), resuming up to `attempts` times when a stream fragment's temp file vanished.
+    Retries fetch one fragment at a time; what was already downloaded is kept (.part + .ytdl)."""
+    import yt_dlp
+
+    for n in range(attempts):
+        try:
+            if n == 0:
+                ydl.process_info(info)
+            else:
+                with yt_dlp.YoutubeDL({**opts, "concurrent_fragment_downloads": 1}) as again:
+                    again.process_info(info)
+            return
+        except yt_dlp.utils.DownloadError as e:
+            if n == attempts - 1 or not _missing_fragment(e):
+                raise
+            report(None, f"A stream piece went missing: resuming one piece at a time (try {n + 2}/{attempts})…")
 
 
 def _clean_ytdlp_error(e: Exception) -> str:

@@ -52,8 +52,11 @@ export function SystemPage({ status }: { status?: Status }) {
         <Stat label="Setup" value={!system.data ? "–" : system.data.ready ? "Ready" : "Needs setup"}
           tone={system.data ? (system.data.ready ? "ok" : "err") : undefined}
           sub={system.data ? `${required.filter((c) => c.ok).length}/${required.length} required checks` : system.error ?? "checking…"} />
-        <Stat label="Disk free" value={status ? `${status.disk_free_gb} GB` : "–"} tone={status && status.disk_free_gb < 5 ? "warn" : undefined}
-          sub={used != null ? `${fmtBytes(used)} used by projects` : "counting…"} />
+        <Stat label="Disk free (projects)" value={status ? `${status.disk_free_gb} GB` : "–"} tone={status && status.disk_free_gb < 5 ? "warn" : undefined}
+          sub={status?.disks && status.disks.length > 1
+            ? status.disks.filter((d) => !d.holds.includes("Projects")).map((d) => `${d.holds.join(" + ")}: ${d.free_gb} GB free`).join(" · ")
+            : used != null ? `${fmtBytes(used)} used by projects` : "counting…"}
+          hint={status?.disks?.map((d) => `${d.holds.join(" + ")} → ${d.path} (${d.free_gb} GB free)`).join("\n")} />
         <Stat label="RAM available" value={status ? `${status.ram_available_gb} GB` : "–"} tone={status && status.ram_available_gb < 1.5 ? "warn" : undefined}
           sub="transcription needs ~1.5 GB" />
         <Stat label="Moment picker" value={ai?.provider ? (ai.models?.[0]?.split("/").pop() ?? "?") : "–"}
