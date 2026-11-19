@@ -169,3 +169,72 @@ def test_legacy_channel_card_is_migrated_once(ws, tmp_path, monkeypatch):
     card = yaml.safe_load(local.read_text())["card"]
     assert card["name"] == "Me" and card["avatar"] is None
     assert not config_mod.migrate_legacy_card(local)  # already there
+
+
+# ---------------------------------------------------------------- clip editor
+
+def _transcript(d):
+    from shorts.models import Sentence, Transcript, Word
+    words = [Word(text=w, start=10 + i, end=10.8 + i, prob=0.9) for i, w in enumerate("one two three four".split())]
+    save_json(Transcript(language="en", model="m", duration=600, sentences=[
+        Sentence(id=0, start=10, end=12, text="one two", words=words[:2]),
+        Sentence(id=1, start=12, end=14, text="three four", words=words[2:])]), d / "transcript.json")
+
+
+def test_editor_view_and_framing_round_trip(ws):
+    from shorts.models import ReframePlan, Shot
+    d = _job_dir(ws, clips=[_clip(), _clip("c2", rank=2, start=100, end=130)])
+    _transcript(d)
+    (d / "reframe").mkdir()
+    (d / "captions").mkdir()
+    save_json(ReframePlan(key="k", fps=30, n_frames=900, src_w=1920, src_h=1080,
+                          shots=[Shot(start=0, end=400, mode="track", x=[0.4] * 400),
+                                 Shot(start=400, end=900, mode="fit")]), d / "reframe" / "c1.json")
+    c, r = _client()
+    done = [st.model_copy(update={"status": "done"}) for st in server._fresh_stages()]
+    r.store.put(server.JobState(id="vid1", source="s", title="t", created_at="x", updated_at="x",
+                                status="done", stages=done))
+    v = c.get("/api/shorts/jobs/vid1/clips/c1/editor").json()
+    assert v["n_frames"] == 900 and [s["mode"] for s in v["shots"]] == ["track", "fit"]
+    assert v["keys"] == [] and v["prev"] is None and v["next"] == "c2" and v["index"] == 1
+    assert v["layout"]["max_aspect"] == pytest.approx(16 / 9, abs=1e-3)
+
+    res = c.put("/api/shorts/jobs/vid1/clips/c1/framing", json={"keys": [{"f": 450, "x": 0.7, "a": 0.8125}]})
+    assert res.status_code == 200, res.text
+    assert res.json()["rerender"] is True
+    assert r.store.get("vid1").status == "queued"   # that clip's preview re-renders
+    assert json.loads((d / "framing" / "c1.json").read_text())["keys"] == [{"f": 450, "x": 0.7, "a": 0.8125}]
+    assert c.get("/api/shorts/jobs/vid1/clips/c1/editor").json()["keys"][0]["f"] == 450
+    # saving again while that re-render waits is fine (only rendering is left)
+    assert c.put("/api/shorts/jobs/vid1/clips/c1/framing", json={"keys": [{"f": 5000, "x": 0.5}]}).status_code == 422
+    assert c.put("/api/shorts/jobs/vid1/clips/c1/framing", json={"keys": []}).json()["keys"] == []
+    assert not (d / "framing" / "c1.json").exists()
+    assert c.get("/api/shorts/jobs/vid1/clips/nope/editor").status_code == 404
+
+
+def test_framing_cant_change_while_processing(ws):
+    _job_dir(ws)
+    c, r = _client()
+    r.store.put(server.JobState(id="vid1", source="s", title="t", created_at="x", updated_at="x",
+                                status="running", stages=server._fresh_stages()))
+    assert c.put("/api/shorts/jobs/vid1/clips/c1/framing", json={"keys": []}).status_code == 409
+
+
+# ---------------------------------------------------------------- focus note
+
+def test_focus_note_is_saved_shown_and_repicks(ws):
+    d = _job_dir(ws)
+    _transcript(d)
+    c, r = _client()
+    r.store.put(server.JobState(id="vid1", source="s", title="t", created_at="x", updated_at="x",
+                                status="done", stages=[st.model_copy(update={"status": "done"})
+                                                       for st in server._fresh_stages()]))
+    assert c.get("/api/shorts/jobs/vid1").json()["focus"] is None
+    j = c.put("/api/shorts/jobs/vid1/focus", json={"text": " the  plane landing ", "mode": "only"}).json()
+    assert j["focus"] == {"text": "the plane landing", "mode": "only"}
+    assert j["status"] == "queued" and not (d / "selection.json").exists()   # picked again
+    assert [s["status"] for s in j["stages"] if s["key"] in ("select", "render")] == ["pending", "pending"]
+    # while that runs the note can't change under it... unless nothing was picked yet
+    assert c.put("/api/shorts/jobs/vid1/focus", json={"text": "x"}).status_code == 200
+    j = c.put("/api/shorts/jobs/vid1/focus", json={"text": ""}).json()
+    assert j["focus"] is None and not (d / "focus.json").exists()

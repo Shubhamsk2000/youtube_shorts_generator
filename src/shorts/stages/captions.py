@@ -15,11 +15,12 @@ from pathlib import Path
 
 from ..config import CaptionCfg, Config, HookCfg, with_job_layout
 from ..text import merge_fragments
-from ..models import Clip, ReframePlan, Selection, Transcript, VideoMeta, load_json
+from ..models import Clip, Selection, Transcript, VideoMeta, load_json
 from common.progress import Reporter
 from . import pacing
 from .canvas import canvas
-from .reframe import effective_plan, pip_bottom, plan_path, split_panel_frac, visible_text_boxes
+from . import framing
+from .reframe import pip_bottom, split_panel_frac, visible_text_boxes
 from .select import OUT as SELECTION
 
 CAPTIONS_DIR = "captions"
@@ -110,9 +111,7 @@ def build_clip(job_dir: Path, cfg: Config, t: Transcript, meta: VideoMeta, c: Cl
     if not lines and not hook:
         p.unlink(missing_ok=True)
         return keep, flash, 0
-    plan_p = plan_path(job_dir, c)
-    plan = load_json(ReframePlan, plan_p) if cfg.reframe.enabled and plan_p.exists() else None
-    plan = effective_plan(plan, cfg.reframe) if plan is not None else None
+    plan = framing.load_plan(job_dir, c, cfg, meta)
     win_aspect = cv.win[2] / cv.win[3]
 
     def seam(shot) -> int | None:

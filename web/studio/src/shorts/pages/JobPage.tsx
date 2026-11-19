@@ -3,6 +3,7 @@ import { ArrowLeft, CircleAlert, Copy, ExternalLink, RefreshCw, RotateCcw, Squar
 import { useConfirm, useToast, ErrorBoundary } from "@kit/feedback";
 import { api, clockSkew, currentStage, isActive, isExporting, overallProgress, type Job } from "../api";
 import { ClipsPanel } from "../components/ClipsPanel";
+import { FocusPanel } from "../components/FocusPanel";
 import { LayoutPanel } from "../components/LayoutPanel";
 import { Pipeline } from "@kit/Pipeline";
 import { Player, type Seek } from "../components/Player";
@@ -143,6 +144,7 @@ export function JobPage({ id }: { id: string }) {
         <aside className="lg:sticky lg:top-20 lg:order-2 lg:self-start">
           <div className="space-y-5">
             <Pipeline stages={job.stages} skew={skew} />
+            <ErrorBoundary label="Focus"><FocusPanel job={job} onJob={setData} /></ErrorBoundary>
             <ErrorBoundary label="Layout"><LayoutPanel job={job} onJob={setData} /></ErrorBoundary>
           </div>
         </aside>

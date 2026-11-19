@@ -9,6 +9,7 @@ import { SettingsPage } from "./app/SettingsPage";
 import { SystemPage } from "./app/SystemPage";
 import { Home } from "./shorts/pages/Home";
 import { JobPage } from "./shorts/pages/JobPage";
+import { EditorPage } from "./shorts/pages/EditorPage";
 
 type Route = { section: Section; title: string; key: string; page: () => React.ReactNode };
 
@@ -53,6 +54,11 @@ export default function App() {
 function resolve(path: string, status: Status | undefined): Route {
   let m: RegExpMatchArray | null;
   if (path === "/" || path === "") return { section: "projects", title: "", key: "home", page: () => <Home status={status} /> };
+  if ((m = path.match(/^\/jobs\/([^/]+)\/clips\/([^/]+)\/?$/))) {
+    const id = decodeURIComponent(m[1]);
+    const cid = decodeURIComponent(m[2]);
+    return { section: "projects", title: "Edit clip", key: `edit-${id}-${cid}`, page: () => <EditorPage key={`${id}/${cid}`} jobId={id} clipId={cid} /> };
+  }
   if ((m = path.match(/^\/jobs\/([^/]+)\/?$/))) {
     const id = decodeURIComponent(m[1]);
     return { section: "projects", title: "Project", key: `job-${id}`, page: () => <JobPage key={id} id={id} /> };

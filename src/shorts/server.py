@@ -18,13 +18,13 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import export as exporter
-from . import health, pipeline, settings
+from . import editor, health, pipeline, settings
 from common import ffmpeg
 from common.paths import DATA_DIR, resolve
 from common.sysinfo import free_disk_gb
 
 from .config import LAYOUT_FILE, Config, load_config, load_job_layout, save_local, with_job_layout
-from .models import Selection, Transcript, VideoMeta, load_json, save_json
+from .models import Focus, Selection, Transcript, VideoMeta, load_json, save_json
 from common.progress import Hooks, Reporter
 from .stages import captions, download, reframe, render, select, sources, transcribe
 from common.runner import SerialRunner
@@ -307,6 +307,7 @@ class Worker:
         self.store, self.cfg, self.cfg_path, self.runner = store, cfg, cfg_path, runner
         self.current: str | None = None
         self._cancel: set[str] = set()       # pipeline runs asked to stop
+        self._again: set[str] = set()        # a clip changed while the job was rendering: run once more after
         self._cancel_export: set[str] = set()
 
     def submit(self, job_id: str) -> None:
@@ -314,6 +315,18 @@ class Worker:
         self.runner.drop("shorts", job_id, "pipeline")  # already waiting: keep one queued run, not two
         self.store.update(job_id, status="queued", error=None, stopping=False)
         self.runner.submit("shorts", job_id, "pipeline", lambda: self._handle("run", job_id))
+
+    def rerender(self, job_id: str) -> None:
+        """Re-render previews whose inputs changed (a clip edit). A running job renders again when it's done;
+        a queued one already will."""
+        job = self.store.get(job_id)
+        if job and (job.status == "running" or self.current == job_id):
+            self._again.add(job_id)
+            return
+        self.store.update(job_id, stage="render", status="pending", progress=None, eta_s=None, message=None,
+                          started_at=None, finished_at=None)
+        if not job or job.status != "queued":
+            self.submit(job_id)
 
     def stop(self, job_id: str) -> str:
         """Stop a job's pipeline run (queued: removed at once; running: at its next progress update).
@@ -450,6 +463,11 @@ class Worker:
                                   job.title, job.duration, job.is_youtube)
             pipeline.run(job.source, self.cfg, hooks, job=ref)
             self.store.update(job_id, status="done", stopping=False)
+            if job_id in self._again:  # an edit landed after the render had passed that clip
+                self._again.discard(job_id)
+                self.store.update(job_id, stage="render", status="pending", progress=None, eta_s=None,
+                                  message=None, started_at=None, finished_at=None)
+                self.submit(job_id)
         except Exception as e:
             if job_id in self._cancel:  # stopped (the stop may surface wrapped in another error)
                 self._mark_stopped(job_id)
@@ -462,6 +480,7 @@ class Worker:
             self.store.update(job_id, status="failed", error=_friendly(e), stopping=False)
         finally:
             self._cancel.discard(job_id)
+            self._again.discard(job_id)  # failed or stopped: Retry renders everything that's stale anyway
             self.current = None
 
 
@@ -491,6 +510,14 @@ def _friendly(e: BaseException) -> str:
 
 class CreateJob(BaseModel):
     url: str
+    focus: str = ""                                   # optional note: what the AI should look for
+    focus_mode: Literal["prefer", "only"] = "prefer"
+
+
+class FocusBody(BaseModel):
+    text: str
+    mode: Literal["prefer", "only"] = "prefer"
+    repick: bool = True                               # pick the moments again now (when the job is idle)
 
 
 class JobStats(BaseModel):
@@ -504,6 +531,8 @@ class JobStats(BaseModel):
 
 class JobView(JobState):
     stats: JobStats = JobStats()
+    focus: Focus | None = None     # the focus note in effect for the next pick
+    picked_focus: Focus | None = None  # the note the current picks were made with
     progress: float = 0.0          # 0-1, stages weighted by their typical share of the run
     server_time: str = ""          # lets the browser show elapsed times without clock skew
 
@@ -514,6 +543,16 @@ class ClipEdit(BaseModel):
     show_hook: bool | None = None
     description: str | None = None
     hashtags: list[str] | None = None
+
+
+class FramingKey(BaseModel):
+    f: int
+    x: float | None = None    # None = keep following the automatic framing
+    a: float = 9 / 16
+
+
+class FramingBody(BaseModel):
+    keys: list[FramingKey]
 
 
 class BulkReview(BaseModel):
@@ -623,6 +662,22 @@ def _dir_size(p: Path) -> int:
     return total
 
 
+def _picked_focus(d: Path) -> Focus | None:
+    """The focus note of the current picks (read from selection.json without loading every clip)."""
+    p = d / select.OUT
+    if not p.exists():
+        return None
+    try:
+        raw = json.loads(p.read_text()).get("focus")
+        return Focus(**raw) if raw else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _same_focus_text(f: Focus | None, text: str, mode: str) -> bool:
+    return bool(f) and f.text == re.sub(r"\s+", " ", text).strip()[:select.FOCUS_MAX] and f.mode == mode
+
+
 def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:50] or "clip"
 
@@ -638,25 +693,34 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         return health.summary(cfg)
 
     def view(job: JobState) -> JobView:
-        return JobView(**job.model_dump(), stats=job_stats(cfg.workspace() / job.id),
-                       progress=weighted_progress(job.stages), server_time=_now())
+        d = cfg.workspace() / job.id
+        return JobView(**job.model_dump(), stats=job_stats(d), progress=weighted_progress(job.stages),
+                       server_time=_now(), focus=select.load_focus(d), picked_focus=_picked_focus(d))
 
     @router.get("/jobs", response_model=list[JobView])
     def list_jobs():
         store.rescan()
         return [view(j) for j in store.all()]
 
-    def start_job(source: str) -> JobState:
-        """URL or local file -> job (an existing one is resumed instead of duplicated)."""
+    def start_job(source: str, focus: str = "", focus_mode: str = "prefer") -> JobState:
+        """URL or local file -> job (an existing one is resumed instead of duplicated). A focus note is saved
+        with it; on an existing finished job a different note picks the moments again."""
         try:
             ref = download.resolve_job(source, cfg)
         except download.DownloadError as e:
             raise HTTPException(422, str(e))
         existing = store.get(ref.id)
         if existing:
+            if focus.strip() and not _same_focus_text(select.load_focus(ref.dir), focus, focus_mode):
+                select.save_focus(ref.dir, focus, focus_mode)
+                if existing.status not in ("queued", "running") and worker.current != ref.id \
+                        and (ref.dir / transcribe.OUT).exists():
+                    repick(ref.id)
+                    return store.get(ref.id)
             if existing.status in ("failed", "interrupted"):
                 worker.submit(ref.id)  # resume: finished stages are cached on disk
             return store.get(ref.id)
+        select.save_focus(ref.dir, focus, focus_mode)
         now = _now()
         store.put(JobState(id=ref.id, source=ref.source, title=ref.title, duration=ref.duration,
                            is_youtube=ref.is_youtube, created_at=now, updated_at=now,
@@ -669,10 +733,11 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         url = body.url.strip()
         if not download.is_url(url):
             raise HTTPException(422, "Paste a full video URL (https://…)")
-        return view(start_job(url))
+        return view(start_job(url, body.focus, body.focus_mode))
 
     @router.put("/uploads/{name}", response_model=JobView)
-    async def upload_video(name: str, request: Request):
+    async def upload_video(name: str, request: Request, focus: str = "",
+                           focus_mode: Literal["prefer", "only"] = "prefer"):
         """The browser streams a local video file as the request body; it is saved to data/shorts/uploads/
         (the job hard-links it, so no second copy on disk) and processed like a downloaded video."""
         name = Path(name).name
@@ -685,7 +750,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         UPLOADS.mkdir(parents=True, exist_ok=True)
         dst = UPLOADS / name
         if dst.exists() and dst.stat().st_size == size:
-            return view(start_job(str(dst)))  # same file uploaded again: reuse it (and its job)
+            return view(start_job(str(dst), focus, focus_mode))  # same file again: reuse it (and its job)
         n = 2
         while dst.exists():
             dst = UPLOADS / f"{Path(name).stem} ({n}){suffix}"
@@ -705,7 +770,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         except Exception:
             dst.unlink(missing_ok=True)
             raise HTTPException(422, "That file isn't a playable video")
-        return view(await run_in_threadpool(start_job, str(dst)))
+        return view(await run_in_threadpool(start_job, str(dst), focus, focus_mode))
 
     @router.get("/jobs/{job_id}", response_model=JobView)
     def get_job(job_id: str):
@@ -887,20 +952,37 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             worker.submit(job_id)
         return _layout_view(load_config(cfg_path), d)
 
+    def repick(job_id: str) -> None:
+        d = cfg.workspace() / job_id
+        (d / select.OUT).unlink(missing_ok=True)
+        for key in ("select", "sources", "reframe", "captions", "render"):
+            store.update(job_id, stage=key, status="pending", progress=None, eta_s=None, message=None,
+                         started_at=None, finished_at=None)
+        worker.submit(job_id)
+
     @router.post("/jobs/{job_id}/reselect", response_model=JobView)
     def reselect_job(job_id: str):
         """Ask Gemini again (e.g. after prompt changes): redo moments -> reframe -> captions -> previews."""
         job = _job_or_404(store, job_id)
         if job.status in ("queued", "running") or worker.current == job_id:
             raise HTTPException(409, "Job is already in progress")
-        d = cfg.workspace() / job_id
-        if not (d / transcribe.OUT).exists():
+        if not (cfg.workspace() / job_id / transcribe.OUT).exists():
             raise HTTPException(409, "Not transcribed yet")
-        (d / select.OUT).unlink(missing_ok=True)
-        for key in ("select", "sources", "reframe", "captions", "render"):
-            store.update(job_id, stage=key, status="pending", progress=None, eta_s=None, message=None,
-                         started_at=None, finished_at=None)
-        worker.submit(job_id)
+        repick(job_id)
+        return view(store.get(job_id))
+
+    @router.put("/jobs/{job_id}/focus", response_model=JobView)
+    def set_focus(job_id: str, body: FocusBody):
+        """Change (or clear, with empty text) what the AI looks for. With repick, the moments are picked again
+        right away when the job is idle and transcribed; otherwise the note applies to the next pick."""
+        job = _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        busy = job.status in ("queued", "running") or worker.current == job_id
+        if busy and (d / select.OUT).exists():
+            raise HTTPException(409, "This video is processing: change the focus when it's done (or stop it first)")
+        select.save_focus(d, body.text, body.mode)
+        if body.repick and not busy and (d / transcribe.OUT).exists():
+            repick(job_id)
         return view(store.get(job_id))
 
     @router.get("/jobs/{job_id}/source")
@@ -943,6 +1025,12 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             store.update(job_id, stage=key, status="pending", progress=None, eta_s=None, message=None,
                          started_at=None, finished_at=None)
         worker.submit(job_id)
+
+    def renders_only_or_409(job: JobState, what: str) -> None:
+        """Clip edits are fine while the job is only (re-)rendering previews; not while it picks or frames."""
+        busy = job.status in ("queued", "running") or worker.current == job.id
+        if busy and any(st.status not in ("done", "planned") for st in job.stages if st.key != "render"):
+            raise HTTPException(409, f"This video is processing: {what} when it's done (or stop it first)")
 
     def idle_or_409(job: JobState, what: str) -> None:
         if job.status in ("queued", "running") or worker.current == job.id:
@@ -987,7 +1075,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
                 setattr(clip, k, v)
             visual = (captions.hook_text(clip), clip.show_hook) != visual_before
             if visual:
-                idle_or_409(job, "change the on-screen text")
+                renders_only_or_409(job, "change the on-screen text")
             save_json(sel, d / select.OUT)
         rerender = False
         if visual:
@@ -997,8 +1085,94 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
                 rerender = True
             except Exception as e:  # noqa: BLE001
                 raise HTTPException(500, f"Saved, but the captions couldn't be rebuilt: {_friendly(e)}") from None
-            resubmit_render(job_id, ("render",))
+            worker.rerender(job_id)
         return {"clip": {**clip.model_dump(), "duration": round(clip.duration, 2)}, "rerender": rerender}
+
+    def clip_or_404(d: Path, clip_id: str):
+        if not (d / select.OUT).exists():
+            raise HTTPException(409, "No clips yet")
+        sel = load_json(Selection, d / select.OUT)
+        clip = next((c for c in sel.clips if c.id == clip_id), None)
+        if not clip:
+            raise HTTPException(404, "Unknown clip")
+        return sel, clip
+
+    def meta_or_409(d: Path) -> VideoMeta:
+        if not (d / download.META).exists():
+            raise HTTPException(409, "Not downloaded yet")
+        return load_json(VideoMeta, d / download.META)
+
+    @router.get("/jobs/{job_id}/clips/{clip_id}/editor")
+    def get_editor(job_id: str, clip_id: str):
+        """What the clip editor draws: automatic framing per shot, manual keys, faces, removed pauses."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        sel, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        live = load_config(cfg_path)
+        order = sorted(sel.clips, key=lambda c: c.rank)
+        k = next(i for i, c in enumerate(order) if c.id == clip_id)
+        f = render.clip_file(d, clip, live)
+        ready = (d / render.CLIPS_DIR / f).exists()
+        return {
+            **editor.view(d, meta, clip, live),
+            "clip": {**clip.model_dump(), "duration": round(clip.duration, 2),
+                     "review": _load_reviews(d).get(clip.id), "ready": ready,
+                     "url": f"/api/shorts/jobs/{job_id}/clips/{clip.id}/video?v={f[-10:-4]}" if ready else None},
+            "prev": order[k - 1].id if k > 0 else None,
+            "next": order[k + 1].id if k + 1 < len(order) else None,
+            "index": k + 1,
+            "count": len(order),
+            "proxy_url": f"/api/shorts/jobs/{job_id}/clips/{clip.id}/proxy",
+        }
+
+    @router.get("/jobs/{job_id}/clips/{clip_id}/proxy")
+    async def get_proxy(job_id: str, clip_id: str):
+        """The clip's full 16:9 frame as a small mp4 for the editor (made on first open, then cached)."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        _, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        try:
+            p = await run_in_threadpool(editor.ensure_proxy, d, meta, clip, load_config(cfg_path))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Couldn't prepare the editor video: {_friendly(e)}") from None
+        return FileResponse(p, media_type="video/mp4", headers={"Cache-Control": "private, max-age=86400"})
+
+    @router.post("/jobs/{job_id}/clips/{clip_id}/proxy", status_code=204)
+    async def warm_proxy(job_id: str, clip_id: str):
+        """Build the editor video ahead of time (the page warms the next clip's while you edit this one)."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        _, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        try:
+            await run_in_threadpool(editor.ensure_proxy, d, meta, clip, load_config(cfg_path))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Couldn't prepare the editor video: {_friendly(e)}") from None
+
+    @router.put("/jobs/{job_id}/clips/{clip_id}/framing")
+    def set_framing(job_id: str, clip_id: str, body: FramingBody):
+        """Save the window keys from the editor (empty list = automatic again) and re-render that clip."""
+        job = _job_or_404(store, job_id)
+        renders_only_or_409(job, "change the framing")
+        d = cfg.workspace() / job_id
+        _, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        live = with_job_layout(load_config(cfg_path), d)
+        before = render.clip_file(d, clip, live)
+        try:
+            fr = editor.save_keys(d, meta, clip, live, [editor.framing.Key(**k.model_dump()) for k in body.keys])
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+        try:
+            captions.refresh_clip(d, live, clip)  # captions move off burned-in text through the new window
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Saved, but the captions couldn't be rebuilt: {_friendly(e)}") from None
+        rerender = render.clip_file(d, clip, live) != before
+        if rerender:
+            worker.rerender(job_id)
+        return {"keys": [k.model_dump() for k in fr.keys], "rerender": rerender}
 
     @router.post("/jobs/{job_id}/rerender", response_model=JobView)
     def rerender(job_id: str):
