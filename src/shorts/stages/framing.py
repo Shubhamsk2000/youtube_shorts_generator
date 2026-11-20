@@ -11,6 +11,9 @@ window at one source frame of the clip:
 
 A shot (between two camera cuts) with keys becomes "manual": x and a ease between its keys and hold before the
 first / after the last. Shots without keys keep their automatic framing. At a cut the window jumps, as always.
+
+keep_cam (on by default): in a facecam shot (cam panel on top, or corner cam) the keys only set the gameplay
+window, and the cam stays where the layout puts it. Off: the keys frame the whole short, as in any other shot.
 """
 from __future__ import annotations
 
@@ -20,7 +23,7 @@ from pydantic import BaseModel
 
 from ..config import Config
 from ..models import Clip, ReframePlan, Shot, VideoMeta, load_json, save_json
-from .reframe import effective_plan, plan_path
+from .reframe import effective_plan, plan_path, screen_crop
 
 FRAMING_DIR = "framing"
 OUT_ASPECT = 9 / 16
@@ -35,6 +38,7 @@ class Key(BaseModel):
 
 class Framing(BaseModel):
     keys: list[Key] = []
+    keep_cam: bool = True  # facecam shots: the keys set only the gameplay window, the cam stays
 
 
 def framing_path(job_dir: Path, clip: Clip) -> Path:
@@ -128,6 +132,9 @@ def apply(plan: ReframePlan, fr: Framing | None) -> ReframePlan:
         if not mine:
             shots.append(s)
             continue
+        if fr.keep_cam and s.mode == "split" and s.cams:
+            shots.append(_keep_cam(s, mine, end, plan))
+            continue
         path = s.x if s.x and s.mode in ("track", "center", "manual") else None
 
         def auto_x(f: int, s=s, path=path) -> float:
@@ -136,6 +143,17 @@ def apply(plan: ReframePlan, fr: Framing | None) -> ReframePlan:
         xs, as_ = interpolate(mine, range(s.start, end), auto_x, plan.src_w, plan.src_h)
         shots.append(Shot(start=s.start, end=end, mode="manual", x=xs, a=as_, why="set in the editor"))
     return plan.model_copy(update={"shots": shots})
+
+
+def _keep_cam(s: Shot, keys: list[Key], end: int, plan: ReframePlan) -> Shot:
+    """A facecam shot with its gameplay window from the keys; the cams stay. Keys without x keep the
+    automatic position (central, off the cam): if none has one, x stays None and the renderer places it."""
+    a_only = all(k.x is None for k in keys)
+    auto = screen_crop(s.cams, plan.src_w, plan.src_h, OUT_ASPECT)
+    cx = (auto[0] + auto[2]) / 2 / max(1, plan.src_w)
+    xs, as_ = interpolate(keys, range(s.start, end), lambda f: cx, plan.src_w, plan.src_h)
+    return s.model_copy(update={"end": end, "x": None if a_only else xs, "a": as_,
+                                "why": "facecam kept, gameplay window set in the editor"})
 
 
 def base_plan(meta: VideoMeta, clip: Clip) -> ReframePlan:

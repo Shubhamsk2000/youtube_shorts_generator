@@ -286,8 +286,11 @@ def visible_text_boxes(plan: ReframePlan, fi: int, rc: ReframeCfg) -> list[tuple
             return []  # cam panel + screen layout: not handled
         out_w, out_h = 1080, 1920
         (gl, gt, gr, gb), _ = pip_geometry(shot, plan.src_w, plan.src_h, out_w, out_h, rc)
-        l, t, r, b = gl / plan.src_w, gt / plan.src_h, gr / plan.src_w, gb / plan.src_h
         by, bh = pip_band(out_w, out_h, rc)
+        if (win := screen_window(shot, fi, plan.src_w, plan.src_h, out_w / out_h)) is not None:
+            (gl, gt, gr, gb), e = win
+            by, bh = screen_band(e, out_w, out_h)
+        l, t, r, b = gl / plan.src_w, gt / plan.src_h, gr / plan.src_w, gb / plan.src_h
         y_of = lambda v: (by + (v - t) / (b - t) * bh) / out_h  # noqa: E731  (source y -> output fraction)
         for x0, y0, x1, y1 in near.boxes:
             if x1 <= l or x0 >= r:
@@ -919,6 +922,37 @@ def screen_crop(cams: list[list[float]], sw: int, sh: int, aspect: float) -> tup
             best_left, best_cost = left, cost
     top = (sh - ch) // 2
     return best_left, top, best_left + cw, top + ch
+
+
+def _at(v: list[float], shot: Shot, fi: int) -> float:
+    return v[min(max(fi - shot.start, 0), len(v) - 1)]
+
+
+def screen_window(shot: Shot, fi: int, sw: int, sh: int, area_aspect: float
+                  ) -> tuple[tuple[int, int, int, int], float] | None:
+    """Facecam shot with a window set in the editor (the cam is kept): (screen crop px, its aspect).
+
+    The window's shape `a` is never narrower than the area it fills (cam panel layout: the space under the
+    cam; corner cam: the whole frame); wider = full width over a blurred copy. x None = the automatic
+    position (central, shifted off the cam). None when the shot has no editor window."""
+    if not shot.a:
+        return None
+    e = max(area_aspect, _at(shot.a, shot, fi))
+    if not shot.x:
+        crop = screen_crop(shot.cams, sw, sh, e)
+    else:
+        cw = min(sw, max(2, round(sh * e)))
+        ch = min(sh, max(2, round(cw / e)))
+        left = int(np.clip(round(_at(shot.x, shot, fi) * sw - cw / 2), 0, sw - cw))
+        top = (sh - ch) // 2
+        crop = (left, top, left + cw, top + ch)
+    return crop, (crop[2] - crop[0]) / max(1, crop[3] - crop[1])
+
+
+def screen_band(e: float, area_w: int, area_h: int) -> tuple[int, int]:
+    """(top, height) px of a screen crop of aspect `e` inside its area: fills it, or a centred full-width band."""
+    h = min(area_h, max(2, round(area_w / e / 2) * 2))
+    return (area_h - h) // 2, h
 
 
 def pip_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, rc: ReframeCfg

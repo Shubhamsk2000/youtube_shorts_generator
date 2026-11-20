@@ -146,6 +146,16 @@ export interface EditorShot {
   why: string;
   x: number[] | null;
   cams: number[][];
+  cam_view: CamView | null; // facecam shot: how the layout draws it
+}
+
+/** A facecam shot on the 9:16 frame (fractions of the output, sources as fractions of the frame). */
+export interface CamView {
+  area: [number, number];   // the gameplay's (top, height)
+  screen_x: number;         // automatic gameplay crop: centre x and shape
+  screen_a: number;
+  tiles: { src: number[]; dst: number[] }[];  // each cam: source box [x0, y0, x1, y1] -> output box [x, y, w, h]
+  pip: boolean;             // corner cam (else the cam panel on top)
 }
 
 export interface EditorData {
@@ -157,6 +167,7 @@ export interface EditorData {
   shots: EditorShot[];
   faces: { f: number; faces: number[][] }[];
   keys: FrameKey[];
+  keep_cam: boolean;        // facecam shots: keys set only the gameplay window, the cam stays
   keep: [number, number][] | null;
   flash: [number, number] | null;
   layout: { out_w: number; out_h: number; fit_y: number; fit_dim: number; screen_layout: ScreenLayout; background: Background; max_aspect: number };
@@ -246,8 +257,9 @@ export const api = {
   editor: (id: string, clipId: string) => request<EditorData>(`${J(id)}/clips/${encodeURIComponent(clipId)}/editor`),
   warmProxy: (id: string, clipId: string) =>
     request<void>(`${J(id)}/clips/${encodeURIComponent(clipId)}/proxy`, { method: "POST", timeoutMs: 300000 }),
-  setFraming: (id: string, clipId: string, keys: FrameKey[]) =>
-    request<{ keys: FrameKey[]; rerender: boolean }>(`${J(id)}/clips/${encodeURIComponent(clipId)}/framing`, json("PUT", { keys })),
+  setFraming: (id: string, clipId: string, keys: FrameKey[], keepCam: boolean) =>
+    request<{ keys: FrameKey[]; keep_cam: boolean; rerender: boolean }>(
+      `${J(id)}/clips/${encodeURIComponent(clipId)}/framing`, json("PUT", { keys, keep_cam: keepCam })),
   reselect: (id: string) => request<Job>(`${J(id)}/reselect`, json("POST")),
   review: (id: string, clipId: string, review: Review) =>
     request<{ id: string; review: Review }>(`${J(id)}/clips/${encodeURIComponent(clipId)}/review`, json("PUT", { review })),

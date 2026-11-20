@@ -26,6 +26,64 @@ function wrap(text: string, max: number): string[] {
   return lines;
 }
 
+/** Blurred, dimmed fill of the rectangle: the centre of the frame in its shape, drawn tiny and scaled up. */
+function blurFill(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, d: EditorData, x: number, y: number, w: number, h: number) {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  small ??= document.createElement("canvas");
+  small.width = Math.max(1, Math.round(w / 14));
+  small.height = Math.max(1, Math.round(h / 14));
+  const sctx = small.getContext("2d")!;
+  const bw = Math.min(vw, vh * (w / h));
+  const bh = Math.min(vh, bw / (w / h));
+  sctx.drawImage(video, (vw - bw) / 2, (vh - bh) / 2, bw, bh, 0, 0, small.width, small.height);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(small, x, y, w, h);
+  ctx.fillStyle = `rgba(0,0,0,${1 - d.layout.fit_dim})`;
+  ctx.fillRect(x, y, w, h);
+}
+
+/** Facecam layout (mirrors render.compose_split / compose_pip): the gameplay window fills its area (or sits
+ * full width over blur when wider), then the cam panel on top or the corner cam(s). */
+function drawCamLayout(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, d: EditorData, win: Win, W: number, H: number) {
+  const cv = win.cam!;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const top = cv.area[0] * H;
+  const ah = cv.area[1] * H;
+  const e = Math.max(win.a, W / ah);
+  const cw = Math.min(vw, vh * e);
+  const ch = Math.min(vh, cw / e);
+  const left = clamp(win.x * vw - cw / 2, 0, vw - cw);
+  const sy = (vh - ch) / 2;
+  const bandH = Math.min(ah, W / (cw / ch));
+  if (bandH >= ah - 0.5) ctx.drawImage(video, left, sy, cw, ch, 0, top, W, ah);
+  else {
+    blurFill(ctx, video, d, 0, top, W, ah);
+    ctx.drawImage(video, left, sy, cw, ch, 0, top + (ah - bandH) / 2, W, bandH);
+  }
+  for (const { src, dst } of cv.tiles) {
+    const [x, y, w, h] = [dst[0] * W, dst[1] * H, dst[2] * W, dst[3] * H];
+    const args = [src[0] * vw, src[1] * vh, (src[2] - src[0]) * vw, (src[3] - src[1]) * vh, x, y, w, h] as const;
+    if (!cv.pip) {
+      ctx.drawImage(video, ...args);
+      continue;
+    }
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, w * 0.08);
+    ctx.clip();
+    ctx.drawImage(video, ...args);
+    ctx.restore();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = Math.max(1, W / 270);
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, w * 0.08);
+    ctx.stroke();
+  }
+}
+
 /** One frame of the short: the window (full screen, or full width over blur), hook banner, guides. */
 export function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement | null, d: EditorData, win: Win, t: number, o: PreviewOpts) {
   const W = ctx.canvas.width;
@@ -36,40 +94,20 @@ export function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement
   const vw = video.videoWidth;
   const vh = video.videoHeight;
 
-  if (win.kind === "crop") {
+  if (win.cam) {
+    drawCamLayout(ctx, video, d, win, W, H);
+  } else if (win.kind === "crop") {
     const cw = Math.min(vw, vh * FILL);
     const left = clamp(win.x * vw - cw / 2, 0, vw - cw);
     ctx.drawImage(video, left, 0, cw, vh, 0, 0, W, H);
   } else {
-    // blurred, dimmed fill: the centre of the frame in the output's shape, drawn tiny and scaled up
-    small ??= document.createElement("canvas");
-    small.width = Math.max(1, Math.round(W / 14));
-    small.height = Math.max(1, Math.round(H / 14));
-    const sctx = small.getContext("2d")!;
-    const bw = Math.min(vw, vh * (W / H));
-    sctx.drawImage(video, (vw - bw) / 2, 0, bw, vh, 0, 0, small.width, small.height);
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(small, 0, 0, W, H);
-    ctx.fillStyle = `rgba(0,0,0,${1 - d.layout.fit_dim})`;
-    ctx.fillRect(0, 0, W, H);
+    blurFill(ctx, video, d, 0, 0, W, H);
     const a = win.kind === "split" ? d.layout.max_aspect : win.a;
     const cw = Math.min(vw, vh * a);
     const left = clamp(win.x * vw - cw / 2, 0, vw - cw);
     const bandH = Math.min(H, W / (cw / vh));
     const y = clamp(d.layout.fit_y * H - bandH / 2, 0, H - bandH);
     ctx.drawImage(video, left, 0, cw, vh, 0, y, W, bandH);
-    if (win.kind === "split") {
-      ctx.fillStyle = "rgba(0,0,0,0.6)";
-      ctx.fillRect(0, H * 0.46, W, H * 0.08);
-      ctx.fillStyle = "#fff";
-      ctx.font = `600 ${Math.round(H * 0.022)}px system-ui, sans-serif`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText("Facecam layout (automatic)", W / 2, H * 0.485);
-      ctx.font = `${Math.round(H * 0.017)}px system-ui, sans-serif`;
-      ctx.fillText("See the rendered preview · drag to set your own", W / 2, H * 0.515);
-    }
   }
 
   const hook = d.hook;

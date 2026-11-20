@@ -35,8 +35,8 @@ from .captions import ass_path, refresh_clip
 from .pacing import edits_path, kept_duration, load_edits
 from .canvas import Canvas, canvas, canvas_key
 from . import framing
-from .reframe import (crop_to_aspect, pip_band, pip_geometry, plan_path, screen_crop,
-                      split_panel_frac)
+from .reframe import (crop_to_aspect, pip_band, pip_geometry, plan_path, screen_band, screen_crop,
+                      screen_window, split_panel_frac)
 from .select import OUT as SELECTION
 from . import sources
 
@@ -328,8 +328,8 @@ def compose(frame: np.ndarray, shot: Shot | None, i: int, out_w: int, out_h: int
         return compose_fit(frame, out_w, out_h, rc, cv2, interp)
     if shot is not None and shot.mode == "split" and shot.cams and rc.screen_layout != "track":
         if rc.screen_layout == "pip":
-            return compose_pip(frame, shot, out_w, out_h, rc, cv2, interp)
-        return compose_split(frame, shot, out_w, out_h, meta, rc, cv2, interp)
+            return compose_pip(frame, shot, out_w, out_h, rc, cv2, interp, i)
+        return compose_split(frame, shot, out_w, out_h, meta, rc, cv2, interp, i)
     x = 0.5
     if shot is not None and shot.x:
         x = shot.x[min(max(i - shot.start, 0), len(shot.x) - 1)]
@@ -442,8 +442,25 @@ def split_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, meta: V
     return panel_h, cams, screen
 
 
+def edited_screen(frame: np.ndarray, shot: Shot, i: int, area_w: int, area_h: int, rc: ReframeCfg, cv2,
+                  interp=None) -> np.ndarray | None:
+    """The gameplay area of a facecam shot whose window was set in the editor (None = automatic): the
+    window fills the area, or (wider) sits full width over a blurred copy of the frame."""
+    sh, sw = frame.shape[:2]
+    win = screen_window(shot, i, sw, sh, area_w / area_h)
+    if win is None:
+        return None
+    (gl, gt, gr, gb), e = win
+    y, h = screen_band(e, area_w, area_h)
+    if h >= area_h:
+        return np.array(_resize(frame[gt:gb, gl:gr], area_w, area_h, cv2, interp), copy=True)
+    out = blurred_bg(frame, area_w, area_h, rc, cv2)
+    out[y:y + h] = _resize(frame[gt:gb, gl:gr], area_w, h, cv2, interp)
+    return out
+
+
 def compose_split(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, meta: VideoMeta, rc: ReframeCfg,
-                  cv2, interp=None) -> np.ndarray:
+                  cv2, interp=None, i: int = 0) -> np.ndarray:
     """Facecam(s) on top, the screen underneath."""
     sh, sw = frame.shape[:2]
     panel_h, cams, (gl, gt, gr, gb) = split_geometry(shot, sw, sh, out_w, out_h, meta, rc)
@@ -454,7 +471,8 @@ def compose_split(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, meta: V
         x = slot_w * k
         w_k = out_w - slot_w * (n - 1) if k == n - 1 else slot_w
         out[:panel_h, x:x + w_k] = _resize(frame[b:d, a:c], w_k, panel_h, cv2, interp)
-    out[panel_h:] = _resize(frame[gt:gb, gl:gr], out_w, out_h - panel_h, cv2, interp)
+    screen = edited_screen(frame, shot, i, out_w, out_h - panel_h, rc, cv2, interp)
+    out[panel_h:] = screen if screen is not None else _resize(frame[gt:gb, gl:gr], out_w, out_h - panel_h, cv2, interp)
     return out
 
 
@@ -498,12 +516,16 @@ def _pip_layers(w: int, h: int, radius: int, border: int, shadow: float, pad: in
     return sh[..., None], ring[..., None], cam[..., None]
 
 
-def compose_pip(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, rc: ReframeCfg, cv2, interp=None) -> np.ndarray:
+def compose_pip(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, rc: ReframeCfg, cv2, interp=None,
+                i: int = 0) -> np.ndarray:
     """Gameplay/screen fills the frame; the facecam sits in a top corner (rounded, bordered, shadowed)."""
     sh, sw = frame.shape[:2]
     (gl, gt, gr, gb), cams = pip_geometry(shot, sw, sh, out_w, out_h, rc)
     by, bh = pip_band(out_w, out_h, rc)
-    if bh >= out_h:
+    edited = edited_screen(frame, shot, i, out_w, out_h, rc, cv2, interp)
+    if edited is not None:
+        out = edited
+    elif bh >= out_h:
         out = _resize(frame[gt:gb, gl:gr], out_w, out_h, cv2, interp)
         out = np.array(out, copy=True)  # _resize may hand back a view of the decoded frame
     else:  # zoomed out: the gameplay full width, over a blurred and dimmed fill of the same crop
