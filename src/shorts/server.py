@@ -553,6 +553,7 @@ class FramingKey(BaseModel):
 
 class FramingBody(BaseModel):
     keys: list[FramingKey]
+    keep_cam: bool = True     # facecam shots: the keys set only the gameplay window, the cam stays
 
 
 class BulkReview(BaseModel):
@@ -1162,7 +1163,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         live = with_job_layout(load_config(cfg_path), d)
         before = render.clip_file(d, clip, live)
         try:
-            fr = editor.save_keys(d, meta, clip, live, [editor.framing.Key(**k.model_dump()) for k in body.keys])
+            fr = editor.save_keys(d, meta, clip, live, [editor.framing.Key(**k.model_dump()) for k in body.keys],
+                                  body.keep_cam)
         except ValueError as e:
             raise HTTPException(422, str(e)) from None
         try:
@@ -1172,7 +1174,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         rerender = render.clip_file(d, clip, live) != before
         if rerender:
             worker.rerender(job_id)
-        return {"keys": [k.model_dump() for k in fr.keys], "rerender": rerender}
+        return {"keys": [k.model_dump() for k in fr.keys], "keep_cam": fr.keep_cam, "rerender": rerender}
 
     @router.post("/jobs/{job_id}/rerender", response_model=JobView)
     def rerender(job_id: str):

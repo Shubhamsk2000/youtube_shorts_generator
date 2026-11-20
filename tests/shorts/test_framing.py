@@ -111,3 +111,44 @@ def test_a_key_without_x_widens_but_keeps_tracking():
     half = 0.8125 * 1080 / 1920 / 2
     assert s.x[200] == pytest.approx(max(path[200], half), abs=1e-4)  # still follows the face path
     assert s.x[0] == pytest.approx(half, abs=1e-4)                   # pushed inward: the wider window must fit
+
+
+CAM = [0.75, 0.05, 0.98, 0.35]  # facecam in the top right of the source
+
+
+def cam_shot(a=0, b=90):
+    return Shot(start=a, end=b, mode="split", cams=[CAM], face_x=[0.5], face_y=[0.45], why="cam")
+
+
+def test_keys_in_a_facecam_shot_keep_the_cam_by_default():
+    p = plan([cam_shot()])
+    s = framing.apply(p, Framing(keys=[Key(f=0, x=None, a=1.0)])).shots[0]
+    assert s.mode == "split" and s.cams == [CAM]             # the facecam layout stays
+    assert s.x is None and set(s.a) == {1.0}                 # only the shape: automatic position
+    s = framing.apply(p, Framing(keys=[Key(f=0, x=0.3, a=1.0)])).shots[0]
+    assert s.mode == "split" and set(s.x) == {0.3}
+    # "edit whole short": the window replaces the layout, as before
+    s = framing.apply(p, Framing(keys=[Key(f=0, x=0.3, a=1.0)], keep_cam=False)).shots[0]
+    assert s.mode == "manual" and not s.cams
+
+
+def test_kept_cam_render_uses_the_window_for_the_gameplay_only():
+    frame = np.full((1080, 1920, 3), 200, np.uint8)
+    frame[:, :300] = 0                                       # dark left edge: only a wide window shows it
+    m = meta()
+    for layout in ("split", "pip"):
+        rc = ReframeCfg(screen_layout=layout)
+        auto = compose(frame, cam_shot(), 0, 1080, 1920, m, rc, cv2)
+        wide = cam_shot().model_copy(update={"x": [0.5] * 90, "a": [16 / 9] * 90})
+        out = compose(frame, wide, 0, 1080, 1920, m, rc, cv2)
+        assert out.shape == (1920, 1080, 3)
+        assert out[1150, 5].mean() < 20                      # the whole frame: its dark edge is in view
+        assert auto[1150, 5].mean() > 150                    # the automatic crop doesn't reach it
+        if layout == "split":
+            assert np.array_equal(out[:200], auto[:200])     # the cam panel is untouched
+
+
+def test_framing_file_keeps_the_choice(tmp_path):
+    c = clip()
+    framing.save(tmp_path, c, Framing(keys=[Key(f=0, x=0.5)], keep_cam=False))
+    assert framing.load(tmp_path, c).keep_cam is False

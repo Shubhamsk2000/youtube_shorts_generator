@@ -5,7 +5,7 @@ import {
 } from "lucide-react";
 import { useConfirm, useToast, ErrorBoundary } from "@kit/feedback";
 import { api, editorHref, jobHref, type EditorData, type FrameKey, type Review } from "../api";
-import { Button, Card, CardHeader, Input, Toggle } from "@kit/ui";
+import { Button, Card, CardHeader, Input, Segmented, Toggle } from "@kit/ui";
 import { cx, errorText, Link, navigate, useStored, usePoll } from "../lib";
 import {
   FILL, PRESETS, aspectLabel, clamp, clampX, keysInShot, modeLabel, presetValue, putKey, shotIndexAt, shotRange,
@@ -81,7 +81,10 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
   const [h, dispatch] = useReducer(hist, { past: [], present: d.keys, future: [] });
   const [saved, setSaved] = useState(() => JSON.stringify(d.keys));
   const keys = h.present;
-  const dirty = JSON.stringify(keys) !== saved;
+  const [keepCam, setKeepCam] = useState(d.keep_cam !== false);
+  const [savedCam, setSavedCam] = useState(d.keep_cam !== false);
+  const hasCam = d.layout.screen_layout !== "track" && d.shots.some((s) => s.cam_view);
+  const dirty = JSON.stringify(keys) !== saved || (keys.length > 0 && keepCam !== savedCam);
   const [t, setT] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [videoState, setVideoState] = useState<"loading" | "ready" | "error">("loading");
@@ -96,7 +99,7 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
   const dur = d.clip.duration;
   const step = 1 / (fps > 35 ? fps / 2 : fps); // the proxy has every 2nd frame of 50/60 fps sources
   const f = clamp(Math.round(t * fps), 0, n - 1);
-  const win = windowAt(d, keys, f);
+  const win = windowAt(d, keys, f, keepCam);
   const si = shotIndexAt(d.shots, f);
   const shot = d.shots[si];
   const [s0, s1] = shotRange(d, si);
@@ -193,7 +196,7 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
 
   function followFaces(on: boolean) {
     if (!shotKeys.length) return;
-    commit(keys.map((k) => (k.f >= s0 && k.f < s1 ? { ...k, x: on ? null : clampX(windowAt(d, keys, k.f).x, k.a, d) } : k)));
+    commit(keys.map((k) => (k.f >= s0 && k.f < s1 ? { ...k, x: on ? null : clampX(windowAt(d, keys, k.f, keepCam).x, k.a, d) } : k)));
   }
 
   function addKey() {
@@ -231,9 +234,11 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
     if (saving) return;
     setSaving(true);
     try {
-      const res = await api.setFraming(jobId, d.clip.id, keys);
+      const res = await api.setFraming(jobId, d.clip.id, keys, keepCam);
       dispatch({ type: "init", keys: res.keys });
       setSaved(JSON.stringify(res.keys));
+      setKeepCam(res.keep_cam);
+      setSavedCam(res.keep_cam);
       toast.ok(res.rerender ? "Framing saved · re-rendering this clip" : "Framing saved", res.rerender ? "The rendered preview updates when it's done" : undefined);
       reload();
     } catch (e) {
@@ -333,6 +338,10 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
     return Math.abs(best.f - f) <= fps ? best.faces : null;
   }, [showFaces, d.faces, f, fps]);
   const autoShape = shot.mode === "fit" ? "whole frame" : shot.mode === "split" ? "facecam layout" : "9:16";
+  const fromAutoCam = win.kind === "split" && !win.manual; // its window shape is the layout's, not a preset
+  const shapeLabel = win.kind === "split"
+    ? (win.manual ? `facecam + ${aspectLabel(win.a, d)} gameplay` : "facecam layout")
+    : aspectLabel(win.a, d);
 
   return (
     <div className="mx-auto max-w-7xl px-4 pt-5 pb-24 sm:px-6">
@@ -365,7 +374,7 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
           <Button variant="outline" disabled={!keys.length} onClick={() => commit([])} title="Remove every keyframe: back to the automatic framing">
             <RotateCcw className="size-4" /> <span className="hidden sm:inline">All auto</span>
           </Button>
-          {dirty && <Button variant="ghost" onClick={() => dispatch({ type: "init", keys: JSON.parse(saved) })}>Discard</Button>}
+          {dirty && <Button variant="ghost" onClick={() => { dispatch({ type: "init", keys: JSON.parse(saved) }); setKeepCam(savedCam); }}>Discard</Button>}
           <Button onClick={save} disabled={!dirty} loading={saving} title="Save and re-render this clip (Ctrl+S)">
             <Check className="size-4" /> Save framing
           </Button>
@@ -376,7 +385,7 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
         <div className="min-w-0 space-y-4">
           <div className="relative">
             <ErrorBoundary label="Video">
-              <Stage d={d} video={video} win={win} faces={sample} cams={shot.cams} src={d.proxy_url}
+              <Stage d={d} video={video} win={win} faces={sample} cams={shot.cams} keepCam={keepCam} src={d.proxy_url}
                 onBegin={() => { pause(); dispatch({ type: "checkpoint" }); }}
                 onChange={(x, a) => dispatch({ type: "live", keys: putKey(keys, { f, x, a }) })}
                 onEnd={() => {}} />
@@ -419,14 +428,32 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
               aside={shotKeys.length ? <span className="font-medium text-accent">Manual · {shotKeys.length} key{shotKeys.length === 1 ? "" : "s"}</span> : <span>Auto · {modeLabel[shot.mode]}</span>}
             />
             <div className="space-y-4 p-4">
+              {hasCam && (
+                <div>
+                  <p className="mb-2 text-xs font-medium text-muted">Facecam shots <span className="font-normal">· whole clip</span></p>
+                  <Segmented
+                    value={keepCam ? "keep" : "whole"}
+                    onChange={(v) => setKeepCam(v === "keep")}
+                    options={[
+                      { value: "keep", label: "Keep facecam", hint: "The facecam stays; your window and its shape only change the gameplay part" },
+                      { value: "whole", label: "Edit whole short", hint: "Your window frames the entire short; the facecam layout is replaced" },
+                    ]}
+                  />
+                  <p className="mt-1.5 text-xs text-faint">
+                    {keepCam
+                      ? "Moving or reshaping the window only changes the gameplay part. The facecam stays where the layout puts it."
+                      : "In shots you edit, your window is the whole short and the facecam layout is dropped."}
+                  </p>
+                </div>
+              )}
               <div>
                 <p className="mb-2 text-xs font-medium text-muted">
-                  Window shape <span className="font-normal">· now {win.kind === "split" ? "facecam layout" : aspectLabel(win.a, d)}{!win.manual && ` (auto: ${autoShape})`}</span>
+                  Window shape <span className="font-normal">· now {shapeLabel}{!win.manual && ` (auto: ${autoShape})`}</span>
                 </p>
                 <div className="flex flex-wrap gap-1.5">
                   {PRESETS.map((p) => {
                     const v = presetValue(p, d);
-                    const on = win.kind !== "split" && Math.abs(win.a - v) < 0.006;
+                    const on = !fromAutoCam && Math.abs(win.a - v) < 0.006;
                     return (
                       <button key={p.label} onClick={() => setShape(v)} title={`${p.hint} · at this frame`}
                         className={cx("h-8 rounded-lg border px-2.5 font-mono text-xs font-semibold transition",
@@ -442,8 +469,8 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
               </div>
 
               <div className="flex flex-wrap gap-2">
-                <Button variant="outline" onClick={() => shapeToClip(win.kind === "split" ? FILL : win.a)} title="Every shot gets this window shape; tracked shots keep following faces">
-                  Use {win.kind === "split" ? "9:16" : aspectLabel(win.a, d)} for the whole clip
+                <Button variant="outline" onClick={() => shapeToClip(fromAutoCam ? FILL : win.a)} title="Every shot gets this window shape; tracked shots keep following faces">
+                  Use {fromAutoCam ? "9:16" : aspectLabel(win.a, d)} for the whole clip
                 </Button>
                 <Button variant="outline" onClick={lockShot} title="One fixed window for this whole shot (removes its other keyframes)">
                   <Lock className="size-3.5" /> Hold this window for the shot

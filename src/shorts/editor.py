@@ -16,6 +16,8 @@ from common import ffmpeg
 from .config import Config, with_job_layout
 from .models import Clip, ReframePlan, VideoMeta
 from .stages import captions, framing, pacing, sources
+from .stages.reframe import pip_geometry
+from .stages.render import split_geometry
 
 EDITOR_DIR = "editor"
 PROXY_HEIGHT = 540
@@ -26,6 +28,28 @@ _locks_guard = threading.Lock()
 
 def n_frames(plan: ReframePlan | None, meta: VideoMeta, c: Clip) -> int:
     return max(plan.n_frames if plan else 0, round(c.duration * meta.fps), 1)
+
+
+def cam_view(s, meta: VideoMeta, rc) -> dict | None:
+    """A facecam shot as the live preview draws it, on the 1080x1920 frame (fractions): the gameplay area
+    (top, height), the automatic gameplay crop (centre x, shape), and each cam tile (source box -> output box)."""
+    if s.mode != "split" or not s.cams or rc.screen_layout == "track":
+        return None
+    W, H, sw, sh = 1080, 1920, meta.width, meta.height
+    if rc.screen_layout == "pip":
+        (gl, gt, gr, gb), cams = pip_geometry(s, sw, sh, W, H, rc)
+        tiles = [{"src": [a / sw, b / sh, c / sw, d / sh], "dst": [x / W, y / H, w / W, h / H]}
+                 for (a, b, c, d), (x, y, w, h) in cams]
+        return {"area": [0.0, 1.0], "screen_x": (gl + gr) / 2 / sw, "screen_a": (gr - gl) / max(1, gb - gt),
+                "tiles": tiles, "pip": True}
+    panel_h, cams, (gl, gt, gr, gb) = split_geometry(s, sw, sh, W, H, meta, rc)
+    n = len(cams)
+    slot = W // n
+    tiles = [{"src": [a / sw, b / sh, c / sw, d / sh],
+              "dst": [slot * k / W, 0.0, ((W - slot * (n - 1)) if k == n - 1 else slot) / W, panel_h / H]}
+             for k, (a, b, c, d) in enumerate(cams)]
+    return {"area": [panel_h / H, 1 - panel_h / H], "screen_x": (gl + gr) / 2 / sw,
+            "screen_a": (gr - gl) / max(1, gb - gt), "tiles": tiles, "pip": False}
 
 
 def view(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config) -> dict:
@@ -43,10 +67,11 @@ def view(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config) -> dict:
         "src_w": meta.width,
         "src_h": meta.height,
         "analysed": auto is not None,
-        "shots": [{"start": s.start, "end": s.end, "mode": s.mode, "why": s.why, "x": s.x, "cams": s.cams}
-                  for s in shots],
+        "shots": [{"start": s.start, "end": s.end, "mode": s.mode, "why": s.why, "x": s.x, "cams": s.cams,
+                   "cam_view": cam_view(s, meta, rc)} for s in shots],
         "faces": [{"f": s.f, "faces": [f[:4] for f in s.faces]} for s in (auto.samples if auto else [])],
         "keys": [k.model_dump() for k in fr.keys] if fr else [],
+        "keep_cam": fr.keep_cam if fr else True,
         "keep": keep if cfg.pacing.enabled else None,
         "flash": flash,
         "layout": {
@@ -102,9 +127,11 @@ def ensure_proxy(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config) -> Path:
         return dst
 
 
-def save_keys(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config, keys: list[framing.Key]) -> framing.Framing:
+def save_keys(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config, keys: list[framing.Key],
+              keep_cam: bool = True) -> framing.Framing:
     cfg = with_job_layout(cfg, job_dir)
     auto = framing.analysis(job_dir, c, cfg)
-    fr = framing.Framing(keys=framing.clean(keys, n_frames(auto, meta, c), meta.width, meta.height))
+    fr = framing.Framing(keys=framing.clean(keys, n_frames(auto, meta, c), meta.width, meta.height),
+                         keep_cam=keep_cam)
     framing.save(job_dir, c, fr)
     return fr

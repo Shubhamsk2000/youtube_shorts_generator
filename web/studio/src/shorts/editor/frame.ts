@@ -1,5 +1,5 @@
 /** Window math for the clip editor. Mirrors src/shorts/stages/framing.py so the live preview matches the render. */
-import type { EditorData, EditorShot, FrameKey } from "../api";
+import type { CamView, EditorData, EditorShot, FrameKey } from "../api";
 
 export const FILL = 9 / 16;
 
@@ -9,7 +9,11 @@ export type Win = {
   kind: "crop" | "wide" | "fit" | "split";
   manual: boolean;    // set in the editor (else the automatic framing)
   follow: boolean;    // x comes from the automatic path (a key without x)
+  cam?: CamView;      // kind "split": the facecam layout is drawn, the window is its gameplay part
 };
+
+/** Shape of the gameplay area of a facecam layout (the narrowest gameplay window there is). */
+export const areaAspect = (cv: CamView) => FILL / Math.max(0.05, cv.area[1]);
 
 export const PRESETS: { label: string; a: number | "max"; hint: string }[] = [
   { label: "9:16", a: FILL, hint: "Fills the screen (like the automatic crop)" },
@@ -64,33 +68,44 @@ function autoX(s: EditorShot, f: number) {
 export function autoWin(d: EditorData, f: number): Win {
   const s = d.shots[shotIndexAt(d.shots, f)];
   if (s.mode === "fit") return { x: 0.5, a: d.layout.max_aspect, kind: "fit", manual: false, follow: false };
-  if (s.mode === "split" && s.cams.length && d.layout.screen_layout !== "track")
-    return { x: 0.5, a: FILL, kind: "split", manual: false, follow: false };
+  if (s.mode === "split" && s.cams.length && d.layout.screen_layout !== "track") {
+    const cv = s.cam_view;
+    return cv
+      ? { x: cv.screen_x, a: cv.screen_a, kind: "split", manual: false, follow: false, cam: cv }
+      : { x: 0.5, a: FILL, kind: "split", manual: false, follow: false };
+  }
   return { x: autoX(s, f), a: FILL, kind: "crop", manual: false, follow: false };
 }
 
-/** The window drawn at frame f: manual keys in its shot, else the automatic framing. */
-export function windowAt(d: EditorData, keys: FrameKey[], f: number): Win {
+/** The window drawn at frame f: manual keys in its shot, else the automatic framing. keepCam: in a facecam
+ * shot the keys set only the gameplay window and the cam stays (else they frame the whole short). */
+export function windowAt(d: EditorData, keys: FrameKey[], f: number, keepCam = true): Win {
   const i = shotIndexAt(d.shots, f);
   const mine = keysInShot(d, keys, i).sort((p, q) => p.f - q.f);
   if (!mine.length) return autoWin(d, f);
   const s = d.shots[i];
+  const cv = keepCam && d.layout.screen_layout !== "track" ? s.cam_view : null;
+  const autoAt = (g: number) => (cv ? cv.screen_x : autoX(s, g));
   let j = 0;
   while (j + 1 < mine.length && mine[j + 1].f <= f) j++;
   const k0 = mine[j];
-  const x0 = k0.x ?? autoX(s, f);
+  const x0 = k0.x ?? autoAt(f);
   let x = x0;
   let a = k0.a;
   let follow = k0.x == null;
   if (!(f <= k0.f || j + 1 >= mine.length)) {
     const k1 = mine[j + 1];
     const t = ease((f - k0.f) / (k1.f - k0.f));
-    const x1 = k1.x ?? autoX(s, f);
+    const x1 = k1.x ?? autoAt(f);
     x = x0 + (x1 - x0) * t;
     a = k0.a + (k1.a - k0.a) * t;
     follow = k0.x == null && k1.x == null;
   }
   a = clampA(a, d);
+  if (cv) {
+    a = Math.min(Math.max(a, areaAspect(cv)), Math.max(FILL, d.layout.max_aspect)); // never narrower than its area
+    return { x: clampX(x, a, d), a, kind: "split", manual: true, follow, cam: cv };
+  }
   return { x: clampX(x, a, d), a, kind: a > FILL * 1.01 ? "wide" : "crop", manual: true, follow };
 }
 

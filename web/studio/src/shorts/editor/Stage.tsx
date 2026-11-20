@@ -10,9 +10,10 @@ export type DragMode = "move" | "l" | "r";
  * edge to make it wider or narrower (snaps to the presets; hold Shift for a free shape), click outside it to
  * centre it there.
  */
-export function Stage({ d, video, win, faces, cams, onBegin, onChange, onEnd, src }: {
+export function Stage({ d, video, win, faces, cams, keepCam, onBegin, onChange, onEnd, src }: {
   d: EditorData;
   cams: number[][];                             // the current shot's facecam boxes
+  keepCam: boolean;                             // facecam shots: the window is only the gameplay part
   video: RefObject<HTMLVideoElement | null>;
   win: Win;
   faces: number[][] | null;
@@ -24,8 +25,11 @@ export function Stage({ d, video, win, faces, cams, onBegin, onChange, onEnd, sr
   const box = useRef<HTMLDivElement>(null);
   const drag = useRef<{ mode: DragMode; x0: number; w: number; left: number; cw: number; x: number; a: number; follow: boolean } | null>(null);
 
-  const split = win.kind === "split";
-  const cw = winWidth(split ? FILL : win.a, d);
+  const split = win.kind === "split";           // the facecam layout is drawn (automatic, or kept with your window)
+  const autoCam = split && !win.manual;
+  // the shape a first touch gives the window: the gameplay part (cam kept), or a 9:16 crop of the whole short
+  const touchA = autoCam && !keepCam ? FILL : win.a;
+  const cw = winWidth(touchA, d);
   const left = clamp(win.x - cw / 2, 0, 1 - cw);
 
   function start(e: RPointerEvent, mode: DragMode) {
@@ -34,10 +38,12 @@ export function Stage({ d, video, win, faces, cams, onBegin, onChange, onEnd, sr
     e.stopPropagation();
     const rect = box.current!.getBoundingClientRect();
     (e.target as Element).setPointerCapture(e.pointerId);
-    const a = split ? FILL : win.a;
-    drag.current = { mode, x0: e.clientX, w: rect.width, left, cw, x: win.x, a, follow: win.follow && mode !== "move" };
+    const a = touchA;
+    // an automatic facecam shot: a resize keeps the automatic position (with the cam kept)
+    const follow = (autoCam ? keepCam : win.follow) && mode !== "move";
+    drag.current = { mode, x0: e.clientX, w: rect.width, left, cw, x: win.x, a, follow };
     onBegin();
-    if (split) onChange(win.x, a);  // the facecam layout becomes a window on the first touch
+    if (autoCam) onChange(follow ? null : clampX(win.x, a, d), a);  // the first touch makes it a window
   }
 
   function move(e: RPointerEvent) {
@@ -70,7 +76,7 @@ export function Stage({ d, video, win, faces, cams, onBegin, onChange, onEnd, sr
     if (e.button !== 0 || drag.current) return;
     const rect = box.current!.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
-    const a = split ? FILL : win.a;
+    const a = touchA;
     onBegin();
     onChange(clampX(x, a, d), a);
     onEnd();
@@ -82,7 +88,7 @@ export function Stage({ d, video, win, faces, cams, onBegin, onChange, onEnd, sr
 
       {/* outside the window: dimmed, click to move the window there */}
       <div className="absolute inset-0 cursor-crosshair" onPointerDown={clickOutside} />
-      {!split && (
+      {!(autoCam && !keepCam) && (
         <>
           <div className="pointer-events-none absolute inset-y-0 left-0 bg-black/60" style={{ width: `${left * 100}%` }} />
           <div className="pointer-events-none absolute inset-y-0 right-0 bg-black/60" style={{ width: `${(1 - left - cw) * 100}%` }} />
@@ -95,8 +101,10 @@ export function Stage({ d, video, win, faces, cams, onBegin, onChange, onEnd, sr
             <div key={i} className="absolute rounded-sm border-2 border-dashed border-fuchsia-400/90"
               style={{ left: `${c[0] * 100}%`, top: `${c[1] * 100}%`, width: `${(c[2] - c[0]) * 100}%`, height: `${(c[3] - c[1]) * 100}%` }} />
           ))}
-          <span className="absolute top-2 left-1/2 -translate-x-1/2 rounded-md bg-black/70 px-2 py-1 text-[11px] font-medium text-white backdrop-blur">
-            Facecam layout (automatic) · click or drag to set your own window
+          <span className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-md bg-black/70 px-2 py-1 text-[11px] font-medium whitespace-nowrap text-white backdrop-blur">
+            {keepCam
+              ? "Facecam stays · the window is the gameplay part"
+              : autoCam ? "Facecam layout (automatic) · drag to replace it with your own window" : "Facecam layout"}
           </span>
         </div>
       )}
@@ -118,14 +126,14 @@ export function Stage({ d, video, win, faces, cams, onBegin, onChange, onEnd, sr
         onPointerCancel={end}
         className={cx(
           "absolute inset-y-0 cursor-grab active:cursor-grabbing",
-          split ? "border-2 border-dashed border-white/40" : win.manual ? "border-2 border-accent shadow-[0_0_0_1px_rgba(0,0,0,0.4)]" : "border-2 border-white/85",
+          autoCam && !keepCam ? "border-2 border-dashed border-white/40" : win.manual ? "border-2 border-accent shadow-[0_0_0_1px_rgba(0,0,0,0.4)]" : "border-2 border-white/85",
         )}
         style={{ left: `${left * 100}%`, width: `${cw * 100}%` }}
       >
-        {!split && (
+        {!(autoCam && !keepCam) && (
           <span className={cx("pointer-events-none absolute top-1.5 left-1.5 rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold text-white",
             win.manual ? "bg-accent" : "bg-black/60")}>
-            {aspectLabel(win.a, d)}{win.manual ? (win.follow ? " · follows faces" : "") : " · auto"}
+            {split && "gameplay "}{aspectLabel(win.a, d)}{win.manual ? (win.follow ? (split ? " · auto position" : " · follows faces") : "") : " · auto"}
           </span>
         )}
         {(["l", "r"] as const).map((m) => (
