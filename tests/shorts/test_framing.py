@@ -152,3 +152,43 @@ def test_framing_file_keeps_the_choice(tmp_path):
     c = clip()
     framing.save(tmp_path, c, Framing(keys=[Key(f=0, x=0.5)], keep_cam=False))
     assert framing.load(tmp_path, c).keep_cam is False
+
+
+def _cam_shot(**kw):
+    return Shot(start=0, end=90, mode="split", cams=[[0.0, 0.0, 0.3, 0.35], [0.7, 0.0, 1.0, 0.35]], **kw)
+
+
+def test_facecam_frame_replaces_the_cam_crop_in_the_panel_shape():
+    from shorts.stages.render import split_geometry
+    rc = ReframeCfg()
+    auto_h, auto_cams, auto_screen = split_geometry(_cam_shot(), 1920, 1080, 1080, 1920, meta(), rc)
+    fr = Framing(cam=framing.CamBox(x=0.5, y=0.3, h=0.3))
+    s = framing.apply(plan([_cam_shot(), Shot(start=90, end=120, mode="track", x=[0.5] * 30)]), fr).shots
+    assert s[0].cam_box == [0.5, 0.3, 0.3] and s[1].cam_box == []    # only facecam shots
+    panel_h, cams, screen = split_geometry(s[0], 1920, 1080, 1080, 1920, meta(), rc)
+    assert panel_h == auto_h and screen == auto_screen               # the panel and gameplay don't move
+    assert len(cams) == 1                                            # one cam across the whole panel
+    a, b, c, d = cams[0]
+    assert (c - a) / (d - b) == pytest.approx(1080 / panel_h, rel=0.01)
+    assert (d - b) == pytest.approx(0.3 * 1080, abs=1)
+    assert (a + c) / 2 == pytest.approx(960, abs=1) and (b + d) / 2 == pytest.approx(0.3 * 1080, abs=1)
+
+
+def test_facecam_frame_is_kept_inside_the_source():
+    from shorts.stages.reframe import cam_box_crop
+    a, b, c, d = cam_box_crop([0.98, 0.02, 0.5], 16 / 9, 1920, 1080)
+    assert a >= 0 and b == 0 and c <= 1920 and d <= 1080
+    a, b, c, d = cam_box_crop([0.5, 0.5, 1.0], 4.0, 1920, 1080)       # too wide: full width
+    assert (a, c) == (0, 1920) and (d - b) == pytest.approx(480, abs=1)
+
+
+def test_facecam_frame_alone_is_saved_and_survives_whole_short_keys(tmp_path):
+    c = clip()
+    framing.save(tmp_path, c, Framing(cam=framing.CamBox(x=0.2, y=0.2, h=0.4)))
+    fr = framing.load(tmp_path, c)
+    assert fr is not None and fr.cam.h == 0.4 and not fr.keys
+    # "edit whole short": a keyed facecam shot becomes a manual window, no cam to frame
+    fr2 = Framing(keys=[Key(f=0, x=0.5)], keep_cam=False, cam=fr.cam)
+    assert framing.apply(plan([_cam_shot()]), fr2).shots[0].cam_box == []
+    framing.save(tmp_path, c, Framing())
+    assert framing.load(tmp_path, c) is None

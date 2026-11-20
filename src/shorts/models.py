@@ -147,6 +147,8 @@ class Shot(BaseModel):
     cams: list[list[float]] = []   # split: facecam boxes [x0, y0, x1, y1] (fractions), shown on top
     face_y: list[float] = []       # split: face centre y inside each cam (fraction of the cam box)
     face_x: list[float] = []       # split: face centre x inside each cam
+    cam_box: list[float] = []      # split: facecam crop set in the editor [cx, cy, h] (fractions of the source);
+                                   # replaces the automatic cam crop(s), its width follows the cam slot's shape
 
 
 class ReframePlan(BaseModel):

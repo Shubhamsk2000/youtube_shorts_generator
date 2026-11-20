@@ -4,32 +4,34 @@ import {
   RotateCcw, ScanFace, SkipBack, SkipForward, Undo2, X,
 } from "lucide-react";
 import { useConfirm, useToast, ErrorBoundary } from "@kit/feedback";
-import { api, editorHref, jobHref, type EditorData, type FrameKey, type Review } from "../api";
+import { api, editorHref, jobHref, type CamBox, type EditorData, type FrameKey, type Review } from "../api";
 import { Button, Card, CardHeader, Input, Segmented, Toggle } from "@kit/ui";
 import { cx, errorText, Link, navigate, useStored, usePoll } from "../lib";
 import {
   FILL, PRESETS, aspectLabel, clamp, clampX, keysInShot, modeLabel, presetValue, putKey, shotIndexAt, shotRange,
-  skipTarget, windowAt,
+  skipTarget, windowAt, withCamBox,
 } from "../editor/frame";
 import { Preview, drawFrame } from "../editor/Preview";
 import { Stage } from "../editor/Stage";
 import { Timeline } from "../editor/Timeline";
 
-type Hist = { past: FrameKey[][]; present: FrameKey[]; future: FrameKey[][] };
+/** What the editor changes: the window keys and the facecam frame (undone together). */
+type Edit = { keys: FrameKey[]; cam: CamBox | null };
+type Hist = { past: Edit[]; present: Edit; future: Edit[] };
 type Act =
-  | { type: "init"; keys: FrameKey[] }
-  | { type: "checkpoint" }               // before a drag: one undo step for the whole drag
-  | { type: "live"; keys: FrameKey[] }   // during a drag
-  | { type: "commit"; keys: FrameKey[] } // a one-off change
+  | { type: "init"; edit: Edit }
+  | { type: "checkpoint" }                 // before a drag: one undo step for the whole drag
+  | { type: "live"; edit: Partial<Edit> }  // during a drag
+  | { type: "commit"; edit: Partial<Edit> } // a one-off change
   | { type: "undo" }
   | { type: "redo" };
 
 function hist(h: Hist, a: Act): Hist {
   switch (a.type) {
-    case "init": return { past: [], present: a.keys, future: [] };
+    case "init": return { past: [], present: a.edit, future: [] };
     case "checkpoint": return { past: [...h.past.slice(-99), h.present], present: h.present, future: [] };
-    case "live": return { ...h, present: a.keys };
-    case "commit": return { past: [...h.past.slice(-99), h.present], present: a.keys, future: [] };
+    case "live": return { ...h, present: { ...h.present, ...a.edit } };
+    case "commit": return { past: [...h.past.slice(-99), h.present], present: { ...h.present, ...a.edit }, future: [] };
     case "undo": return h.past.length ? { past: h.past.slice(0, -1), present: h.past[h.past.length - 1], future: [h.present, ...h.future] } : h;
     case "redo": return h.future.length ? { past: [...h.past, h.present], present: h.future[0], future: h.future.slice(1) } : h;
   }
@@ -78,13 +80,14 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
   const toast = useToast();
   const confirm = useConfirm();
   const video = useRef<HTMLVideoElement>(null);
-  const [h, dispatch] = useReducer(hist, { past: [], present: d.keys, future: [] });
-  const [saved, setSaved] = useState(() => JSON.stringify(d.keys));
-  const keys = h.present;
+  const [h, dispatch] = useReducer(hist, { past: [], present: { keys: d.keys, cam: d.cam ?? null }, future: [] });
+  const [saved, setSaved] = useState(() => JSON.stringify({ keys: d.keys, cam: d.cam ?? null }));
+  const keys = h.present.keys;
+  const camBox = h.present.cam;
   const [keepCam, setKeepCam] = useState(d.keep_cam !== false);
   const [savedCam, setSavedCam] = useState(d.keep_cam !== false);
   const hasCam = d.layout.screen_layout !== "track" && d.shots.some((s) => s.cam_view);
-  const dirty = JSON.stringify(keys) !== saved || (keys.length > 0 && keepCam !== savedCam);
+  const dirty = JSON.stringify(h.present) !== saved || (keys.length > 0 && keepCam !== savedCam);
   const [t, setT] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [videoState, setVideoState] = useState<"loading" | "ready" | "error">("loading");
@@ -99,7 +102,8 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
   const dur = d.clip.duration;
   const step = 1 / (fps > 35 ? fps / 2 : fps); // the proxy has every 2nd frame of 50/60 fps sources
   const f = clamp(Math.round(t * fps), 0, n - 1);
-  const win = windowAt(d, keys, f, keepCam);
+  const win0 = windowAt(d, keys, f, keepCam);
+  const win = win0.cam ? { ...win0, cam: withCamBox(win0.cam, camBox, d) } : win0; // with your facecam frame
   const si = shotIndexAt(d.shots, f);
   const shot = d.shots[si];
   const [s0, s1] = shotRange(d, si);
@@ -169,7 +173,7 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
   const pause = () => video.current?.pause();
 
   // ---------------------------------------------------------------- edits
-  const commit = (next: FrameKey[]) => dispatch({ type: "commit", keys: next });
+  const commit = (next: FrameKey[]) => dispatch({ type: "commit", edit: { keys: next } });
 
   function setShape(a: number) {
     const keepFollowing = win.manual ? win.follow : true; // auto framing: keep tracking, just widen
@@ -234,9 +238,10 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
     if (saving) return;
     setSaving(true);
     try {
-      const res = await api.setFraming(jobId, d.clip.id, keys, keepCam);
-      dispatch({ type: "init", keys: res.keys });
-      setSaved(JSON.stringify(res.keys));
+      const res = await api.setFraming(jobId, d.clip.id, keys, keepCam, camBox);
+      const edit = { keys: res.keys, cam: res.cam ?? null };
+      dispatch({ type: "init", edit });
+      setSaved(JSON.stringify(edit));
       setKeepCam(res.keep_cam);
       setSavedCam(res.keep_cam);
       toast.ok(res.rerender ? "Framing saved · re-rendering this clip" : "Framing saved", res.rerender ? "The rendered preview updates when it's done" : undefined);
@@ -371,10 +376,11 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
         <div className="flex shrink-0 items-center gap-2">
           <Button variant="ghost" onClick={() => dispatch({ type: "undo" })} disabled={!h.past.length} title="Undo (Ctrl+Z)" aria-label="Undo"><Undo2 className="size-4" /></Button>
           <Button variant="ghost" onClick={() => dispatch({ type: "redo" })} disabled={!h.future.length} title="Redo (Ctrl+Shift+Z)" aria-label="Redo"><Redo2 className="size-4" /></Button>
-          <Button variant="outline" disabled={!keys.length} onClick={() => commit([])} title="Remove every keyframe: back to the automatic framing">
+          <Button variant="outline" disabled={!keys.length && !camBox} onClick={() => dispatch({ type: "commit", edit: { keys: [], cam: null } })}
+            title="Remove every keyframe and the facecam frame: back to the automatic framing">
             <RotateCcw className="size-4" /> <span className="hidden sm:inline">All auto</span>
           </Button>
-          {dirty && <Button variant="ghost" onClick={() => { dispatch({ type: "init", keys: JSON.parse(saved) }); setKeepCam(savedCam); }}>Discard</Button>}
+          {dirty && <Button variant="ghost" onClick={() => { dispatch({ type: "init", edit: JSON.parse(saved) }); setKeepCam(savedCam); }}>Discard</Button>}
           <Button onClick={save} disabled={!dirty} loading={saving} title="Save and re-render this clip (Ctrl+S)">
             <Check className="size-4" /> Save framing
           </Button>
@@ -386,8 +392,10 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
           <div className="relative">
             <ErrorBoundary label="Video">
               <Stage d={d} video={video} win={win} faces={sample} cams={shot.cams} keepCam={keepCam} src={d.proxy_url}
+                camCustom={camBox != null}
                 onBegin={() => { pause(); dispatch({ type: "checkpoint" }); }}
-                onChange={(x, a) => dispatch({ type: "live", keys: putKey(keys, { f, x, a }) })}
+                onChange={(x, a) => dispatch({ type: "live", edit: { keys: putKey(keys, { f, x, a }) } })}
+                onCam={(cam) => dispatch({ type: "live", edit: { cam } })}
                 onEnd={() => {}} />
             </ErrorBoundary>
             {videoState !== "ready" && (
@@ -444,6 +452,17 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
                       ? "Moving or reshaping the window only changes the gameplay part. The facecam stays where the layout puts it."
                       : "In shots you edit, your window is the whole short and the facecam layout is dropped."}
                   </p>
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs text-faint">
+                      <span className="font-medium text-muted">Facecam frame {camBox ? "· yours" : "· auto"}</span>
+                      {" · "}Cam crop looks off? Drag the pink frame on the video to move it, or a corner to resize it.
+                      Its shape follows the cam slot, so it always fills it. Applies to every facecam shot in this clip.
+                    </p>
+                    <Button variant="ghost" disabled={!camBox} onClick={() => dispatch({ type: "commit", edit: { cam: null } })}
+                      title="Back to the automatically detected facecam crop">
+                      <RotateCcw className="size-3.5" /> Auto facecam
+                    </Button>
+                  </div>
                 </div>
               )}
               <div>

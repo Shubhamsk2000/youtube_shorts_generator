@@ -139,6 +139,14 @@ export interface FrameKey {
   a: number;
 }
 
+/** The facecam frame set in the editor (whole clip): centre and height, fractions of the source. Its width
+ * follows the shape of the cam's slot in the layout. */
+export interface CamBox {
+  x: number;
+  y: number;
+  h: number;
+}
+
 export interface EditorShot {
   start: number;
   end: number;
@@ -168,6 +176,7 @@ export interface EditorData {
   faces: { f: number; faces: number[][] }[];
   keys: FrameKey[];
   keep_cam: boolean;        // facecam shots: keys set only the gameplay window, the cam stays
+  cam: CamBox | null;       // facecam frame set in the editor (null = the automatic cam crop)
   keep: [number, number][] | null;
   flash: [number, number] | null;
   layout: { out_w: number; out_h: number; fit_y: number; fit_dim: number; screen_layout: ScreenLayout; background: Background; max_aspect: number };
@@ -257,9 +266,9 @@ export const api = {
   editor: (id: string, clipId: string) => request<EditorData>(`${J(id)}/clips/${encodeURIComponent(clipId)}/editor`),
   warmProxy: (id: string, clipId: string) =>
     request<void>(`${J(id)}/clips/${encodeURIComponent(clipId)}/proxy`, { method: "POST", timeoutMs: 300000 }),
-  setFraming: (id: string, clipId: string, keys: FrameKey[], keepCam: boolean) =>
-    request<{ keys: FrameKey[]; keep_cam: boolean; rerender: boolean }>(
-      `${J(id)}/clips/${encodeURIComponent(clipId)}/framing`, json("PUT", { keys, keep_cam: keepCam })),
+  setFraming: (id: string, clipId: string, keys: FrameKey[], keepCam: boolean, cam: CamBox | null) =>
+    request<{ keys: FrameKey[]; keep_cam: boolean; cam: CamBox | null; rerender: boolean }>(
+      `${J(id)}/clips/${encodeURIComponent(clipId)}/framing`, json("PUT", { keys, keep_cam: keepCam, cam })),
   reselect: (id: string) => request<Job>(`${J(id)}/reselect`, json("POST")),
   review: (id: string, clipId: string, review: Review) =>
     request<{ id: string; review: Review }>(`${J(id)}/clips/${encodeURIComponent(clipId)}/review`, json("PUT", { review })),

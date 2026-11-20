@@ -907,6 +907,20 @@ def crop_to_aspect(x0: float, y0: float, x1: float, y1: float, aspect: float, fx
     return x0, top, x1, top + nh
 
 
+def cam_box_crop(box: list[float], aspect: float, sw: int, sh: int) -> tuple[int, int, int, int]:
+    """Source crop (px) of an editor facecam frame [cx, cy, h] with width/height = aspect, kept inside the frame
+    (too wide for the frame: shrunk to its full width)."""
+    cx, cy, h = box[:3]
+    ch = max(2.0, min(1.0, h) * sh)
+    cw = ch * aspect
+    if cw > sw:
+        cw, ch = float(sw), sw / aspect
+    left = float(np.clip(cx * sw - cw / 2, 0, sw - cw))
+    top = float(np.clip(cy * sh - ch / 2, 0, sh - ch))
+    a, b = int(round(left)), int(round(top))
+    return a, b, max(a + 2, int(round(left + cw))), max(b + 2, int(round(top + ch)))
+
+
 def screen_crop(cams: list[list[float]], sw: int, sh: int, aspect: float) -> tuple[int, int, int, int]:
     """Crop (px) of the gameplay/screen with width/height = aspect: as central as possible (crosshairs,
     characters and menus sit in the middle), shifted sideways so it doesn't show the cam a second time."""
@@ -965,7 +979,7 @@ def pip_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, rc: Refra
     screen = screen_crop(shot.cams, sw, sh, max(out_w / out_h, rc.pip_screen_aspect))
     used: set[str] = set()
     cams = []
-    for k, (x0, y0, x1, y1) in enumerate(shot.cams[:2]):
+    for k, (x0, y0, x1, y1) in enumerate(shot.cams[:1] if shot.cam_box else shot.cams[:2]):
         fx = shot.face_x[k] if k < len(shot.face_x) else 0.5
         fy = shot.face_y[k] if k < len(shot.face_y) else 0.45
         ix, iy = 0.015 * (x1 - x0), 0.015 * (y1 - y0)  # inset: the cam's own border/rounded corners don't show
@@ -985,7 +999,10 @@ def pip_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, rc: Refra
         margin = round(rc.pip_margin * out_w)
         x = margin if side == "left" else out_w - margin - w
         y = round(rc.pip_top * out_h)
-        cams.append(((int(a), int(b), max(int(a) + 2, int(c)), max(int(b) + 2, int(d))), (x, y, w, h)))
+        src = (int(a), int(b), max(int(a) + 2, int(c)), max(int(b) + 2, int(d)))
+        if shot.cam_box:  # the frame set in the editor, in the corner cam's exact shape
+            src = cam_box_crop(shot.cam_box, w / h, sw, sh)
+        cams.append((src, (x, y, w, h)))
     return screen, cams
 
 

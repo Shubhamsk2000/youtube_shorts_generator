@@ -14,6 +14,10 @@ first / after the last. Shots without keys keep their automatic framing. At a cu
 
 keep_cam (on by default): in a facecam shot (cam panel on top, or corner cam) the keys only set the gameplay
 window, and the cam stays where the layout puts it. Off: the keys frame the whole short, as in any other shot.
+
+cam (optional, whole clip): the facecam frame, for when the automatic cam crop is off. Centre (x, y) and height
+h as fractions of the source; the width follows the shape of the cam's slot in the layout (the panel on top, or
+the corner cam), so it always fills it. Applies to every facecam shot the layout still draws with its cam.
 """
 from __future__ import annotations
 
@@ -36,9 +40,20 @@ class Key(BaseModel):
     a: float = OUT_ASPECT  # window width / height
 
 
+class CamBox(BaseModel):
+    x: float  # centre, fractions of the source
+    y: float
+    h: float  # height, fraction of the source height
+
+
 class Framing(BaseModel):
     keys: list[Key] = []
     keep_cam: bool = True  # facecam shots: the keys set only the gameplay window, the cam stays
+    cam: CamBox | None = None  # facecam frame set in the editor (None = the automatic cam crop)
+
+    @property
+    def empty(self) -> bool:
+        return not self.keys and self.cam is None
 
 
 def framing_path(job_dir: Path, clip: Clip) -> Path:
@@ -53,12 +68,12 @@ def load(job_dir: Path, clip: Clip) -> Framing | None:
         fr = load_json(Framing, p)
     except Exception:  # noqa: BLE001  (a broken file = automatic framing)
         return None
-    return fr if fr.keys else None
+    return None if fr.empty else fr
 
 
 def save(job_dir: Path, clip: Clip, fr: Framing) -> None:
     p = framing_path(job_dir, clip)
-    if not fr.keys:
+    if fr.empty:
         p.unlink(missing_ok=True)
         return
     p.parent.mkdir(exist_ok=True)
@@ -91,6 +106,13 @@ def clean(keys: list[Key], n_frames: int, src_w: int, src_h: int) -> list[Key]:
     return [by_f[f] for f in sorted(by_f)]
 
 
+def clean_cam(cam: CamBox | None) -> CamBox | None:
+    if cam is None:
+        return None
+    h = round(min(max(cam.h, 0.04), 1.0), 4)
+    return CamBox(x=round(min(max(cam.x, 0.0), 1.0), 4), y=round(min(max(cam.y, 0.0), 1.0), 4), h=h)
+
+
 def _ease(t: float) -> float:
     return t * t * (3 - 2 * t)  # smoothstep: no sudden start or stop between keys
 
@@ -120,14 +142,18 @@ def interpolate(keys: list[Key], frames: range, auto_x=lambda f: 0.5,
 
 
 def apply(plan: ReframePlan, fr: Framing | None) -> ReframePlan:
-    """The plan with every shot that has keys replaced by its manual window path."""
-    if not fr or not fr.keys or not plan.shots:
+    """The plan with every shot that has keys replaced by its manual window path, and the facecam frame (if
+    set) on every facecam shot that keeps its cam."""
+    if not fr or fr.empty or not plan.shots:
         return plan
     keys = sorted(fr.keys, key=lambda k: k.f)
+    box = [fr.cam.x, fr.cam.y, fr.cam.h] if fr.cam else []
     shots: list[Shot] = []
     last = len(plan.shots) - 1
     for n, s in enumerate(plan.shots):
-        end = max(s.end, keys[-1].f + 1) if n == last else s.end  # keys past the analysed frames: last shot
+        if box and s.mode == "split" and s.cams:
+            s = s.model_copy(update={"cam_box": box})
+        end = max(s.end, keys[-1].f + 1) if keys and n == last else s.end  # keys past the analysed frames
         mine = [k for k in keys if s.start <= k.f < end]
         if not mine:
             shots.append(s)
