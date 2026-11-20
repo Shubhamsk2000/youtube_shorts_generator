@@ -551,9 +551,16 @@ class FramingKey(BaseModel):
     a: float = 9 / 16
 
 
+class FramingCam(BaseModel):
+    x: float  # centre, fractions of the source
+    y: float
+    h: float  # height, fraction of the source height
+
+
 class FramingBody(BaseModel):
     keys: list[FramingKey]
     keep_cam: bool = True     # facecam shots: the keys set only the gameplay window, the cam stays
+    cam: FramingCam | None = None  # facecam frame (None = the automatic cam crop)
 
 
 class BulkReview(BaseModel):
@@ -1154,7 +1161,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
 
     @router.put("/jobs/{job_id}/clips/{clip_id}/framing")
     def set_framing(job_id: str, clip_id: str, body: FramingBody):
-        """Save the window keys from the editor (empty list = automatic again) and re-render that clip."""
+        """Save the window keys and facecam frame from the editor (none = automatic again); re-render the clip."""
         job = _job_or_404(store, job_id)
         renders_only_or_409(job, "change the framing")
         d = cfg.workspace() / job_id
@@ -1164,7 +1171,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         before = render.clip_file(d, clip, live)
         try:
             fr = editor.save_keys(d, meta, clip, live, [editor.framing.Key(**k.model_dump()) for k in body.keys],
-                                  body.keep_cam)
+                                  body.keep_cam,
+                                  editor.framing.CamBox(**body.cam.model_dump()) if body.cam else None)
         except ValueError as e:
             raise HTTPException(422, str(e)) from None
         try:
@@ -1174,7 +1182,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         rerender = render.clip_file(d, clip, live) != before
         if rerender:
             worker.rerender(job_id)
-        return {"keys": [k.model_dump() for k in fr.keys], "keep_cam": fr.keep_cam, "rerender": rerender}
+        return {"keys": [k.model_dump() for k in fr.keys], "keep_cam": fr.keep_cam,
+                "cam": fr.cam.model_dump() if fr.cam else None, "rerender": rerender}
 
     @router.post("/jobs/{job_id}/rerender", response_model=JobView)
     def rerender(job_id: str):

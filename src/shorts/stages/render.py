@@ -35,7 +35,7 @@ from .captions import ass_path, refresh_clip
 from .pacing import edits_path, kept_duration, load_edits
 from .canvas import Canvas, canvas, canvas_key
 from . import framing
-from .reframe import (crop_to_aspect, pip_band, pip_geometry, plan_path, screen_band, screen_crop,
+from .reframe import (cam_box_crop, crop_to_aspect, pip_band, pip_geometry, plan_path, screen_band, screen_crop,
                       screen_window, split_panel_frac)
 from .select import OUT as SELECTION
 from . import sources
@@ -423,6 +423,9 @@ def split_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, meta: V
                    ) -> tuple[int, list[tuple[int, int, int, int]], tuple[int, int, int, int]]:
     """(cam panel height, cam source crops (px), screen source crop (px)) for a SPLIT shot."""
     panel_h = int(round(split_panel_frac(shot.cams, meta.width, meta.height, rc, out_w / out_h) * out_h / 2) * 2)
+    if shot.cam_box:  # the facecam frame set in the editor: one cam across the whole panel
+        return panel_h, [cam_box_crop(shot.cam_box, out_w / panel_h, sw, sh)], \
+            screen_crop(shot.cams, sw, sh, out_w / (out_h - panel_h))
     n = len(shot.cams)
     slot_w = out_w // n
     cams = []

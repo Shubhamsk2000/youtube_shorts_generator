@@ -1,5 +1,5 @@
 /** Window math for the clip editor. Mirrors src/shorts/stages/framing.py so the live preview matches the render. */
-import type { CamView, EditorData, EditorShot, FrameKey } from "../api";
+import type { CamBox, CamView, EditorData, EditorShot, FrameKey } from "../api";
 
 export const FILL = 9 / 16;
 
@@ -107,6 +107,41 @@ export function windowAt(d: EditorData, keys: FrameKey[], f: number, keepCam = t
     return { x: clampX(x, a, d), a, kind: "split", manual: true, follow, cam: cv };
   }
   return { x: clampX(x, a, d), a, kind: a > FILL * 1.01 ? "wide" : "crop", manual: true, follow };
+}
+
+/** Shape (width / height, in pixels) of the slot the facecam fills: the whole panel on top (one cam once
+ * you set the frame), or the corner cam. Mirrors render.split_geometry / reframe.pip_geometry. */
+export function camAspect(cv: CamView, d: Pick<EditorData, "layout">) {
+  const t = cv.tiles[0];
+  if (!t) return 16 / 9;
+  const W = d.layout.out_w;
+  const H = d.layout.out_h;
+  return cv.pip ? (t.dst[2] * W) / Math.max(1, t.dst[3] * H) : W / Math.max(1, t.dst[3] * H);
+}
+
+/** The facecam frame as a source box [x0, y0, x1, y1] (fractions), in the slot's shape, inside the frame.
+ * Mirrors reframe.cam_box_crop. */
+export function camBoxSrc(b: CamBox, aspect: number, d: Pick<EditorData, "src_w" | "src_h">): number[] {
+  let h = clamp(b.h, 0.04, 1);
+  let w = (h * d.src_h * aspect) / d.src_w;
+  if (w > 1) {
+    w = 1;
+    h = d.src_w / aspect / d.src_h;
+  }
+  const x0 = clamp(b.x - w / 2, 0, 1 - w);
+  const y0 = clamp(b.y - h / 2, 0, 1 - h);
+  return [x0, y0, x0 + w, y0 + h];
+}
+
+/** A source box -> the frame that draws it (centre + height). */
+export const camBoxOf = (src: number[]): CamBox => ({ x: (src[0] + src[2]) / 2, y: (src[1] + src[3]) / 2, h: src[3] - src[1] });
+
+/** The layout with your facecam frame: one cam across the panel (or in the corner), from that box. */
+export function withCamBox(cv: CamView, b: CamBox | null, d: EditorData): CamView {
+  if (!b || !cv.tiles.length) return cv;
+  const src = camBoxSrc(b, camAspect(cv, d), d);
+  const dst = cv.pip ? cv.tiles[0].dst : [0, 0, 1, cv.tiles[0].dst[3]];
+  return { ...cv, tiles: [{ src, dst }] };
 }
 
 /** Insert or replace the key on frame f. */
