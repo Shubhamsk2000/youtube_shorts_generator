@@ -222,3 +222,8 @@ def test_http_410_and_refused_keys_switch_at_once():
             assert getattr(e.value, attr)
         finally:
             lp.urllib.request.urlopen = orig
+
+
+def test_extract_json_of_a_reasoning_only_answer_is_empty_not_a_crash():
+    assert extract_json("<think>a</think>") == ""
+    assert extract_json("   ") == ""

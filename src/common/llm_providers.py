@@ -226,7 +226,11 @@ class OpenAICompatProvider:
         text = (choices[0].get("message") or {}).get("content") or ""
         if not text.strip():
             raise Retryable(f"empty answer (finish reason {choices[0].get('finish_reason')})")
-        return extract_json(text) if req.schema else text
+        if req.schema:
+            text = extract_json(text)
+            if not text:  # a reasoning model that only "thought" (cut off before answering)
+                raise Retryable(f"no answer after its reasoning (finish reason {choices[0].get('finish_reason')})")
+        return text
 
 
 
@@ -258,7 +262,7 @@ def extract_json(text: str) -> str:
         starts = [i for i in (t.find("{"), t.find("[")) if i >= 0]
         if starts:
             t = t[min(starts):]
-    if t[:1] in "{[":
+    if t and t[0] in "{[":
         close = "}" if t[0] == "{" else "]"
         t = t[: t.rfind(close) + 1] or t
     return t
