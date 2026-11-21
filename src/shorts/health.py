@@ -62,8 +62,11 @@ def run_checks(cfg: Config) -> list[Check]:
                                                  "≈ 2-3 GB, see download.mode)", required=False))
     ram = available_ram_gb()
     checks.append(Check("Available RAM", ram >= 1.5, f"{ram:.1f} GB", required=False))
-    checks.append(Check("Gemini API key", bool(os.getenv("GEMINI_API_KEY")),
-                        "set" if os.getenv("GEMINI_API_KEY") else "missing in .env: AI moment finding falls back to rough offline picks", required=False))
+    from common.llm import load_llm_config
+    keyed = [f"{p.name} ({len(p.keys())} key{'s' * (len(p.keys()) != 1)})"
+             for p in load_llm_config().providers.values() if p.api_key_env and p.has_key()]
+    checks.append(Check("AI API keys", bool(keyed), ", ".join(keyed) if keyed else
+                        "none in .env (GEMINI_API_KEY or NVIDIA_API_KEY): moments can't be picked", required=False))
     return checks
 
 

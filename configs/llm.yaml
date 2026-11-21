@@ -11,7 +11,16 @@
 #
 # A model chosen in the UI is saved to configs/llm.local.yaml and wins over tasks: below.
 #
+# When every model of a task's provider fails (quota, overload, retired model, refused key), the other providers
+# are tried, in the order listed under providers:. `fallback: auto` = every other provider whose key is set;
+# a list (e.g. [gemini]) = only those; `none` = never switch provider.
+#
+# Several keys for one provider: GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3... in .env. The next key is
+# used when one runs out of quota or is refused (quota is counted per key and model).
+#
 # Task names: shorts.select, shorts.refine
+
+fallback: auto
 
 default:
   provider: gemini
@@ -38,7 +47,8 @@ providers:
     base_url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
     # every model listed here shows up in Studio's model picker (Clips panel); the first is the default
-    models: [nvidia/nemotron-3.5-super-vl-120b-a12b, mistralai/mistral-large-4-1t-a52b, deepseek-ai/deepseek-v4.1-flash]
+    # (deepseek-ai/deepseek-v4.1-flash was retired by NVIDIA: HTTP 410)
+    models: [nvidia/nemotron-3.5-super-vl-120b-a12b, mistralai/mistral-large-4-1t-a52b]
     min_interval_s: 2
 
   # OpenRouter: one key, many models (some free, ids ending in :free).

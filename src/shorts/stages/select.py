@@ -2,8 +2,9 @@
 
 Gemini reads the transcript (in ~20 min overlapping windows) and answers with *sentence ids*,
 never timestamps: times come from Whisper, and clip edges always land on sentence boundaries.
-Every pick is then validated locally (length, score, duplicates). If Gemini is unreachable the
-stage falls back to an offline heuristic so the pipeline still finishes.
+Every pick is then validated locally (length, score, duplicates). Which AI answers (and what it switches to when
+one fails) is configs/llm.yaml's job. If every provider fails, the stage stops with the reason, so it can be
+retried; the offline heuristic is only used when select.offline_fallback is on.
 """
 from __future__ import annotations
 
@@ -251,7 +252,7 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, force: bool = False,
     focus = load_focus(job_dir)
     if out.exists() and not force:
         sel = load_json(Selection, out)
-        # an offline pick is a stopgap: try Gemini again on the next run; a new focus note picks again
+        # an offline pick is a stopgap: try the AI again on the next run; a new focus note picks again
         if (sel.source == "gemini" or not _has_key()) and _same_focus(sel.focus, focus):
             return sel, describe(sel, cached=True)
 
@@ -266,14 +267,15 @@ def run(job_dir: Path, meta: VideoMeta, cfg: Config, *, force: bool = False,
         try:
             sel = _select_llm(t, meta, cfg.select, job_dir / CACHE_DIR, report, refresh=force, info=info, marks=marks,
                               focus=focus)
-        except Exception as e:  # noqa: BLE001  (any LLM failure -> offline fallback)
+        except Exception as e:  # noqa: BLE001
             from common.llm import LLMError
-            if not cfg.select.offline_fallback:
-                raise
             reason = str(e) if isinstance(e, LLMError) else f"{type(e).__name__}: {e}"
-            report(None, f"Gemini failed ({reason}); using offline picks")
+            if not cfg.select.offline_fallback:
+                raise LLMError(f"No AI could pick the moments ({reason}). Retry in a while, or add another API "
+                               "key (GEMINI_API_KEY_2, NVIDIA_API_KEY) to .env") from None
+            report(None, f"Every AI failed ({reason}); using offline picks")
             sel = select_heuristic(t, cfg.select, heat_fn=heat_fn(info, cfg.select), sig=sig, marks=marks)
-            sel.note = f"Gemini unavailable: {reason}. These are rough offline picks; Retry later for AI picks."
+            sel.note = f"AI unavailable: {reason}. These are rough offline picks; Retry later for AI picks."
             if focus:
                 sel.note += " Your focus note needs the AI: it applies on the retry."
     sel.focus = focus
@@ -341,7 +343,7 @@ def describe(sel: Selection, cached: bool = False) -> str:
             hits = sum(bool(c.focus_match) for c in sel.clips)
             msg += f" · {hits} match{'es' * (hits != 1)} your focus"
     else:
-        msg = f"{n} offline pick{'s' * (n != 1)} (Gemini unavailable)"
+        msg = f"{n} offline pick{'s' * (n != 1)} (AI unavailable)"
     return msg + (" · cached" if cached else "")
 
 
@@ -364,8 +366,8 @@ def _audio(job_dir: Path, t: Transcript, sc: SelectCfg, force: bool,
 
 
 def _has_key() -> bool:
-    import os
-    return bool(os.getenv("GEMINI_API_KEY", "").strip())
+    from common.llm import any_key_set
+    return any_key_set()
 
 
 # ---------------------------------------------------------------- Gemini
@@ -431,7 +433,7 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
     calls = 0
     for i, win in enumerate(windows):
         span = f"{_mmss(win[0].start)}–{_mmss(win[-1].end)}"
-        report(i / (len(windows) + sc.refine), f"Asking Gemini about {span} ({i + 1}/{len(windows)})…")
+        report(i / (len(windows) + sc.refine), f"Asking the AI about {span} ({i + 1}/{len(windows)})…")
         prompt = PROMPT.format(
             title=meta.title, channel=channel, about=about, part=i + 1, parts=len(windows), span=span,
             heat_note=_notes(heat, marks), lines="\n".join(_line(s, heat, marks) for s in win),
@@ -458,6 +460,7 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
         clips, rejected = validate(raw, t.sentences, meta.duration, wide, heat, marks=marks, focus=focus)
         note = "Nothing matched your focus note, so these are the video's best moments instead."
     refined = False
+    refine_err = ""
     if sc.refine and clips:
         report(len(windows) / (len(windows) + 1), f"Editor pass: comparing {len(clips)} candidates…")
         try:
@@ -467,10 +470,11 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
             for k, v in rej2.items():
                 rejected[k] = rejected.get(k, 0) + v
         except Exception as e:  # noqa: BLE001  (first-pass picks are still good)
+            refine_err = str(e)
             report(None, f"Editor pass failed ({e}); keeping first-pass picks")
             clips = clips[:sc.max_clips]
     if note is None and sc.refine and not refined:
-        note = "Editor pass unavailable: first-pass picks"
+        note = "Editor pass unavailable: first-pass picks" + (f" ({refine_err[:300]})" if refine_err else "")
     return Selection(source="gemini", model=used_model, calls=calls, candidates=len(raw), rejected=rejected,
                      clips=clips, note=note)
 

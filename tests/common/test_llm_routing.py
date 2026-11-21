@@ -12,6 +12,9 @@ def cfg(tmp_path, monkeypatch):
     f = tmp_path / "llm.yaml"
     monkeypatch.setattr(llm, "CONFIG_FILE", f)
     monkeypatch.setattr(llm, "LOCAL_FILE", tmp_path / "llm.local.yaml")  # not the model picked in your Studio
+    for k in list(llm.os.environ):
+        if k.startswith(("GEMINI_API_KEY", "NVIDIA_API_KEY", "NV_KEY")):
+            monkeypatch.delenv(k)  # never fall back to a real provider from a test
     llm._cfg_cache.update(mtime=None, cfg=None)
 
     def write(text: str):
@@ -80,7 +83,7 @@ def fake_provider(monkeypatch):
         def __init__(self, cfg):
             pass
 
-        def generate(self, model, req):
+        def generate(self, model, req, key=None):
             asked.append(model)
             return json.dumps({"from": model})
 
@@ -116,3 +119,106 @@ providers:
     llm._cooldown["nvidia/deepseek"] = llm.time.monotonic() + 60
     assert llm.generate_json("pick moments", **call) == ({"from": "nemotron"}, "nemotron")
     assert fake_provider == ["nemotron", "deepseek"]
+
+
+@pytest.fixture
+def scripted(monkeypatch):
+    """Providers whose answers are scripted per "provider/model#key": an exception to raise, or a JSON answer."""
+    from common.llm_providers import Retryable
+    script: dict[str, object] = {}
+    asked: list[str] = []
+
+    def make(kind):
+        class P:
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def generate(self, model, req, key=None):
+                tag = f"{self.cfg.name}/{model}#{key}"
+                asked.append(tag)
+                r = script.get(tag, {"from": tag})
+                if isinstance(r, Exception):
+                    raise r
+                return json.dumps(r)
+        return P
+
+    monkeypatch.setitem(llm.KINDS, "openai", make("openai"))
+    monkeypatch.setitem(llm.KINDS, "gemini", make("gemini"))
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    llm._cooldown.clear()
+    return script, asked, Retryable
+
+
+TWO = """
+tasks:
+  shorts.select: {provider: nvidia}
+providers:
+  gemini: {kind: gemini, api_key_env: GEMINI_API_KEY, min_interval_s: 0}
+  nvidia: {kind: openai, base_url: https://example.test/v1, api_key_env: NV_KEY, models: [nemo, deep], min_interval_s: 0}
+"""
+
+
+def test_falls_back_to_the_other_provider_when_one_fails(cfg, scripted, monkeypatch):
+    script, asked, Retryable = scripted
+    monkeypatch.setenv("NV_KEY", "n1")
+    monkeypatch.setenv("GEMINI_API_KEY", "g1")
+    cfg(TWO)
+    script["nvidia/nemo#n1"] = Retryable("model retired (HTTP 410)", switch_model=True)
+    script["nvidia/deep#n1"] = Retryable("HTTP 503", overloaded=True)
+    data, model = llm.generate_json("x", {"type": "OBJECT"}, models=["gem-a"], task="shorts.select", max_retries=1)
+    assert model == "gem-a" and data == {"from": "gemini/gem-a#g1"}
+    assert asked == ["nvidia/nemo#n1", "nvidia/deep#n1", "nvidia/deep#n1", "gemini/gem-a#g1"]
+    # the retired model cools down: the next call doesn't ask it again
+    asked.clear()
+    llm.generate_json("y", {"type": "OBJECT"}, models=["gem-a"], task="shorts.select", max_retries=1)
+    assert "nvidia/nemo#n1" not in asked
+
+
+def test_a_second_key_is_tried_on_quota_and_a_refused_key_is_skipped(cfg, scripted, monkeypatch):
+    script, asked, Retryable = scripted
+    monkeypatch.setenv("GEMINI_API_KEY", "g1")
+    monkeypatch.setenv("GEMINI_API_KEY_2", "g2")
+    cfg("default: {provider: gemini}\nfallback: none\n")
+    script["gemini/gem-a#g1"] = Retryable("rate limited (daily quota used up)", switch_model=True)
+    _, model = llm.generate_json("x", {"type": "OBJECT"}, models=["gem-a", "gem-b"])
+    assert asked == ["gemini/gem-a#g1", "gemini/gem-a#g2"] and model == "gem-a"
+
+    llm._cooldown.clear()
+    asked.clear()
+    script["gemini/gem-a#g1"] = Retryable("API key refused (HTTP 403)", switch_model=True, bad_key=True)
+    script["gemini/gem-a#g2"] = Retryable("HTTP 503", overloaded=True)
+    script["gemini/gem-b#g2"] = Retryable("HTTP 503", overloaded=True)
+    with pytest.raises(LLMError, match="gem-b"):
+        llm.generate_json("y", {"type": "OBJECT"}, models=["gem-a", "gem-b"], max_retries=0)
+    assert "gemini/gem-b#g1" not in asked  # the refused key isn't tried with the next model
+
+
+def test_fallback_needs_a_key_and_can_be_turned_off(cfg, monkeypatch):
+    monkeypatch.setenv("NV_KEY", "n1")
+    cfg(TWO)
+    assert [p.name for p, _ in llm._chain("shorts.select", False, ["gem-a"])] == ["nvidia"]  # no Gemini key
+    monkeypatch.setenv("GEMINI_API_KEY", "g1")
+    assert [p.name for p, _ in llm._chain("shorts.select", False, ["gem-a"])] == ["nvidia", "gemini"]
+    assert llm._chain("shorts.select", True, ["gem-a"])[0][0].name == "nvidia"  # (media goes by its own route)
+    cfg(TWO + "fallback: none\n")
+    assert [p.name for p, _ in llm._chain("shorts.select", False, ["gem-a"])] == ["nvidia"]
+
+
+def test_http_410_and_refused_keys_switch_at_once():
+    import io
+    import urllib.error
+    from common import llm_providers as lp
+
+    def boom(code, body=b"{}"):
+        def opener(*a, **k):
+            raise urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(body))
+        return opener
+
+    for code, attr in ((410, "switch_model"), (401, "bad_key"), (403, "bad_key")):
+        lp.urllib.request.urlopen, orig = boom(code), lp.urllib.request.urlopen
+        try:
+            with pytest.raises(lp.Retryable) as e:
+                lp._post("http://x", {}, {}, 5, "t")
+            assert getattr(e.value, attr)
+        finally:
+            lp.urllib.request.urlopen = orig
