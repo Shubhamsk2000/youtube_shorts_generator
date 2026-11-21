@@ -1,7 +1,7 @@
 import { useMemo, useState, type KeyboardEvent } from "react";
 import {
   Check, CheckCheck, CircleAlert, Clock, Copy, Crop, Download, FileArchive, Flame, FolderOpen, LoaderCircle, Pencil,
-  RefreshCw, Sparkles, Square, Undo2, X,
+  Play, RefreshCw, Sparkles, Square, Undo2, X,
 } from "lucide-react";
 import { useConfirm, useToast } from "@kit/feedback";
 import { Kbd, Select } from "@kit/ui";
@@ -378,9 +378,7 @@ function ClipCard({ clip: c, ex, outdated, onSeek, onReview, onExport, onEdit, e
       <div className="relative aspect-[9/16] bg-black">
         {c.ready && c.url ? (
           <Link to={editHref} className="group absolute inset-0 block" title="Open the editor: framing, window shape, hook" tabIndex={-1}>
-            <video src={`${c.url}#t=0.1`} muted loop preload="metadata" playsInline className="absolute inset-0 size-full"
-              onMouseEnter={(e) => { e.currentTarget.play().catch(() => {}); }}
-              onMouseLeave={(e) => { e.currentTarget.pause(); }} />
+            <CardPreview url={c.url} thumb={c.thumb_url ?? null} />
             <span className="pointer-events-none absolute inset-x-0 bottom-3 mx-auto flex w-fit items-center gap-1.5 rounded-lg bg-black/70 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 backdrop-blur transition group-hover:opacity-100 group-focus-visible:opacity-100">
               <Crop className="size-3.5" /> Open editor
             </span>
@@ -550,6 +548,28 @@ function Empty({ failed }: { failed: boolean }) {
             : "Once the transcript is ready, the AI picks the moments worth posting. Each clip shows its score, the hook and why it was picked, ready for you to approve."}
         </p>
       </div>
+    </div>
+  );
+}
+
+/** A still of the preview; the video is only loaded while the card is hovered (or focused), and released after.
+ * A video per card would hold one of the browser's 6 connections each and stall the rest of the app. */
+function CardPreview({ url, thumb }: { url: string; thumb: string | null }) {
+  const [hover, setHover] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  return (
+    <div className="absolute inset-0" onMouseEnter={() => setHover(true)} onMouseLeave={() => { setHover(false); setPlaying(false); }}
+      onFocus={() => setHover(true)} onBlur={() => { setHover(false); setPlaying(false); }}>
+      {thumb ? (
+        <img src={thumb} alt="" loading="lazy" decoding="async" draggable={false}
+          className={cx("absolute inset-0 size-full object-cover transition-opacity duration-200", playing && "opacity-0")} />
+      ) : !hover && (
+        <div className="absolute inset-0 grid place-items-center bg-black"><Play className="size-6 text-white/40" /></div>
+      )}
+      {hover && (
+        <video src={url} muted loop autoPlay playsInline preload="auto" onPlaying={() => setPlaying(true)}
+          className="absolute inset-0 size-full" />
+      )}
     </div>
   );
 }

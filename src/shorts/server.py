@@ -565,6 +565,31 @@ class Worker:
             self.current = None
 
 
+THUMBS_DIR = "thumbs"
+_thumb_lock = threading.Lock()
+
+
+def _thumb(job_dir: Path, preview: Path) -> Path:
+    """A small JPEG of the preview (a frame ~1 s in), cached by the preview's file name."""
+    out = job_dir / THUMBS_DIR / (preview.stem + ".jpg")
+    if out.exists():
+        return out
+    with _thumb_lock:  # a page asks for every card's at once: one ffmpeg at a time
+        if out.exists():
+            return out
+        out.parent.mkdir(exist_ok=True)
+        clip_id = preview.stem.split("-")[0]
+        for old in out.parent.glob(f"{clip_id}-*.jpg"):  # an earlier render of this clip
+            old.unlink(missing_ok=True)
+        tmp = out.with_name(out.stem + ".tmp.jpg")
+        for at in ("1.0", "0"):  # a very short clip: its first frame
+            ffmpeg.run(["-ss", at, "-i", str(preview), "-frames:v", "1", "-vf", "scale=360:-2:out_range=full,format=yuvj420p", "-q:v", "4", str(tmp)])
+            if tmp.exists() and tmp.stat().st_size:
+                break
+        tmp.replace(out)
+        return out
+
+
 def _friendly(e: BaseException) -> str:
     """One readable line (plus the tool's own message) instead of a bare exception name."""
     msg = (str(e) or "").strip()
@@ -962,6 +987,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             clips.append({**c.model_dump(), "duration": round(c.duration, 2),
                           "review": reviews.get(c.id), "ready": ready,
                           "url": f"/api/shorts/jobs/{job_id}/clips/{c.id}/video?v={f[-10:-4]}" if ready else None,
+                          "thumb_url": f"/api/shorts/jobs/{job_id}/clips/{c.id}/thumb?v={f[-10:-4]}" if ready else None,
                           "final_url": f"/api/shorts/jobs/{job_id}/clips/{c.id}/final?v={hd.stem[-6:]}" if hd.exists() else None,
                           "upload_text": exporter.upload_text(c, meta) if meta else ""})
         return {"source": sel.source, "model": sel.model, "note": sel.note, "candidates": sel.candidates,
@@ -979,6 +1005,24 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             raise HTTPException(404, "Preview not rendered yet")
         return FileResponse(f, media_type="video/mp4",
                             filename=f"{clip.rank:02d}-{_slug(clip.title)}.mp4", content_disposition_type="inline")
+
+    @router.get("/jobs/{job_id}/clips/{clip_id}/thumb")
+    async def get_clip_thumb(job_id: str, clip_id: str):
+        """A still of the rendered preview for the clip cards (made once per render): a card shows this, and only
+        loads the video while you hover it, so a page of clips doesn't open a video connection per card."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        if not (d / select.OUT).exists():
+            raise HTTPException(404, "No clips")
+        clip = next((c for c in load_json(Selection, d / select.OUT).clips if c.id == clip_id), None)
+        f = d / render.CLIPS_DIR / render.clip_file(d, clip, load_config(cfg_path)) if clip else None
+        if not f or not f.exists():
+            raise HTTPException(404, "Preview not rendered yet")
+        try:
+            thumb = await run_in_threadpool(_thumb, d, f)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Couldn't make the thumbnail: {_friendly(e)}") from None
+        return FileResponse(thumb, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=604800"})
 
     @router.put("/jobs/{job_id}/clips/{clip_id}/review")
     def set_review(job_id: str, clip_id: str, body: ReviewBody):
@@ -1262,10 +1306,16 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         d = cfg.workspace() / job_id
         _, clip = clip_or_404(d, clip_id)
         meta = meta_or_409(d)
-        try:
-            await run_in_threadpool(editor.ensure_proxy, d, meta, clip, load_config(cfg_path))
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(500, f"Couldn't prepare the editor video: {_friendly(e)}") from None
+        live = load_config(cfg_path)
+
+        def build():
+            try:
+                editor.ensure_proxy(d, meta, clip, live)
+            except Exception as e:  # noqa: BLE001  (opening that clip shows the error)
+                joblog.log(d, f"Couldn't prepare the editor video of clip {clip.id}: {_friendly(e)}", "warn", "render")
+
+        # answered at once: a request held open for the whole encode takes one of the browser's 6 connections
+        threading.Thread(target=build, daemon=True, name=f"proxy-{clip.id}").start()
 
     @router.put("/jobs/{job_id}/clips/{clip_id}/framing")
     def set_framing(job_id: str, clip_id: str, body: FramingBody):
