@@ -33,7 +33,9 @@ sentences:
 
 select:                     # "Find moments" (Gemini free tier)
   model: gemini-3.8-flash
-  fallback_models: [gemini-3.6-flash, gemini-3.5-flash-lite]  # used on 503 / daily quota
+  # used on 503 / daily quota. Tested 2026-11-21 on a real 20-min window: 3.x flash models are often overloaded (503)
+  # on the free tier; 2.5-flash answered (51 s, 10 picks); 3.5-flash-lite is fast but finds few moments
+  fallback_models: [gemini-3.7-flash, gemini-2.5-flash, gemini-3.6-flash, gemini-3.5-flash-lite]
   window_min: 20            # transcript sent in ~20 min windows (one call each)
   overlap_min: 2
   min_clip_s: 15

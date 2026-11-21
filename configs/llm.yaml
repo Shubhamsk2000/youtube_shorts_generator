@@ -47,8 +47,11 @@ providers:
     base_url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
     # every model listed here shows up in Studio's model picker (Clips panel); the first is the default
-    # (deepseek-ai/deepseek-v4.1-flash was retired by NVIDIA: HTTP 410)
-    models: [nvidia/nemotron-3.5-super-vl-120b-a12b, mistralai/mistral-large-4-1t-a52b]
+    # Tested 2026-11-21 on a real 20-min window (180 s limit): nemotron-3.5-super 94 s / 13 picks, minimax-m3.1-flash
+    # 65 s / 20 picks, nemotron-3-ultra 150 s / 14 picks (best scores, but close to the time limit). Timed out:
+    # mistral-large-4, kimi-k3.1-pro, glm-5.3-flash, step-5-preview, gemma-4-31b, muse-glimmer-30b.
+    # Retired (HTTP 410): deepseek-v4.1-flash.
+    models: [nvidia/nemotron-3.5-super-vl-120b-a12b, minimaxai/minimax-m3.1-flash, nvidia/nemotron-3-ultra-550b-a55b]
     min_interval_s: 2
 
   # OpenRouter: one key, many models (some free, ids ending in :free).
