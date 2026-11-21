@@ -118,3 +118,8 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .shimmer, .progress-stripe, .fade-in { animation: none; }
 }
+
+/* the Pipeline console */
+.console-scroll { scrollbar-width: thin; scrollbar-color: rgb(255 255 255 / 0.14) transparent; }
+.console-scroll::-webkit-scrollbar { width: 8px; }
+.console-scroll::-webkit-scrollbar-thumb { background: rgb(255 255 255 / 0.12); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
