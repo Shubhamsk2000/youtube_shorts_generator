@@ -228,7 +228,7 @@ export function Stage({ d, video, win, faces, cams, keepCam, camCustom, onBegin,
             {split && "gameplay "}{aspectLabel(win.a, d)}{win.manual ? (win.follow ? (split ? " · auto position" : " · follows faces") : "") : " · auto"}
           </span>
         )}
-        {(["l", "r"] as const).map((m) => (
+        {!win.cam?.sized && (["l", "r"] as const).map((m) => (
           <div key={m}
             onPointerDown={(e) => start(e, m)} onPointerMove={move} onPointerUp={end} onPointerCancel={end}
             title="Drag to make the window wider or narrower (Shift: no snapping)"

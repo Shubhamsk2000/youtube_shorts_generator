@@ -71,11 +71,12 @@ def view(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config) -> dict:
         "src_h": meta.height,
         "analysed": auto is not None,
         "shots": [{"start": s.start, "end": s.end, "mode": s.mode, "why": s.why, "x": s.x, "cams": s.cams,
-                   "cam_view": cam_view(s, meta, rc)} for s in shots],
+                   "face_x": s.face_x, "face_y": s.face_y, "cam_view": cam_view(s, meta, rc)} for s in shots],
         "faces": [{"f": s.f, "faces": [f[:4] for f in s.faces]} for s in (auto.samples if auto else [])],
         "keys": [k.model_dump() for k in fr.keys] if fr else [],
         "keep_cam": fr.keep_cam if fr else True,
         "cam": fr.cam.model_dump() if fr and fr.cam else None,
+        "split": fr.split.model_dump() if fr and fr.split else None,
         "keep": keep if cfg.pacing.enabled else None,
         "flash": flash,
         "layout": {
@@ -208,10 +209,11 @@ def apply_trim(job_dir: Path, meta: VideoMeta, old: Clip, new: Clip) -> int:
 
 
 def save_keys(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config, keys: list[framing.Key],
-              keep_cam: bool = True, cam: framing.CamBox | None = None) -> framing.Framing:
+              keep_cam: bool = True, cam: framing.CamBox | None = None,
+              split: framing.SplitSize | None = None) -> framing.Framing:
     cfg = with_job_layout(cfg, job_dir)
     auto = framing.analysis(job_dir, c, cfg)
     fr = framing.Framing(keys=framing.clean(keys, n_frames(auto, meta, c), meta.width, meta.height),
-                         keep_cam=keep_cam, cam=framing.clean_cam(cam))
+                         keep_cam=keep_cam, cam=framing.clean_cam(cam), split=framing.clean_split(split))
     framing.save(job_dir, c, fr)
     return fr

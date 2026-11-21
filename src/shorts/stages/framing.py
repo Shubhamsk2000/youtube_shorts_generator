@@ -46,14 +46,27 @@ class CamBox(BaseModel):
     h: float  # height, fraction of the source height
 
 
+class SplitSize(BaseModel):
+    """Window sizes of the cam-on-top layout (whole clip), fractions of the output: each window stays centred
+    in its place; what it doesn't cover shows the blurred background."""
+    cam_h: float           # cam panel height, of the output height (the gameplay area is the rest)
+    cam_w: float = 1.0     # cam window width, of the output width
+    game_w: float = 1.0    # gameplay window width, of the output width
+    game_h: float = 1.0    # gameplay window height, of the area under the cam panel
+
+
+SPLIT_LIMITS = {"cam_h": (0.10, 0.70), "cam_w": (0.25, 1.0), "game_w": (0.25, 1.0), "game_h": (0.25, 1.0)}
+
+
 class Framing(BaseModel):
     keys: list[Key] = []
     keep_cam: bool = True  # facecam shots: the keys set only the gameplay window, the cam stays
     cam: CamBox | None = None  # facecam frame set in the editor (None = the automatic cam crop)
+    split: SplitSize | None = None  # window sizes of the cam-on-top layout (None = the automatic layout)
 
     @property
     def empty(self) -> bool:
-        return not self.keys and self.cam is None
+        return not self.keys and self.cam is None and self.split is None
 
 
 def framing_path(job_dir: Path, clip: Clip) -> Path:
@@ -113,6 +126,12 @@ def clean_cam(cam: CamBox | None) -> CamBox | None:
     return CamBox(x=round(min(max(cam.x, 0.0), 1.0), 4), y=round(min(max(cam.y, 0.0), 1.0), 4), h=h)
 
 
+def clean_split(sz: SplitSize | None) -> SplitSize | None:
+    if sz is None:
+        return None
+    return SplitSize(**{k: round(min(max(getattr(sz, k), lo), hi), 4) for k, (lo, hi) in SPLIT_LIMITS.items()})
+
+
 def _ease(t: float) -> float:
     return t * t * (3 - 2 * t)  # smoothstep: no sudden start or stop between keys
 
@@ -148,11 +167,14 @@ def apply(plan: ReframePlan, fr: Framing | None) -> ReframePlan:
         return plan
     keys = sorted(fr.keys, key=lambda k: k.f)
     box = [fr.cam.x, fr.cam.y, fr.cam.h] if fr.cam else []
+    sizes = [fr.split.cam_h, fr.split.cam_w, fr.split.game_w, fr.split.game_h] if fr.split else []
     shots: list[Shot] = []
     last = len(plan.shots) - 1
     for n, s in enumerate(plan.shots):
         if box and s.mode == "split" and s.cams:
             s = s.model_copy(update={"cam_box": box})
+        if sizes and s.mode == "split" and s.cams:
+            s = s.model_copy(update={"split": sizes})
         end = max(s.end, keys[-1].f + 1) if keys and n == last else s.end  # keys past the analysed frames
         mine = [k for k in keys if s.start <= k.f < end]
         if not mine:

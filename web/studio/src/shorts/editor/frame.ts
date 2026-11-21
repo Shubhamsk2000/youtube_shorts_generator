@@ -1,5 +1,5 @@
 /** Window math for the clip editor. Mirrors src/shorts/stages/framing.py so the live preview matches the render. */
-import type { CamBox, CamView, EditorData, EditorShot, FrameKey } from "../api";
+import type { CamBox, CamView, EditorData, EditorShot, FrameKey, SplitSize } from "../api";
 
 export const FILL = 9 / 16;
 
@@ -116,7 +116,7 @@ export function camAspect(cv: CamView, d: Pick<EditorData, "layout">) {
   if (!t) return 16 / 9;
   const W = d.layout.out_w;
   const H = d.layout.out_h;
-  return cv.pip ? (t.dst[2] * W) / Math.max(1, t.dst[3] * H) : W / Math.max(1, t.dst[3] * H);
+  return cv.pip || cv.sized ? (t.dst[2] * W) / Math.max(1, t.dst[3] * H) : W / Math.max(1, t.dst[3] * H);
 }
 
 /** The facecam frame as a source box [x0, y0, x1, y1] (fractions), in the slot's shape, inside the frame.
@@ -142,6 +142,80 @@ export function withCamBox(cv: CamView, b: CamBox | null, d: EditorData): CamVie
   const src = camBoxSrc(b, camAspect(cv, d), d);
   const dst = cv.pip ? cv.tiles[0].dst : [0, 0, 1, cv.tiles[0].dst[3]];
   return { ...cv, tiles: [{ src, dst }] };
+}
+
+/** Limits of the layout sizes (mirror framing.SPLIT_LIMITS). */
+export const SPLIT_LIMITS: Record<keyof SplitSize, [number, number]> = {
+  cam_h: [0.1, 0.7], cam_w: [0.25, 1], game_w: [0.25, 1], game_h: [0.25, 1],
+};
+
+/** Largest sub-box of (x0, y0, x1, y1) with width/height = aspect, centred on (fx, fy) where possible
+ * (pixels). Mirrors reframe.crop_to_aspect. */
+function cropToAspect(x0: number, y0: number, x1: number, y1: number, aspect: number, fx: number, fy: number) {
+  const w = x1 - x0;
+  const h = y1 - y0;
+  if (w / h > aspect) {
+    const nw = h * aspect;
+    const left = clamp(x0 + fx * w - nw / 2, x0, x1 - nw);
+    return [left, y0, left + nw, y1];
+  }
+  const nh = w / aspect;
+  const top = clamp(y0 + fy * h - nh / 2, y0, y1 - nh);
+  return [x0, top, x1, top + nh];
+}
+
+/** Centre x (fraction) of the automatic gameplay crop of shape `aspect`: as central as possible, shifted off the
+ * cam. Mirrors reframe.screen_crop. */
+export function screenCropX(cams: number[][], aspect: number, d: Pick<EditorData, "src_w" | "src_h">): number {
+  const sw = d.src_w;
+  const sh = d.src_h;
+  const cw = Math.min(sw, Math.round(sh * aspect));
+  let best = (sw - cw) / 2;
+  let bestCost = Infinity;
+  for (let i = 0; i <= 20; i++) {
+    const shift = -0.25 + i * 0.025;
+    const left = clamp(Math.round((0.5 + shift) * sw - cw / 2), 0, sw - cw);
+    const overlap = cams.reduce((t, c) => t + Math.max(0, Math.min(left + cw, c[2] * sw) - Math.max(left, c[0] * sw)), 0);
+    const cost = overlap * 4 + Math.abs(shift) * sw;
+    if (cost < bestCost) { best = left; bestCost = cost; }
+  }
+  return (best + cw / 2) / sw;
+}
+
+/** The cam-on-top layout with window sizes from the editor: the cam window centred in the panel, the
+ * gameplay window centred under it, each crop in its window's shape. Mirrors render._sized_geometry. */
+export function withSizes(cv: CamView, s: EditorShot, b: CamBox | null, sz: SplitSize, d: EditorData): CamView {
+  const W = d.layout.out_w;
+  const H = d.layout.out_h;
+  const panel = sz.cam_h;
+  const tw = sz.cam_w;
+  const tx = (1 - tw) / 2;
+  const areaH = 1 - panel;
+  const gw = sz.game_w;
+  const gh = sz.game_h * areaH;
+  let tiles: CamView["tiles"];
+  if (b || !s.cams.length) {
+    const aspect = (tw * W) / Math.max(1, panel * H);
+    tiles = b ? [{ src: camBoxSrc(b, aspect, d), dst: [tx, 0, tw, panel] }] : [];
+  } else {
+    const n = s.cams.length;
+    tiles = s.cams.map((c, k) => {
+      const wk = tw / n;
+      const aspect = (wk * W) / Math.max(1, panel * H);
+      const ix = 0.015 * (c[2] - c[0]);
+      const iy = 0.015 * (c[3] - c[1]);
+      const fx = s.face_x?.[k] ?? 0.5;
+      const fy = Math.max(0, (s.face_y?.[k] ?? 0.45) - 0.12);
+      const [a, bb, cc, dd] = cropToAspect((c[0] + ix) * d.src_w, (c[1] + iy) * d.src_h, (c[2] - ix) * d.src_w,
+        (c[3] - iy) * d.src_h, aspect, fx, fy);
+      return { src: [a / d.src_w, bb / d.src_h, cc / d.src_w, dd / d.src_h], dst: [tx + k * wk, 0, wk, panel] };
+    });
+  }
+  return {
+    ...cv, area: [panel, areaH], tiles, sized: true, game: [(1 - gw) / 2, panel + (areaH - gh) / 2, gw, gh],
+    screen_a: (gw * W) / Math.max(1, gh * H),
+    screen_x: screenCropX(s.cams, (gw * W) / Math.max(1, gh * H), d),
+  };
 }
 
 /** Insert or replace the key on frame f. */

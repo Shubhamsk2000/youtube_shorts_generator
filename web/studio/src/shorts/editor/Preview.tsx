@@ -59,6 +59,20 @@ function drawCamLayout(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, d
   const cv = win.cam!;
   const vw = video.videoWidth;
   const vh = video.videoHeight;
+  if (cv.sized && cv.game) {  // window sizes from the editor: each window centred over a blurred fill
+    blurFill(ctx, video, d, 0, 0, W, H);
+    for (const { src, dst } of cv.tiles) {
+      ctx.drawImage(video, src[0] * vw, src[1] * vh, (src[2] - src[0]) * vw, (src[3] - src[1]) * vh,
+        dst[0] * W, dst[1] * H, dst[2] * W, dst[3] * H);
+    }
+    const [gx, gy, gw, gh] = [cv.game[0] * W, cv.game[1] * H, cv.game[2] * W, cv.game[3] * H];
+    const e = gw / Math.max(1, gh);
+    const cw = Math.min(vw, vh * e);
+    const ch = Math.min(vh, cw / e);
+    const left = clamp(win.x * vw - cw / 2, 0, vw - cw);
+    ctx.drawImage(video, left, (vh - ch) / 2, cw, ch, gx, gy, gw, gh);
+    return;
+  }
   const top = cv.area[0] * H;
   const ah = cv.area[1] * H;
   const e = Math.max(win.a, W / ah);

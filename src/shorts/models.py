@@ -151,6 +151,9 @@ class Shot(BaseModel):
     face_x: list[float] = []       # split: face centre x inside each cam
     cam_box: list[float] = []      # split: facecam crop set in the editor [cx, cy, h] (fractions of the source);
                                    # replaces the automatic cam crop(s), its width follows the cam slot's shape
+    split: list[float] = []        # split: window sizes set in the editor [cam_h, cam_w, game_w, game_h]: the cam
+                                   # panel's height (of the output) and the cam window's width (centred in it);
+                                   # the gameplay window's width and height (of the area under the panel, centred)
 
 
 class ReframePlan(BaseModel):
