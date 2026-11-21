@@ -6,17 +6,24 @@ import { Card, CardHeader, ProgressBar } from "./ui";
 /** `skew`: server clock minus browser clock (ms), so elapsed times are right even if the clocks differ. */
 export function Pipeline({ stages, title = "Pipeline", skew = 0 }: { stages: Stage[]; title?: string; skew?: number }) {
   const pct = Math.floor(stagesProgress(stages) * 100);
-  const running = stages.some((s) => s.status === "running");
-  const now = useNow(1000, running) + skew;
   return (
     <Card>
       <CardHeader title={title} aside={<span className="font-mono" title="Weighted by how long each step usually takes">{pct}%</span>} />
-      <ol className="px-5 py-4">
-        {stages.map((s, i) => (
-          <StageRow key={s.key} stage={s} last={i === stages.length - 1} now={now} />
-        ))}
-      </ol>
+      <PipelineSteps stages={stages} skew={skew} />
     </Card>
+  );
+}
+
+/** The steps alone (for a card that adds its own header). */
+export function PipelineSteps({ stages, skew = 0 }: { stages: Stage[]; skew?: number }) {
+  const running = stages.some((s) => s.status === "running");
+  const now = useNow(1000, running) + skew;
+  return (
+    <ol className="px-5 py-4">
+      {stages.map((s, i) => (
+        <StageRow key={s.key} stage={s} last={i === stages.length - 1} now={now} />
+      ))}
+    </ol>
   );
 }
 

@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import export as exporter
-from . import editor, health, pipeline, settings
+from . import editor, health, joblog, pipeline, settings
 from common import ffmpeg
 from common.paths import DATA_DIR, resolve
 from common.sysinfo import free_disk_gb
@@ -87,6 +87,14 @@ class JobCancelled(Exception):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+_LABELS = {s.key: s.label for s in pipeline.STAGES}
+
+
+def _dur(secs: float) -> str:
+    secs = int(round(secs))
+    return f"{secs // 60}m {secs % 60:02d}s" if secs >= 60 else f"{secs}s"
 
 
 def _fresh_stages() -> list[StageState]:
@@ -267,6 +275,26 @@ class StoreHooks(Hooks):
     def __init__(self, store: JobStore, job_id: str, cancelled=lambda: False):
         self.store, self.job_id, self.cancelled = store, job_id, cancelled
         self._t0: dict[str, float] = {}
+        self.dir = store.cfg.workspace() / job_id
+        # a step that finishes at once (reused from disk) is one log line, not "started" + "done in 0s":
+        # its "started" line (and the progress said so far) is only written once it has run for a moment
+        self._held: dict[str, list[str]] = {}
+        self._timers: dict[str, threading.Timer] = {}
+        self._hold_lock = threading.Lock()
+
+    def _release(self, stage: str) -> None:
+        with self._hold_lock:
+            held = self._held.pop(stage, None)
+            if (t := self._timers.pop(stage, None)) is not None:
+                t.cancel()
+        if held is None:
+            return
+        self.log(f"{_LABELS.get(stage, stage)} started", "info", stage)
+        for m in held:
+            joblog.progress(self.dir, stage, m)
+
+    def log(self, msg: str, level: str = "info", stage: str | None = None) -> None:
+        joblog.log(self.dir, msg, level, stage)
 
     def _check(self) -> None:
         if self.cancelled():
@@ -277,10 +305,29 @@ class StoreHooks(Hooks):
         self._t0[stage] = time.monotonic()
         self.store.update(self.job_id, stage=stage, status="running", progress=None, eta_s=None,
                           message=None, started_at=_now(), finished_at=None)
+        with self._hold_lock:
+            self._held[stage] = []
+            t = threading.Timer(1.5, self._release, (stage,))
+            t.daemon = True
+            self._timers[stage] = t
+        t.start()
 
     def stage_done(self, stage: str, message: str | None = None) -> None:
         self.store.update(self.job_id, stage=stage, status="done", progress=1.0, eta_s=None,
                           message=message, finished_at=_now())
+        with self._hold_lock:
+            held = self._held.pop(stage, None)
+            if (t := self._timers.pop(stage, None)) is not None:
+                t.cancel()
+        label = _LABELS.get(stage, stage)
+        if held is not None:  # done at once: one line; only problems said on the way are kept
+            for m in held:
+                if joblog.level_of(m) != "info":
+                    joblog.progress(self.dir, stage, m)
+            self.log(f"{label}: {message or 'done'}", "ok", stage)
+            return
+        took = f" in {_dur(time.monotonic() - self._t0[stage])}" if stage in self._t0 else ""
+        self.log(f"{label} done{took}" + (f" · {message}" if message else ""), "ok", stage)
         if stage == "download":
             meta = load_json(VideoMeta, self.store.cfg.workspace() / self.job_id / download.META)
             self.store.update(self.job_id, width=meta.width, height=meta.height, fps=meta.fps,
@@ -296,6 +343,12 @@ class StoreHooks(Hooks):
             fields["eta_s"] = round(el * (1 - f) / f) if f is not None and f >= 0.03 and el >= 5 else None
             if message:
                 fields["message"] = message
+                with self._hold_lock:
+                    held = self._held.get(stage)
+                    if held is not None:
+                        held.append(message)
+                if held is None:
+                    joblog.progress(self.dir, stage, message)
             self.store.update(self.job_id, stage=stage, force_save=False, **fields)
         return report
 
@@ -310,6 +363,9 @@ class Worker:
         self._again: set[str] = set()        # a clip changed while the job was rendering: run once more after
         self._cancel_export: set[str] = set()
 
+    def _log(self, job_id: str, msg: str, level: str = "info", stage: str | None = None) -> None:
+        joblog.log(self.store.cfg.workspace() / job_id, msg, level, stage)
+
     def submit(self, job_id: str) -> None:
         self._cancel.discard(job_id)
         self.runner.drop("shorts", job_id, "pipeline")  # already waiting: keep one queued run, not two
@@ -322,6 +378,7 @@ class Worker:
         job = self.store.get(job_id)
         if job and (job.status == "running" or self.current == job_id):
             self._again.add(job_id)
+            self._log(job_id, "A clip changed: it renders again when this run finishes")
             return
         self.store.update(job_id, stage="render", status="pending", progress=None, eta_s=None, message=None,
                           started_at=None, finished_at=None)
@@ -340,6 +397,7 @@ class Worker:
         if job.status in ("queued", "running"):
             self._cancel.add(job_id)
             self.store.update(job_id, stopping=True)
+            self._log(job_id, "Stop requested: stopping at the next checkpoint", "warn")
             return "stopping"
         return "idle"
 
@@ -355,6 +413,7 @@ class Worker:
                 self.store.update(job_id)
             return "stopped"
         self._cancel_export.add(job_id)
+        self._log(job_id, "Export stop requested: stopping after the current clip", "warn", "export")
         with self.store.lock:
             self.store.jobs[job_id].export.queue = []
             self.store.jobs[job_id].export.message = "Cancelling after this step…"
@@ -368,6 +427,8 @@ class Worker:
             self.store.update(job_id, stage=running.key, status="pending", progress=None, eta_s=None,
                               message="Stopped: resume to continue from here", finished_at=None)
         self.store.update(job_id, status="interrupted", error=None, stopping=False)
+        self._log(job_id, "Stopped" + (f" during {running.label}" if running else "") + ": finished steps are kept, Resume continues",
+                  "warn", running.key if running else None)
 
     def submit_export(self, job_id: str, clip_ids: list[str]) -> None:
         """Queue clips for HD export; clicks while an export runs are added to the same queue."""
@@ -393,6 +454,9 @@ class Worker:
         with store.lock:
             ex().status = "running"
             store.update(job_id)
+            n_q = len(ex().queue)
+        self._log(job_id, f"HD export started: {n_q} clip{'s' * (n_q != 1)}", "info", "export")
+        t_start = time.monotonic()
         n_done = 0
         try:
             self.cfg = load_config(self.cfg_path)
@@ -407,6 +471,8 @@ class Worker:
                     left = len(ex().queue)
                     store.update(job_id)
 
+                self._log(job_id, f"Exporting clip {cid}" + (f" ({left} more queued)" if left else ""), "info", "export")
+
                 def report(fraction=None, message=None, left=left):
                     if job_id in self._cancel_export:
                         raise JobCancelled()
@@ -414,6 +480,7 @@ class Worker:
                         ex().progress = fraction
                         if message:
                             ex().message = message + (f" · {left} more queued" if left else "")
+                            joblog.progress(d, "export", message)
                     store.update(job_id, force_save=False)
 
                 with job_lock(d):
@@ -428,6 +495,8 @@ class Worker:
                 e.status, e.progress, e.current, e.finished_at = "done", 1.0, None, _now()
                 e.message = f"{n_done} clip{'s' * (n_done != 1)} exported"
                 store.update(job_id)
+            self._log(job_id, f"HD export done: {n_done} clip{'s' * (n_done != 1)} in {_dur(time.monotonic() - t_start)}"
+                      + (f" → {ex().dir}" if ex().dir else ""), "ok", "export")
         except Exception as err:
             cancelled = job_id in self._cancel_export
             if not cancelled:
@@ -438,6 +507,8 @@ class Worker:
                 e.message = (f"Export cancelled · {n_done} finished" if cancelled
                              else _friendly(err))
                 store.update(job_id)
+            self._log(job_id, e.message if cancelled else f"HD export failed: {_friendly(err)}",
+                      "warn" if cancelled else "error", "export")
         finally:
             self._cancel_export.discard(job_id)
             self.current = None
@@ -451,6 +522,9 @@ class Worker:
             return
         self.current = job_id
         self.store.update(job_id, status="running")
+        todo = [s.label for s in job.stages if s.status not in ("done", "planned")]
+        self._log(job_id, "Processing started" + (f": {', '.join(todo)}" if todo else ""))
+        t_start = time.monotonic()
         try:  # pick up configs/shorts.yaml edits without restarting the server
             self.cfg = load_config(self.cfg_path)
         except Exception as e:
@@ -463,6 +537,7 @@ class Worker:
                                   job.title, job.duration, job.is_youtube)
             pipeline.run(job.source, self.cfg, hooks, job=ref)
             self.store.update(job_id, status="done", stopping=False)
+            self._log(job_id, f"All done in {_dur(time.monotonic() - t_start)}", "ok")
             if job_id in self._again:  # an edit landed after the render had passed that clip
                 self._again.discard(job_id)
                 self.store.update(job_id, stage="render", status="pending", progress=None, eta_s=None,
@@ -470,10 +545,16 @@ class Worker:
                 self.submit(job_id)
         except Exception as e:
             if job_id in self._cancel:  # stopped (the stop may surface wrapped in another error)
+                for st in list(hooks._held):
+                    hooks._release(st)
                 self._mark_stopped(job_id)
                 return
             traceback.print_exc()
             running = next((s for s in self.store.get(job_id).stages if s.status == "running"), None)
+            if running:
+                hooks._release(running.key)  # what it said before failing
+            self._log(job_id, (f"{running.label} failed: " if running else "Failed: ") + _friendly(e), "error",
+                      running.key if running else None)
             if running:
                 self.store.update(job_id, stage=running.key, status="failed", eta_s=None, finished_at=_now(),
                                   message=_friendly(e))
@@ -706,6 +787,10 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
     def system():
         return health.summary(cfg)
 
+    def ulog(job_id: str, msg: str, level: str = "info", stage: str | None = None) -> None:
+        """Something you did (from the UI), in the project's log."""
+        joblog.log(cfg.workspace() / job_id, msg, level, stage)
+
     def view(job: JobState) -> JobView:
         d = cfg.workspace() / job.id
         return JobView(**job.model_dump(), stats=job_stats(d), progress=weighted_progress(job.stages),
@@ -739,6 +824,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         store.put(JobState(id=ref.id, source=ref.source, title=ref.title, duration=ref.duration,
                            is_youtube=ref.is_youtube, created_at=now, updated_at=now,
                            stages=_fresh_stages()))
+        ref.dir.mkdir(parents=True, exist_ok=True)
+        ulog(ref.id, f"Project created from {ref.source}" + (f" · focus: “{focus.strip()[:120]}”" if focus.strip() else ""))
         worker.submit(ref.id)
         return store.get(ref.id)
 
@@ -812,6 +899,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         job = _job_or_404(store, job_id)
         if job.status in ("queued", "running"):
             raise HTTPException(409, "Job is already in progress")
+        ulog(job_id, ("Retry" if job.status == "failed" else "Resume") + " requested: finished steps are reused")
         worker.submit(job_id)
         return view(store.get(job_id))
 
@@ -835,6 +923,12 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         d = (cfg.workspace() / job_id).resolve()
         if d.parent == cfg.workspace().resolve() and d.is_dir():
             shutil.rmtree(d)
+
+    @router.get("/jobs/{job_id}/log")
+    def get_log(job_id: str, after: int = -1, limit: int = 500):
+        """The project's activity log (newest `limit` entries after sequence number `after`)."""
+        _job_or_404(store, job_id)
+        return joblog.read(cfg.workspace() / job_id, after, max(1, min(limit, 2000)))
 
     @router.get("/jobs/{job_id}/transcript")
     def get_transcript(job_id: str):
@@ -919,6 +1013,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             wanted = [c for c in body.clip_ids if c in ids]
             if not wanted:
                 raise HTTPException(404, "Unknown clip")
+        ulog(job_id, f"HD export requested: {len(wanted)} clip{'s' * (len(wanted) != 1)}", stage="export")
         worker.submit_export(job_id, wanted)
         return view(store.get(job_id))
 
@@ -955,6 +1050,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         else:
             v = min(max(body.cam_size, 0.15), 0.45)
             data["split_cam_min"] = data["split_cam_max"] = round(v, 3)
+        ulog(job_id, f"Layout changed: {body.screen_layout}, background {body.background}"
+             + (f", cam {round(body.cam_size * 100)}%" if body.cam_size else ", cam auto"), stage="reframe")
         with store.lock:
             tmp = d / (LAYOUT_FILE + ".tmp")
             tmp.write_text(json.dumps(data, indent=1))
@@ -982,6 +1079,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             raise HTTPException(409, "Job is already in progress")
         if not (cfg.workspace() / job_id / transcribe.OUT).exists():
             raise HTTPException(409, "Not transcribed yet")
+        ulog(job_id, "Re-pick moments requested: the AI picks again (the transcript is reused)", stage="select")
         repick(job_id)
         return view(store.get(job_id))
 
@@ -995,6 +1093,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         if busy and (d / select.OUT).exists():
             raise HTTPException(409, "This video is processing: change the focus when it's done (or stop it first)")
         select.save_focus(d, body.text, body.mode)
+        ulog(job_id, f"Focus note {'set' if body.text.strip() else 'cleared'}"
+             + (f" ({body.mode}): “{body.text.strip()[:120]}”" if body.text.strip() else ""), stage="select")
         if body.repick and not busy and (d / transcribe.OUT).exists():
             repick(job_id)
         return view(store.get(job_id))
@@ -1188,6 +1288,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"Saved, but the captions couldn't be rebuilt: {_friendly(e)}") from None
         rerender = render.clip_file(d, clip, live) != before
+        ulog(job_id, f"Framing saved for “{clip.title}”: {len(fr.keys)} keyframe{'s' * (len(fr.keys) != 1)}"
+             + (", custom facecam frame" if fr.cam else "") + (" · re-rendering it" if rerender else ""), stage="render")
         if rerender:
             worker.rerender(job_id)
         return {"keys": [k.model_dump() for k in fr.keys], "keep_cam": fr.keep_cam,
@@ -1237,6 +1339,9 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             dropped = editor.apply_trim(d, meta, old, new)
             sel.clips = [new if c.id == clip_id else c for c in sel.clips]
             save_json(sel, d / select.OUT)
+        ulog(job_id, f"Clip “{new.title}” trimmed: {old.duration:.1f}s → {new.duration:.1f}s "
+             f"(start {new.start - old.start:+.1f}s, end {new.end - old.end:+.1f}s)"
+             + (f", {dropped} keyframe{'s' * (dropped != 1)} dropped" if dropped else ""), stage="render")
         resubmit_render(job_id, ("sources", "reframe", "captions", "render"))
         return {"clip": {**new.model_dump(), "duration": round(new.duration, 2)}, "dropped_keys": dropped,
                 "rerender": True}
@@ -1248,6 +1353,7 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         idle_or_409(job, "re-render")
         if not (cfg.workspace() / job_id / select.OUT).exists():
             raise HTTPException(409, "No clips yet")
+        ulog(job_id, "Re-render requested with the current settings (moments and transcript kept)", stage="render")
         resubmit_render(job_id, ("sources", "reframe", "captions", "render"))
         return view(store.get(job_id))
 

@@ -1,15 +1,17 @@
 import { useState } from "react";
+import { stagesProgress } from "@kit/types";
 import { ArrowLeft, CircleAlert, Copy, ExternalLink, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
 import { useConfirm, useToast, ErrorBoundary } from "@kit/feedback";
 import { api, clockSkew, currentStage, isActive, isExporting, overallProgress, type Job } from "../api";
 import { ClipsPanel } from "../components/ClipsPanel";
 import { FocusPanel } from "../components/FocusPanel";
 import { LayoutPanel } from "../components/LayoutPanel";
-import { Pipeline } from "@kit/Pipeline";
+import { PipelineSteps } from "@kit/Pipeline";
+import { Console } from "../components/Console";
 import { Player, type Seek } from "../components/Player";
 import { TranscriptPanel } from "../components/TranscriptPanel";
 import { Button, Card, ProgressBar, StatusBadge } from "../components/ui";
-import { copyText, errorText, fmtDate, fmtDuration, fmtEta, fmtTime, Link, navigate, secondsBetween, timeAgo, useNow, usePoll } from "../lib";
+import { copyText, cx, errorText, fmtDate, fmtDuration, fmtEta, fmtTime, Link, navigate, secondsBetween, timeAgo, useNow, usePoll, useStored } from "../lib";
 
 export function JobPage({ id }: { id: string }) {
   const { data: job, error, setData, updatedAt, stale } = usePoll(
@@ -143,7 +145,7 @@ export function JobPage({ id }: { id: string }) {
       <div className="mt-6 grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_340px]">
         <aside className="lg:sticky lg:top-20 lg:order-2 lg:self-start">
           <div className="space-y-5">
-            <Pipeline stages={job.stages} skew={skew} />
+            <PipelinePanel job={job} skew={skew} />
             <ErrorBoundary label="Focus"><FocusPanel job={job} onJob={setData} /></ErrorBoundary>
             <ErrorBoundary label="Layout"><LayoutPanel job={job} onJob={setData} /></ErrorBoundary>
           </div>
@@ -155,6 +157,32 @@ export function JobPage({ id }: { id: string }) {
         </div>
       </div>
     </div>
+  );
+}
+
+/** The steps, or the live console of what the pipeline is doing. */
+function PipelinePanel({ job, skew }: { job: Job; skew: number }) {
+  const [tab, setTab] = useStored<"steps" | "console">("project.pipelineTab", "steps");
+  const [issues, setIssues] = useState(0);
+  const pct = Math.floor(stagesProgress(job.stages) * 100);
+  return (
+    <Card className="overflow-hidden">
+      <div className="flex items-center justify-between gap-3 border-b border-line px-4 py-2.5">
+        <div role="tablist" className="inline-flex rounded-lg bg-surface-2 p-0.5 text-xs font-medium">
+          {(["steps", "console"] as const).map((k) => (
+            <button key={k} role="tab" aria-selected={tab === k} onClick={() => setTab(k)}
+              className={cx("inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 transition",
+                tab === k ? "bg-surface text-fg shadow-card" : "text-muted hover:text-fg")}>
+              {k === "steps" ? "Pipeline" : "Console"}
+              {k === "console" && issues > 0 && <span className="size-1.5 rounded-full bg-warn" title={`${issues} warnings or errors`} />}
+            </button>
+          ))}
+        </div>
+        <span className="font-mono text-xs text-muted" title="Weighted by how long each step usually takes">{pct}%</span>
+      </div>
+      <div className={tab === "steps" ? "" : "hidden"}><PipelineSteps stages={job.stages} skew={skew} /></div>
+      <div className={tab === "console" ? "" : "hidden"}><Console job={job} onIssues={setIssues} /></div>
+    </Card>
   );
 }
 

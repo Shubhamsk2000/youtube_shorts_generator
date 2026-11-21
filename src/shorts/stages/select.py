@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from pathlib import Path
 
 from ..config import Config, SelectCfg
@@ -441,6 +442,7 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
             min_s=sc.min_clip_s, max_s=sc.max_clip_s, minutes=(win[-1].end - win[0].start) / 60,
             target=max(3, round((win[-1].end - win[0].start) / 90)),
         )
+        t_call = time.monotonic()
         data, used_model = generate_json(
             prompt, _with_focus(SCHEMA, focus),
             models=[sc.model, *sc.fallback_models], cache_dir=cache_dir, system=SYSTEM, refresh=refresh,
@@ -448,7 +450,12 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
             min_interval_s=sc.min_interval_s, task="shorts.select", on_status=lambda m: report(i / len(windows), m),
         )
         calls += 1
-        raw.extend(data.get("clips") or [])
+        got = data.get("clips") or []
+        raw.extend(got)
+        took = time.monotonic() - t_call
+        report((i + 1) / (len(windows) + sc.refine),
+               f"Part {i + 1}/{len(windows)} ({span}): {len(got)} moment{'s' * (len(got) != 1)} from {used_model}"
+               + (f" in {took:.0f}s" if took >= 1 else " (cached)"))
     report(len(windows) / (len(windows) + sc.refine), f"Checking {len(raw)} proposed moments…")
     # keep some spare candidates for the editor pass to choose from
     wide = sc.model_copy(update={"max_clips": sc.max_clips + 10}) if sc.refine else sc
@@ -464,9 +471,13 @@ def _select_llm(t: Transcript, meta: VideoMeta, sc: SelectCfg, cache_dir: Path, 
     if sc.refine and clips:
         report(len(windows) / (len(windows) + 1), f"Editor pass: comparing {len(clips)} candidates…")
         try:
+            t_call = time.monotonic()
             clips, rej2 = _refine(clips, t, meta, info, sc, cache_dir, report, refresh, heat, marks, focus)
             calls += 1
             refined = True
+            took = time.monotonic() - t_call
+            report(None, f"Editor pass: kept {len(clips)} of the candidates"
+                         + (f" in {took:.0f}s" if took >= 1 else " (cached)"))
             for k, v in rej2.items():
                 rejected[k] = rejected.get(k, 0) + v
         except Exception as e:  # noqa: BLE001  (first-pass picks are still good)

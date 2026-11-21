@@ -34,6 +34,16 @@ export interface Focus {
   mode: FocusMode;
 }
 
+/** One line of a project's activity log (the Pipeline console). */
+export interface LogEntry {
+  i: number;
+  t: string;  // ISO time
+  level: "info" | "ok" | "warn" | "error";
+  stage: string | null;
+  msg: string;
+}
+export interface LogPage { entries: LogEntry[]; last: number; truncated: boolean }
+
 export interface Job {
   id: string;
   source: string;
@@ -258,6 +268,7 @@ export const api = {
   system: () => request<SystemInfo>(`${S}/system`, { timeoutMs: 20000 }),
   jobs: () => request<Job[]>(`${S}/jobs`),
   job: (id: string) => request<Job>(J(id)),
+  log: (id: string, after = -1) => request<LogPage>(`${J(id)}/log?after=${after}`),
   create: (url: string, focus?: Focus | null) =>
     request<Job>(`${S}/jobs`, { ...json("POST", { url, focus: focus?.text ?? "", focus_mode: focus?.mode ?? "prefer" }), timeoutMs: 90000 }),
   setFocus: (id: string, text: string, mode: FocusMode, repick = true) =>
