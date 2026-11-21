@@ -46,6 +46,7 @@ export function usePoll<T>(
 ) {
   const [data, setData] = useState<T>();
   const [error, setError] = useState<string>();
+  const [failing, setFailing] = useState(0);   // failed polls in a row
   const [updatedAt, setUpdatedAt] = useState<number>();
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
@@ -64,9 +65,11 @@ export function usePoll<T>(
       setError(undefined);
       setUpdatedAt(Date.now());
       failures.current = 0;
+      setFailing(0);
     } catch (e) {
       if (g !== gen.current) return;
       failures.current += 1;
+      setFailing(failures.current);
       setError(errorText(e));
     } finally {
       inFlight.current = false;
@@ -108,7 +111,7 @@ export function usePoll<T>(
     };
   }, [load]);
 
-  return { data, error, stale: !!error && data !== undefined, updatedAt, reload: load, setData };
+  return { data, error, failing, stale: !!error && data !== undefined, updatedAt, reload: load, setData };
 }
 
 export function errorText(e: unknown): string {

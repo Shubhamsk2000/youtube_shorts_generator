@@ -128,6 +128,7 @@ export interface Clip {
   review: Review;
   ready: boolean;
   url: string | null;
+  thumb_url?: string | null;  // a still of the preview (cards load the video only on hover)
   final_url: string | null;
   upload_text: string;
 }

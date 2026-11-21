@@ -24,7 +24,8 @@ function legacy(path: string): string | null {
 
 export default function App() {
   const path = usePath();
-  const { data: status, error } = usePoll(studio.status, (s) => (s?.queue.current ? 2000 : 8000), "status");
+  // one slow or failed check is not "offline": the banner waits for two in a row
+  const { data: status, failing } = usePoll(studio.status, (s) => (s?.queue.current ? 2000 : 8000), "status");
   const to = legacy(path);
   useEffect(() => { if (to) navigate(to, { replace: true }); }, [to]);
   const route = resolve(path, status);
@@ -40,7 +41,7 @@ export default function App() {
           <a href="#main" className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-lg focus:bg-surface focus:px-3 focus:py-2">
             Skip to content
           </a>
-          <Nav section={route.section} status={status} offline={!!error} />
+          <Nav section={route.section} status={status} offline={failing >= 2} />
           <main id="main" className="flex-1">
             <ErrorBoundary label="This page" resetKey={route.key}>{route.page()}</ErrorBoundary>
           </main>
