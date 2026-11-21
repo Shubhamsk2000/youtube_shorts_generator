@@ -41,6 +41,10 @@ Deploying to AWS and updating it after code changes: **[docs/DEPLOY.md](docs/DEP
   keyframe: the window moves smoothly between keyframes and jumps at camera cuts; shots without keyframes keep the
   automatic framing. A wider window can keep following faces. Also: hook text, banner, title, approve/reject,
   undo/redo, Shorts safe zones, and the pauses that pacing removes on the timeline. Saving re-renders that clip.
+  The hook banner can be dragged up or down on the live preview (or set with a slider; Reset = the Settings position).
+  **Trim start / end** plays the clip with 5 s before and after it, with the transcript there: drag the start/end
+  handles, nudge them, or start/end the short at a line. Saving re-frames, re-captions and re-renders that clip;
+  keyframes move with the footage. Need more than 5 s? Save and open it again.
   Keyframes live in `framing/<clip>.json` (the face analysis is never changed: "Reset" removes keyframes).
 - **Settings**: moment picking, captions, hook banner, pacing, layout defaults, export quality, download. Saved to
   `configs/shorts.local.yaml` (git-ignored) on top of `configs/shorts.yaml`; every value is validated before it is

@@ -14,6 +14,7 @@ import {
 import { Preview, drawFrame } from "../editor/Preview";
 import { Stage } from "../editor/Stage";
 import { Timeline } from "../editor/Timeline";
+import { TrimPanel } from "../editor/TrimPanel";
 
 /** What the editor changes: the window keys and the facecam frame (undone together). */
 type Edit = { keys: FrameKey[]; cam: CamBox | null };
@@ -73,7 +74,8 @@ export function EditorPage({ jobId, clipId }: { jobId: string; clipId: string })
       </div>
     );
   }
-  return <Editor key={clipId} jobId={jobId} d={d} reload={reload} setData={setData} />;
+  // a saved trim changes the clip's frames: start the editor over on the new range
+  return <Editor key={`${clipId}:${d.clip.start}:${d.clip.end}`} jobId={jobId} d={d} reload={reload} setData={setData} />;
 }
 
 function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; reload: () => void; setData: (d: EditorData) => void }) {
@@ -297,14 +299,24 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
   const [title, setTitle] = useState(d.clip.title);
   const [hookText, setHookText] = useState(d.clip.hook_text);
   const [showHook, setShowHook] = useState(d.clip.show_hook !== false);
+  const [hookY, setHookY] = useState<number | null>(d.clip.hook_y ?? null); // null = the settings' position
+  const [placing, setPlacing] = useState(false); // show the banner past its seconds while it's being moved
+  const placingTimer = useRef(0);
+  const placeHook = (y: number | null, done = false) => {
+    if (y !== undefined) setHookY(y);
+    setPlacing(true);
+    window.clearTimeout(placingTimer.current);
+    if (done) placingTimer.current = window.setTimeout(() => setPlacing(false), 1500);
+  };
   const [savingText, setSavingText] = useState(false);
   const textChanges = useMemo(() => {
     const c: Record<string, unknown> = {};
     if (title.trim() !== d.clip.title) c.title = title.trim();
     if (hookText.trim() !== d.clip.hook_text) c.hook_text = hookText.trim();
     if (showHook !== (d.clip.show_hook !== false)) c.show_hook = showHook;
+    if (hookY !== (d.clip.hook_y ?? null)) c.hook_y = hookY;
     return c;
-  }, [title, hookText, showHook, d.clip]);
+  }, [title, hookText, showHook, hookY, d.clip]);
   const textInvalid = !title.trim() ? "The title can't be empty"
     : title.length > TEXT_LIMITS.title ? `Title: max ${TEXT_LIMITS.title} characters`
     : hookText.length > TEXT_LIMITS.hook_text ? `Hook: max ${TEXT_LIMITS.hook_text} characters` : null;
@@ -511,6 +523,10 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
             </div>
           </Card>
 
+          <TrimPanel jobId={jobId} clipId={d.clip.id} onSaved={reload}
+            blocked={dirty ? "Save or discard your framing changes first"
+              : Object.keys(textChanges).length ? "Save or discard your text changes first" : null} />
+
           <details className="rounded-xl border border-line bg-surface px-4 py-3 text-sm">
             <summary className="flex cursor-pointer items-center gap-2 text-muted"><Keyboard className="size-4" /> Keyboard shortcuts</summary>
             <div className="mt-3 grid grid-cols-1 gap-x-8 gap-y-1.5 text-xs text-muted sm:grid-cols-2">
@@ -545,7 +561,14 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
             </div>
             <div className="mx-auto max-w-[300px]">
               {tab === "live" ? (
-                <Preview draw={(ctx) => drawFrame(ctx, video.current, d, win, t, { safe, hookText: previewText, showHook: hookShown })} />
+                <Preview
+                  draw={(ctx) => drawFrame(ctx, video.current, d, win, t, {
+                    safe, hookText: previewText, showHook: hookShown, hookY: hookY ?? d.hook.position, hookAlways: placing,
+                  })}
+                  onHookDrag={hookShown ? (y, phase) => {
+                    if (phase === "start") pause();
+                    placeHook(y < 0 ? hookY : Math.round(y * 1000) / 1000, phase === "end");
+                  } : undefined} />
               ) : d.clip.ready && d.clip.url ? (
                 <video key={d.clip.url} src={d.clip.url} controls playsInline className="block aspect-[9/16] w-full rounded-xl bg-black" />
               ) : (
@@ -573,6 +596,23 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
                 <Input value={hookText} onChange={(e) => setHookText(e.target.value)} placeholder="Empty: the title is shown" />
               </label>
               <Toggle checked={showHook} onChange={setShowHook} label={<span className="text-sm">Show the hook banner</span>} />
+              {hookShown && (
+                <div>
+                  <span className="mb-1 flex items-center justify-between text-xs font-medium text-muted">
+                    Banner position
+                    <span className="inline-flex items-center gap-2 font-normal">
+                      <span className="font-mono text-faint">{hookY == null ? "default" : `${Math.round(hookY * 100)}% down`}</span>
+                      <button className="text-accent hover:underline disabled:text-faint disabled:no-underline" disabled={hookY == null}
+                        onClick={() => placeHook(null, true)} title="Back to the position from Settings">Reset</button>
+                    </span>
+                  </span>
+                  <input type="range" min={0.04} max={0.96} step={0.005} value={hookY ?? d.hook.position}
+                    onChange={(e) => placeHook(Number(e.target.value))}
+                    onPointerUp={() => placeHook(hookY, true)} onKeyUp={() => placeHook(hookY, true)} onBlur={() => setPlacing(false)}
+                    className="w-full accent-[var(--accent)]" aria-label="Hook banner position" />
+                  <p className="text-xs text-faint">Or drag the banner on the live preview. Keep it clear of the top bar (Safe zones shows it).</p>
+                </div>
+              )}
               {!d.hook.enabled && <p className="text-xs text-faint">The hook banner is off in Settings (or the tweet card carries the text).</p>}
               {textInvalid && <p className="text-xs text-err">{textInvalid}</p>}
               <Button className="w-full" onClick={saveText} disabled={!Object.keys(textChanges).length || !!textInvalid} loading={savingText}>Save text</Button>

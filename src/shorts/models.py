@@ -90,6 +90,8 @@ class Clip(BaseModel):
     context: str = ""            # what a cold viewer is missing at the start (the banner states it)
     loop: bool = False           # the last line sets up the first: replays without a seam
     focus_match: bool | None = None  # matches the creator's focus note (None = no note was given)
+    hook_y: float | None = None  # hook banner's vertical centre set in the editor (fraction of the height);
+                                 # None = the settings' position (moved below a top facecam when needed)
 
     @property
     def duration(self) -> float:

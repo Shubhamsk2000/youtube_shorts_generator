@@ -148,7 +148,7 @@ def build_clip(job_dir: Path, cfg: Config, t: Transcript, meta: VideoMeta, c: Cl
             elif (y := seam(sh)) is not None:  # below the caption line that sits on the seam
                 bottoms.append(y + round(cc.size * 0.6))
         hook_min_y = max(bottoms) if bottoms else None
-    text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead, hook_min_y=hook_min_y)
+    text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead, hook_min_y=hook_min_y, hook_y=c.hook_y)
     if not p.exists() or p.read_text() != text:  # unchanged files keep their render cache valid
         p.write_text(text)
     return keep, flash, len(lines)
@@ -321,7 +321,7 @@ def wrap(text: str, max_chars: int) -> list[str]:
 
 
 def to_ass(lines: list[CapLine], cc: CaptionCfg, hook: str = "", hc: HookCfg | None = None,
-           line_y=None, lead: float = 0.0, hook_min_y: int | None = None) -> str:
+           line_y=None, lead: float = 0.0, hook_min_y: int | None = None, hook_y: float | None = None) -> str:
     hc = hc or HookCfg()
     margin_v = round(H * (1 - cc.position))
     head = f"""[Script Info]
@@ -345,10 +345,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     events = []
     if hook:
         text = "\\N".join(display_text(x, False) for x in wrap(hook, hc.max_chars_per_line))
-        y = round(hc.position * H)
-        if hook_min_y is not None:  # top of the hook box goes below the corner cam
-            n = text.count("\\N") + 1
-            y = max(y, hook_min_y + 28 + round(n * hc.size * 1.25 / 2) + 16)
+        n = text.count("\\N") + 1
+        half = round(n * hc.size * 1.25 / 2) + 16  # half the box's height
+        if hook_y is not None:  # placed in the editor: exactly there, kept inside the frame
+            y = min(max(round(hook_y * H), half), H - half)
+        else:
+            y = round(hc.position * H)
+            if hook_min_y is not None:  # top of the hook box goes below the corner cam
+                y = max(y, hook_min_y + 28 + half)
         events.append(f"Dialogue: 1,{_ts(0)},{_ts(lead + hc.duration_s)},Hook,,0,0,0,,"
                       f"{{\\an5\\pos({W // 2},{y})\\fad(80,220)\\fscx80\\fscy80\\t(0,160,\\fscx100\\fscy100)}}{text}")
     for line in lines:
