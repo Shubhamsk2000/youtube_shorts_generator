@@ -541,8 +541,14 @@ class ClipEdit(BaseModel):
     title: str | None = None
     hook_text: str | None = None
     show_hook: bool | None = None
+    hook_y: float | None = None   # banner's vertical centre (fraction); sent as null = back to the default
     description: str | None = None
     hashtags: list[str] | None = None
+
+
+class TrimBody(BaseModel):
+    start: float  # source seconds
+    end: float
 
 
 class FramingKey(BaseModel):
@@ -1053,6 +1059,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         if not (d / select.OUT).exists():
             raise HTTPException(409, "No clips yet")
         changes = body.model_dump(exclude_none=True)
+        if "hook_y" in body.model_fields_set:  # null is a real value here: the default position again
+            changes["hook_y"] = None if body.hook_y is None else round(min(max(body.hook_y, 0.04), 0.96), 4)
         if not changes:
             raise HTTPException(422, "Nothing to change")
         for k in ("title", "hook_text", "description"):
@@ -1078,10 +1086,10 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             clip = next((c for c in sel.clips if c.id == clip_id), None)
             if not clip:
                 raise HTTPException(404, "Unknown clip")
-            visual_before = (captions.hook_text(clip), clip.show_hook)
+            visual_before = (captions.hook_text(clip), clip.show_hook, clip.hook_y)
             for k, v in changes.items():
                 setattr(clip, k, v)
-            visual = (captions.hook_text(clip), clip.show_hook) != visual_before
+            visual = (captions.hook_text(clip), clip.show_hook, clip.hook_y) != visual_before
             if visual:
                 renders_only_or_409(job, "change the on-screen text")
             save_json(sel, d / select.OUT)
@@ -1184,6 +1192,54 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             worker.rerender(job_id)
         return {"keys": [k.model_dump() for k in fr.keys], "keep_cam": fr.keep_cam,
                 "cam": fr.cam.model_dump() if fr.cam else None, "rerender": rerender}
+
+    @router.get("/jobs/{job_id}/clips/{clip_id}/trim")
+    def get_trim(job_id: str, clip_id: str):
+        """The clip's range, 5 s on each side of it and the transcript there: for moving its start / end."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        _, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        return {**editor.trim_view(d, meta, clip),
+                "proxy_url": f"/api/shorts/jobs/{job_id}/clips/{clip.id}/trim/proxy"}
+
+    @router.get("/jobs/{job_id}/clips/{clip_id}/trim/proxy")
+    async def get_trim_proxy(job_id: str, clip_id: str):
+        """The clip with 5 s before and after it as a small mp4 (fetches those seconds first if needed)."""
+        _job_or_404(store, job_id)
+        d = cfg.workspace() / job_id
+        _, clip = clip_or_404(d, clip_id)
+        meta = meta_or_409(d)
+        try:
+            p = await run_in_threadpool(editor.ensure_review_proxy, d, meta, clip, load_config(cfg_path))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Couldn't prepare the trim video: {_friendly(e)}") from None
+        return FileResponse(p, media_type="video/mp4", headers={"Cache-Control": "private, max-age=86400"})
+
+    @router.put("/jobs/{job_id}/clips/{clip_id}/trim")
+    def set_trim(job_id: str, clip_id: str, body: TrimBody):
+        """Move the clip's start / end (source seconds). Window keys move with the footage; the clip is framed,
+        captioned and rendered again."""
+        job = _job_or_404(store, job_id)
+        idle_or_409(job, "trim a clip")
+        d = cfg.workspace() / job_id
+        meta = meta_or_409(d)
+        t = load_json(Transcript, d / "transcript.json")
+        with store.lock:
+            sel, old = clip_or_404(d, clip_id)
+            try:
+                new = editor.trimmed(t, meta, old, body.start, body.end)
+            except ValueError as e:
+                raise HTTPException(422, str(e)) from None
+            if abs(new.start - old.start) < 1e-3 and abs(new.end - old.end) < 1e-3:
+                return {"clip": {**old.model_dump(), "duration": round(old.duration, 2)}, "dropped_keys": 0,
+                        "rerender": False}
+            dropped = editor.apply_trim(d, meta, old, new)
+            sel.clips = [new if c.id == clip_id else c for c in sel.clips]
+            save_json(sel, d / select.OUT)
+        resubmit_render(job_id, ("sources", "reframe", "captions", "render"))
+        return {"clip": {**new.model_dump(), "duration": round(new.duration, 2)}, "dropped_keys": dropped,
+                "rerender": True}
 
     @router.post("/jobs/{job_id}/rerender", response_model=JobView)
     def rerender(job_id: str):

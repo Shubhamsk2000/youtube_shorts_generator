@@ -108,6 +108,7 @@ export interface Clip {
   text: string;
   hook_text: string;
   show_hook?: boolean;
+  hook_y?: number | null;   // banner's vertical centre set in the editor (fraction); null = the default
   context?: string;
   loop?: boolean;
   focus_match?: boolean | null;
@@ -130,7 +131,19 @@ export interface ClipsData {
   clips: Clip[];
 }
 
-export type ClipEdit = Partial<Pick<Clip, "title" | "hook_text" | "show_hook" | "description" | "hashtags">>;
+export type ClipEdit = Partial<Pick<Clip, "title" | "hook_text" | "show_hook" | "hook_y" | "description" | "hashtags">>;
+
+/** The trim panel: the clip's range (source seconds), 5 s on each side of it, and the transcript there. */
+export interface TrimData {
+  start: number;
+  end: number;
+  review: [number, number];
+  pad_s: number;
+  min_s: number;
+  max_s: number;
+  sentences: { id: number; start: number; end: number; text: string; words: [number, number, string][] }[];
+  proxy_url: string;
+}
 
 /** One window keyframe from the clip editor (source frame inside the clip). x null = follow the auto framing. */
 export interface FrameKey {
@@ -180,7 +193,7 @@ export interface EditorData {
   keep: [number, number][] | null;
   flash: [number, number] | null;
   layout: { out_w: number; out_h: number; fit_y: number; fit_dim: number; screen_layout: ScreenLayout; background: Background; max_aspect: number };
-  hook: { enabled: boolean; auto: boolean; text: string; position: number; duration_s: number; size: number; max_chars_per_line: number };
+  hook: { enabled: boolean; auto: boolean; text: string; position: number; y: number | null; duration_s: number; size: number; max_chars_per_line: number };
   captions: { enabled: boolean; position: number; size: number };
   clip: Clip;
   prev: string | null;
@@ -269,6 +282,10 @@ export const api = {
   setFraming: (id: string, clipId: string, keys: FrameKey[], keepCam: boolean, cam: CamBox | null) =>
     request<{ keys: FrameKey[]; keep_cam: boolean; cam: CamBox | null; rerender: boolean }>(
       `${J(id)}/clips/${encodeURIComponent(clipId)}/framing`, json("PUT", { keys, keep_cam: keepCam, cam })),
+  trim: (id: string, clipId: string) => request<TrimData>(`${J(id)}/clips/${encodeURIComponent(clipId)}/trim`),
+  setTrim: (id: string, clipId: string, start: number, end: number) =>
+    request<{ clip: Clip; dropped_keys: number; rerender: boolean }>(
+      `${J(id)}/clips/${encodeURIComponent(clipId)}/trim`, json("PUT", { start, end })),
   reselect: (id: string) => request<Job>(`${J(id)}/reselect`, json("POST")),
   review: (id: string, clipId: string, review: Review) =>
     request<{ id: string; review: Review }>(`${J(id)}/clips/${encodeURIComponent(clipId)}/review`, json("PUT", { review })),

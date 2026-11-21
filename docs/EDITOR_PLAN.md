@@ -84,4 +84,4 @@ without freezing it. "Use this shape for the whole clip" adds such keys to every
 ## Later (not in this pass)
 - Up/down position and zoom (the key format has room: `y`, `z`).
 - Switching a shot's layout (split / pip) from the editor.
-- Trimming the clip's start/end and editing which pauses are cut.
+- Editing which pauses are cut. (Trimming start/end and moving the hook banner: done, see the README.)

@@ -1,8 +1,17 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState, type PointerEvent as RPointerEvent } from "react";
 import type { EditorData } from "../api";
 import { FILL, clamp, type Win } from "./frame";
 
-export type PreviewOpts = { safe: boolean; hookText: string; showHook: boolean };
+export type PreviewOpts = {
+  safe: boolean;
+  hookText: string;
+  showHook: boolean;
+  hookY: number;        // banner's vertical centre, fraction of the height
+  hookAlways?: boolean; // show it past its first seconds (while it's being placed)
+};
+
+/** Where the hook banner was drawn (fractions of the height), for dragging it. */
+export type HookBox = { top: number; bottom: number };
 
 /** Shorts UI that covers the video (approximate, 1080x1920 fractions): top bar, bottom text, right buttons. */
 const SAFE = [
@@ -85,12 +94,12 @@ function drawCamLayout(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, d
 }
 
 /** One frame of the short: the window (full screen, or full width over blur), hook banner, guides. */
-export function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement | null, d: EditorData, win: Win, t: number, o: PreviewOpts) {
+export function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement | null, d: EditorData, win: Win, t: number, o: PreviewOpts): HookBox | null {
   const W = ctx.canvas.width;
   const H = ctx.canvas.height;
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, W, H);
-  if (!video || video.readyState < 2 || !video.videoWidth) return;
+  if (!video || video.readyState < 2 || !video.videoWidth) return null;
   const vw = video.videoWidth;
   const vh = video.videoHeight;
 
@@ -111,7 +120,8 @@ export function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement
   }
 
   const hook = d.hook;
-  if (hook.enabled && o.showHook && o.hookText && t < hook.duration_s) {
+  let box: HookBox | null = null;
+  if (hook.enabled && o.showHook && o.hookText && (t < hook.duration_s || o.hookAlways)) {
     const size = (hook.size / 1920) * H;
     ctx.font = `900 ${size}px Inter, "Geist", system-ui, sans-serif`;
     ctx.textAlign = "center";
@@ -120,13 +130,16 @@ export function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement
     const lh = size * 1.18;
     const boxW = Math.min(W * 0.92, Math.max(...lines.map((l) => ctx.measureText(l).width)) + size * 0.9);
     const boxH = lh * lines.length + size * 0.5;
-    const cy = hook.position * H;
+    const cy = clamp(o.hookY * H, boxH / 2, H - boxH / 2); // the render keeps the box inside the frame too
+    box = { top: (cy - boxH / 2) / H, bottom: (cy + boxH / 2) / H };
+    ctx.globalAlpha = t < hook.duration_s ? 1 : 0.75; // past its seconds: shown only to place it
     ctx.fillStyle = "#fff";
     ctx.beginPath();
     ctx.roundRect(W / 2 - boxW / 2, cy - boxH / 2, boxW, boxH, size * 0.25);
     ctx.fill();
     ctx.fillStyle = "#000";
     lines.forEach((l, i) => ctx.fillText(l, W / 2, cy - ((lines.length - 1) * lh) / 2 + i * lh));
+    ctx.globalAlpha = 1;
   }
 
   if (o.safe) {
@@ -149,13 +162,26 @@ export function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement
       ctx.fillText("captions", W * 0.08, y - 3);
     }
   }
+  return box;
 }
 
-/** The 9:16 canvas, redrawn by the page (it owns the clock). */
-export function Preview({ draw }: { draw: (ctx: CanvasRenderingContext2D) => void }) {
+/** The 9:16 canvas, redrawn by the page (it owns the clock). With onHookDrag, the hook banner can be
+ * dragged up or down (y = the banner's new centre, fraction of the height). */
+export function Preview({ draw, onHookDrag }: {
+  draw: (ctx: CanvasRenderingContext2D) => HookBox | null | void;
+  onHookDrag?: (y: number, phase: "start" | "move" | "end") => void;
+}) {
   const ref = useRef<HTMLCanvasElement>(null);
   const drawRef = useRef(draw);
   drawRef.current = draw;
+  const box = useRef<HookBox | null>(null);
+  const grab = useRef<number | null>(null); // pointer offset from the banner's centre while dragging
+  const [over, setOver] = useState(false);
+  const fracY = (e: RPointerEvent) => {
+    const r = ref.current!.getBoundingClientRect();
+    return (e.clientY - r.top) / r.height;
+  };
+  const onBox = (y: number) => !!box.current && y >= box.current.top - 0.01 && y <= box.current.bottom + 0.01;
   useEffect(() => {
     let id = 0;
     const loop = () => {
@@ -169,12 +195,37 @@ export function Preview({ draw }: { draw: (ctx: CanvasRenderingContext2D) => voi
           c.height = h;
         }
         const ctx = c.getContext("2d");
-        if (ctx && w && h) drawRef.current(ctx);
+        if (ctx && w && h) box.current = drawRef.current(ctx) || null;
       }
       id = requestAnimationFrame(loop);
     };
     id = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(id);
   }, []);
-  return <canvas ref={ref} className="block aspect-[9/16] w-full rounded-xl bg-black" aria-label="Live 9:16 preview" />;
+  return (
+    <canvas ref={ref} className="block aspect-[9/16] w-full touch-none rounded-xl bg-black" aria-label="Live 9:16 preview"
+      style={{ cursor: onHookDrag && (over || grab.current != null) ? "ns-resize" : undefined }}
+      title={onHookDrag && over ? "Drag the hook banner up or down" : undefined}
+      onPointerDown={(e) => {
+        if (!onHookDrag || e.button !== 0) return;
+        const y = fracY(e);
+        if (!onBox(y)) return;
+        const b = box.current!;
+        grab.current = y - (b.top + b.bottom) / 2;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        onHookDrag((b.top + b.bottom) / 2, "start");
+      }}
+      onPointerMove={(e) => {
+        const y = fracY(e);
+        if (grab.current == null) return setOver(!!onHookDrag && onBox(y));
+        onHookDrag?.(clamp(y - grab.current, 0.04, 0.96), "move");
+      }}
+      onPointerUp={(e) => {
+        if (grab.current == null) return;
+        onHookDrag?.(clamp(fracY(e) - grab.current, 0.04, 0.96), "end");
+        grab.current = null;
+      }}
+      onPointerCancel={() => { if (grab.current != null) { grab.current = null; onHookDrag?.(-1, "end"); } }}
+      onPointerLeave={() => setOver(false)} />
+  );
 }
