@@ -117,7 +117,9 @@ def build_clip(job_dir: Path, cfg: Config, t: Transcript, meta: VideoMeta, c: Cl
     def seam(shot) -> int | None:
         """Stacked facecam shot -> y (canvas px) of the line between the cam panel and the gameplay."""
         if shot.mode == "split" and shot.cams and cfg.reframe.screen_layout == "split":
-            return cv.y(split_panel_frac(shot.cams, meta.width, meta.height, cfg.reframe, win_aspect))
+            frac = shot.split[0] if shot.split else split_panel_frac(shot.cams, meta.width, meta.height, cfg.reframe,
+                                                                     win_aspect)
+            return cv.y(frac)
         return None
 
     def line_y(start: float) -> int | None:

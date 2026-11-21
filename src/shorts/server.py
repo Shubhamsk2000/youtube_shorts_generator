@@ -669,10 +669,18 @@ class FramingCam(BaseModel):
     h: float  # height, fraction of the source height
 
 
+class FramingSplit(BaseModel):
+    cam_h: float
+    cam_w: float = 1.0
+    game_w: float = 1.0
+    game_h: float = 1.0
+
+
 class FramingBody(BaseModel):
     keys: list[FramingKey]
     keep_cam: bool = True     # facecam shots: the keys set only the gameplay window, the cam stays
     cam: FramingCam | None = None  # facecam frame (None = the automatic cam crop)
+    split: FramingSplit | None = None  # window sizes of the cam-on-top layout (None = automatic)
 
 
 class BulkReview(BaseModel):
@@ -1330,7 +1338,8 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
         try:
             fr = editor.save_keys(d, meta, clip, live, [editor.framing.Key(**k.model_dump()) for k in body.keys],
                                   body.keep_cam,
-                                  editor.framing.CamBox(**body.cam.model_dump()) if body.cam else None)
+                                  editor.framing.CamBox(**body.cam.model_dump()) if body.cam else None,
+                                  editor.framing.SplitSize(**body.split.model_dump()) if body.split else None)
         except ValueError as e:
             raise HTTPException(422, str(e)) from None
         try:
@@ -1339,11 +1348,14 @@ def make_router(runner: SerialRunner, cfg_path: Path | None = None) -> APIRouter
             raise HTTPException(500, f"Saved, but the captions couldn't be rebuilt: {_friendly(e)}") from None
         rerender = render.clip_file(d, clip, live) != before
         ulog(job_id, f"Framing saved for “{clip.title}”: {len(fr.keys)} keyframe{'s' * (len(fr.keys) != 1)}"
-             + (", custom facecam frame" if fr.cam else "") + (" · re-rendering it" if rerender else ""), stage="render")
+             + (", custom facecam frame" if fr.cam else "")
+             + (f", sizes cam {fr.split.cam_w:.0%}×{fr.split.cam_h:.0%} · gameplay {fr.split.game_w:.0%}×{fr.split.game_h:.0%}"
+                if fr.split else "") + (" · re-rendering it" if rerender else ""), stage="render")
         if rerender:
             worker.rerender(job_id)
         return {"keys": [k.model_dump() for k in fr.keys], "keep_cam": fr.keep_cam,
-                "cam": fr.cam.model_dump() if fr.cam else None, "rerender": rerender}
+                "cam": fr.cam.model_dump() if fr.cam else None,
+                "split": fr.split.model_dump() if fr.split else None, "rerender": rerender}
 
     @router.get("/jobs/{job_id}/clips/{clip_id}/trim")
     def get_trim(job_id: str, clip_id: str):

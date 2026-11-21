@@ -4,20 +4,20 @@ import {
   RotateCcw, ScanFace, SkipBack, SkipForward, Undo2, X,
 } from "lucide-react";
 import { useConfirm, useToast, ErrorBoundary } from "@kit/feedback";
-import { api, editorHref, jobHref, type CamBox, type EditorData, type FrameKey, type Review } from "../api";
+import { api, editorHref, jobHref, type CamBox, type EditorData, type FrameKey, type Review, type SplitSize } from "../api";
 import { Button, Card, CardHeader, Input, Segmented, Toggle } from "@kit/ui";
 import { cx, errorText, Link, navigate, useStored, usePoll } from "../lib";
 import {
   FILL, PRESETS, aspectLabel, clamp, clampX, keysInShot, modeLabel, presetValue, putKey, shotIndexAt, shotRange,
-  skipTarget, windowAt, withCamBox,
+  SPLIT_LIMITS, skipTarget, windowAt, withCamBox, withSizes,
 } from "../editor/frame";
 import { Preview, drawFrame } from "../editor/Preview";
 import { Stage } from "../editor/Stage";
 import { Timeline } from "../editor/Timeline";
 import { TrimPanel } from "../editor/TrimPanel";
 
-/** What the editor changes: the window keys and the facecam frame (undone together). */
-type Edit = { keys: FrameKey[]; cam: CamBox | null };
+/** What the editor changes: the window keys, the facecam frame and the layout sizes (undone together). */
+type Edit = { keys: FrameKey[]; cam: CamBox | null; split: SplitSize | null };
 type Hist = { past: Edit[]; present: Edit; future: Edit[] };
 type Act =
   | { type: "init"; edit: Edit }
@@ -82,10 +82,12 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
   const toast = useToast();
   const confirm = useConfirm();
   const video = useRef<HTMLVideoElement>(null);
-  const [h, dispatch] = useReducer(hist, { past: [], present: { keys: d.keys, cam: d.cam ?? null }, future: [] });
-  const [saved, setSaved] = useState(() => JSON.stringify({ keys: d.keys, cam: d.cam ?? null }));
+  const [h, dispatch] = useReducer(hist, { past: [], present: { keys: d.keys, cam: d.cam ?? null, split: d.split ?? null }, future: [] });
+  const [saved, setSaved] = useState(() => JSON.stringify({ keys: d.keys, cam: d.cam ?? null, split: d.split ?? null }));
   const keys = h.present.keys;
   const camBox = h.present.cam;
+  const sizes = h.present.split;
+  const stacked = d.layout.screen_layout === "split" && d.shots.some((s) => s.cam_view && !s.cam_view.pip);
   const [keepCam, setKeepCam] = useState(d.keep_cam !== false);
   const [savedCam, setSavedCam] = useState(d.keep_cam !== false);
   const hasCam = d.layout.screen_layout !== "track" && d.shots.some((s) => s.cam_view);
@@ -105,9 +107,13 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
   const step = 1 / (fps > 35 ? fps / 2 : fps); // the proxy has every 2nd frame of 50/60 fps sources
   const f = clamp(Math.round(t * fps), 0, n - 1);
   const win0 = windowAt(d, keys, f, keepCam);
-  const win = win0.cam ? { ...win0, cam: withCamBox(win0.cam, camBox, d) } : win0; // with your facecam frame
   const si = shotIndexAt(d.shots, f);
   const shot = d.shots[si];
+  // with your facecam frame, and (cam on top) your window sizes: the gameplay crop then takes its window's shape
+  const sizedCam = win0.cam && !win0.cam.pip && sizes ? withSizes(win0.cam, shot, camBox, sizes, d) : null;
+  // (no keys in the shot: the automatic position for that shape, off the cam, as the render does)
+  const win = sizedCam ? { ...win0, cam: sizedCam, a: sizedCam.screen_a, x: win0.manual && !win0.follow ? win0.x : sizedCam.screen_x }
+    : win0.cam ? { ...win0, cam: withCamBox(win0.cam, camBox, d) } : win0;
   const [s0, s1] = shotRange(d, si);
   const shotKeys = keysInShot(d, keys, si);
   const tracked = shot.mode === "track";
@@ -240,8 +246,8 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
     if (saving) return;
     setSaving(true);
     try {
-      const res = await api.setFraming(jobId, d.clip.id, keys, keepCam, camBox);
-      const edit = { keys: res.keys, cam: res.cam ?? null };
+      const res = await api.setFraming(jobId, d.clip.id, keys, keepCam, camBox, sizes);
+      const edit = { keys: res.keys, cam: res.cam ?? null, split: res.split ?? null };
       dispatch({ type: "init", edit });
       setSaved(JSON.stringify(edit));
       setKeepCam(res.keep_cam);
@@ -388,8 +394,8 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
         <div className="flex shrink-0 items-center gap-2">
           <Button variant="ghost" onClick={() => dispatch({ type: "undo" })} disabled={!h.past.length} title="Undo (Ctrl+Z)" aria-label="Undo"><Undo2 className="size-4" /></Button>
           <Button variant="ghost" onClick={() => dispatch({ type: "redo" })} disabled={!h.future.length} title="Redo (Ctrl+Shift+Z)" aria-label="Redo"><Redo2 className="size-4" /></Button>
-          <Button variant="outline" disabled={!keys.length && !camBox} onClick={() => dispatch({ type: "commit", edit: { keys: [], cam: null } })}
-            title="Remove every keyframe and the facecam frame: back to the automatic framing">
+          <Button variant="outline" disabled={!keys.length && !camBox && !sizes} onClick={() => dispatch({ type: "commit", edit: { keys: [], cam: null, split: null } })}
+            title="Remove every keyframe, the facecam frame and the layout sizes: back to the automatic framing">
             <RotateCcw className="size-4" /> <span className="hidden sm:inline">All auto</span>
           </Button>
           {dirty && <Button variant="ghost" onClick={() => { dispatch({ type: "init", edit: JSON.parse(saved) }); setKeepCam(savedCam); }}>Discard</Button>}
@@ -475,6 +481,12 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
                       <RotateCcw className="size-3.5" /> Auto facecam
                     </Button>
                   </div>
+                  {stacked && keepCam && (
+                    <LayoutSizes sizes={sizes} autoCamH={(shot.cam_view && !shot.cam_view.pip ? shot.cam_view : d.shots.find((x) => x.cam_view && !x.cam_view.pip)?.cam_view)?.area[0] ?? 0.3}
+                      onBegin={() => { pause(); dispatch({ type: "checkpoint" }); }}
+                      onLive={(split) => dispatch({ type: "live", edit: { split } })}
+                      onSet={(split) => dispatch({ type: "commit", edit: { split } })} />
+                  )}
                 </div>
               )}
               <div>
@@ -486,8 +498,9 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
                     const v = presetValue(p, d);
                     const on = !fromAutoCam && Math.abs(win.a - v) < 0.006;
                     return (
-                      <button key={p.label} onClick={() => setShape(v)} title={`${p.hint} · at this frame`}
-                        className={cx("h-8 rounded-lg border px-2.5 font-mono text-xs font-semibold transition",
+                      <button key={p.label} onClick={() => setShape(v)} title={sizedCam ? "Set by Layout sizes in this shot" : `${p.hint} · at this frame`}
+                        disabled={!!sizedCam}
+                        className={cx("h-8 rounded-lg border px-2.5 font-mono text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-40",
                           on ? "border-accent bg-accent-soft text-accent" : "border-line text-muted hover:border-line-strong hover:text-fg")}>
                         {p.label}
                       </button>
@@ -495,6 +508,7 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
                   })}
                 </div>
                 <p className="mt-2 text-xs text-faint">
+                  {sizedCam ? "In this shot the gameplay window's shape comes from Layout sizes above; drag it on the video to move what it shows. " : ""}
                   Wider than 9:16 shows more of the frame: it fills the short's width over a blurred copy of the video. Drag the window's edges for any shape.
                 </p>
               </div>
@@ -629,6 +643,58 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
           </div>
         </aside>
       </div>
+    </div>
+  );
+}
+
+const SIZE_ROWS: { k: keyof SplitSize; label: string; hint: string }[] = [
+  { k: "cam_h", label: "Cam height", hint: "How tall the cam panel on top is; the gameplay gets the rest" },
+  { k: "cam_w", label: "Cam width", hint: "The cam window's width, centred in its panel" },
+  { k: "game_w", label: "Gameplay width", hint: "The gameplay window's width, centred" },
+  { k: "game_h", label: "Gameplay height", hint: "The gameplay window's height, of the space under the cam, centred" },
+];
+
+/** The cam-on-top layout's window sizes (whole clip): each window keeps its centre; what it doesn't cover shows
+ * the blurred background. */
+function LayoutSizes({ sizes, autoCamH, onBegin, onLive, onSet }: {
+  sizes: SplitSize | null;
+  autoCamH: number;   // the automatic cam panel height (the starting point)
+  onBegin: () => void;
+  onLive: (s: SplitSize) => void;
+  onSet: (s: SplitSize | null) => void;
+}) {
+  const base: SplitSize = sizes ?? { cam_h: Math.round(autoCamH * 1000) / 1000, cam_w: 1, game_w: 1, game_h: 1 };
+  return (
+    <div className="mt-4 rounded-xl border border-line bg-surface-2/50 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs font-medium text-muted">Layout sizes <span className="font-normal">{sizes ? "· yours" : "· auto"}</span></p>
+        <Button variant="ghost" className="h-7 px-2 text-xs" disabled={!sizes} onClick={() => onSet(null)} title="Back to the automatic layout">
+          <RotateCcw className="size-3.5" /> Auto sizes
+        </Button>
+      </div>
+      <div className="mt-2 grid grid-cols-1 gap-x-5 gap-y-2.5 sm:grid-cols-2">
+        {SIZE_ROWS.map(({ k, label, hint }) => {
+          const [lo, hi] = SPLIT_LIMITS[k];
+          const v = base[k];
+          return (
+            <label key={k} className="block" title={hint}>
+              <span className="flex items-baseline justify-between text-xs">
+                <span className="text-fg">{label}</span>
+                <span className={cx("font-mono tabular-nums", sizes ? "text-accent" : "text-faint")}>{Math.round(v * 100)}%</span>
+              </span>
+              <input type="range" min={lo} max={hi} step={0.005} value={v} aria-label={label}
+                onPointerDown={onBegin}
+                onKeyDown={(e) => { if (e.key.startsWith("Arrow") || e.key === "PageUp" || e.key === "PageDown") onBegin(); }}
+                onChange={(e) => onLive({ ...base, [k]: Number(e.target.value) })}
+                className="mt-1 w-full accent-[var(--accent)]" />
+            </label>
+          );
+        })}
+      </div>
+      <p className="mt-2 text-xs text-faint">
+        Each window stays centred in its place; uncovered space shows the blurred video. The gameplay crop takes the
+        window's shape, so nothing is stretched. Applies to every cam-on-top shot in this clip.
+      </p>
     </div>
   );
 }

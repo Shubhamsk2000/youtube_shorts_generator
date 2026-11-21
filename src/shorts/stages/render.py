@@ -419,10 +419,29 @@ def compose_fit(frame: np.ndarray, out_w: int, out_h: int, rc: ReframeCfg, cv2, 
     return bg
 
 
+def _even(v: float, lo: int = 2) -> int:
+    return max(lo, int(round(v / 2)) * 2)
+
+
+def split_boxes(shot: Shot, out_w: int, out_h: int, panel_h: int) -> tuple[tuple[int, int], tuple[int, int, int, int]]:
+    """Where the windows of a SPLIT shot go (px): (cam window x, width) inside the panel on top, and the gameplay
+    window (x, y, w, h) inside the area under it. Without sizes set in the editor both fill their place."""
+    area_h = out_h - panel_h
+    if not shot.split:
+        return (0, out_w), (0, panel_h, out_w, area_h)
+    _, cam_w, game_w, game_h = shot.split
+    tw = min(out_w, _even(cam_w * out_w))
+    gw, gh = min(out_w, _even(game_w * out_w)), min(area_h, _even(game_h * area_h))
+    return ((out_w - tw) // 2, tw), ((out_w - gw) // 2, panel_h + (area_h - gh) // 2, gw, gh)
+
+
 def split_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, meta: VideoMeta, rc: ReframeCfg
                    ) -> tuple[int, list[tuple[int, int, int, int]], tuple[int, int, int, int]]:
     """(cam panel height, cam source crops (px), screen source crop (px)) for a SPLIT shot."""
-    panel_h = int(round(split_panel_frac(shot.cams, meta.width, meta.height, rc, out_w / out_h) * out_h / 2) * 2)
+    frac = shot.split[0] if shot.split else split_panel_frac(shot.cams, meta.width, meta.height, rc, out_w / out_h)
+    panel_h = min(out_h - 2, _even(frac * out_h))
+    if shot.split:
+        return _sized_geometry(shot, sw, sh, out_w, out_h, panel_h)
     if shot.cam_box:  # the facecam frame set in the editor: one cam across the whole panel
         return panel_h, [cam_box_crop(shot.cam_box, out_w / panel_h, sw, sh)], \
             screen_crop(shot.cams, sw, sh, out_w / (out_h - panel_h))
@@ -443,6 +462,37 @@ def split_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, meta: V
 
     screen = screen_crop(shot.cams, sw, sh, out_w / (out_h - panel_h))
     return panel_h, cams, screen
+
+
+def _sized_geometry(shot: Shot, sw: int, sh: int, out_w: int, out_h: int, panel_h: int):
+    """split_geometry for window sizes set in the editor: each crop takes its window's shape."""
+    (_, tw), (_, _, gw, gh) = split_boxes(shot, out_w, out_h, panel_h)
+    if shot.cam_box:
+        cams = [cam_box_crop(shot.cam_box, tw / panel_h, sw, sh)]
+    else:
+        n = len(shot.cams)
+        cams = []
+        for k, (x0, y0, x1, y1) in enumerate(shot.cams):
+            w_k = tw - (tw // n) * (n - 1) if k == n - 1 else tw // n
+            fx = shot.face_x[k] if k < len(shot.face_x) else 0.5
+            fy = max(0.0, (shot.face_y[k] if k < len(shot.face_y) else 0.45) - 0.12)
+            ix, iy = 0.015 * (x1 - x0), 0.015 * (y1 - y0)
+            a, b, c, d = crop_to_aspect((x0 + ix) * sw, (y0 + iy) * sh, (x1 - ix) * sw, (y1 - iy) * sh,
+                                        w_k / panel_h, fx, fy)
+            cams.append((int(a), int(b), max(int(a) + 2, int(c)), max(int(b) + 2, int(d))))
+    # the automatic gameplay crop in the window's shape (central, off the cam); keys move it per frame
+    return panel_h, cams, screen_crop(shot.cams, sw, sh, gw / gh)
+
+
+def _sized_screen_crop(shot: Shot, i: int, sw: int, sh: int, e: float, auto: tuple[int, int, int, int]):
+    """The gameplay crop at frame i for a sized layout: shape e, at the editor's position (keys) if any."""
+    if not shot.x:
+        return auto
+    x = shot.x[min(max(i - shot.start, 0), len(shot.x) - 1)]
+    cw = min(sw, max(2, round(sh * e)))
+    ch = min(sh, max(2, round(cw / e)))
+    left = int(np.clip(round(x * sw - cw / 2), 0, sw - cw))
+    return left, (sh - ch) // 2, left + cw, (sh - ch) // 2 + ch
 
 
 def edited_screen(frame: np.ndarray, shot: Shot, i: int, area_w: int, area_h: int, rc: ReframeCfg, cv2,
@@ -467,6 +517,8 @@ def compose_split(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, meta: V
     """Facecam(s) on top, the screen underneath."""
     sh, sw = frame.shape[:2]
     panel_h, cams, (gl, gt, gr, gb) = split_geometry(shot, sw, sh, out_w, out_h, meta, rc)
+    if shot.split:
+        return _compose_sized(frame, shot, out_w, out_h, rc, cv2, interp, i, panel_h, cams, (gl, gt, gr, gb))
     out = np.empty((out_h, out_w, 3), np.uint8)
     n = len(cams)
     slot_w = out_w // n
@@ -476,6 +528,24 @@ def compose_split(frame: np.ndarray, shot: Shot, out_w: int, out_h: int, meta: V
         out[:panel_h, x:x + w_k] = _resize(frame[b:d, a:c], w_k, panel_h, cv2, interp)
     screen = edited_screen(frame, shot, i, out_w, out_h - panel_h, rc, cv2, interp)
     out[panel_h:] = screen if screen is not None else _resize(frame[gt:gb, gl:gr], out_w, out_h - panel_h, cv2, interp)
+    return out
+
+
+def _compose_sized(frame, shot: Shot, out_w: int, out_h: int, rc: ReframeCfg, cv2, interp, i: int, panel_h: int,
+                   cams, auto_screen) -> np.ndarray:
+    """Cam-on-top layout with window sizes from the editor: each window centred in its place over blur."""
+    sh, sw = frame.shape[:2]
+    (tx, tw), (gx, gy, gw, gh) = split_boxes(shot, out_w, out_h, panel_h)
+    full = tw >= out_w and gw >= out_w and gh >= out_h - panel_h
+    out = np.empty((out_h, out_w, 3), np.uint8) if full else blurred_bg(frame, out_w, out_h, rc, cv2)
+    n = len(cams)
+    x = tx
+    for k, (a, b, c, d) in enumerate(cams):
+        w_k = tw - (tw // n) * (n - 1) if k == n - 1 else tw // n
+        out[:panel_h, x:x + w_k] = _resize(frame[b:d, a:c], w_k, panel_h, cv2, interp)
+        x += w_k
+    gl, gt, gr, gb = _sized_screen_crop(shot, i, sw, sh, gw / gh, auto_screen)
+    out[gy:gy + gh, gx:gx + gw] = _resize(frame[gt:gb, gl:gr], gw, gh, cv2, interp)
     return out
 
 

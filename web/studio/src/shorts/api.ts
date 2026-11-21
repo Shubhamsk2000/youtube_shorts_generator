@@ -178,7 +178,17 @@ export interface EditorShot {
   why: string;
   x: number[] | null;
   cams: number[][];
+  face_x?: number[];         // facecam shot: the face's position inside each cam (fractions of the cam)
+  face_y?: number[];
   cam_view: CamView | null; // facecam shot: how the layout draws it
+}
+
+/** Window sizes of the cam-on-top layout set in the editor (whole clip), fractions of the output. */
+export interface SplitSize {
+  cam_h: number;   // cam panel height (of the short's height); the gameplay area is the rest
+  cam_w: number;   // cam window width (of the short's width), centred
+  game_w: number;  // gameplay window width (of the short's width), centred
+  game_h: number;  // gameplay window height (of the area under the cam), centred
 }
 
 /** A facecam shot on the 9:16 frame (fractions of the output, sources as fractions of the frame). */
@@ -188,6 +198,8 @@ export interface CamView {
   screen_a: number;
   tiles: { src: number[]; dst: number[] }[];  // each cam: source box [x0, y0, x1, y1] -> output box [x, y, w, h]
   pip: boolean;             // corner cam (else the cam panel on top)
+  sized?: boolean;          // window sizes set in the editor: windows over a blurred fill
+  game?: number[];          // sized: the gameplay window on the output [x, y, w, h]
 }
 
 export interface EditorData {
@@ -201,6 +213,7 @@ export interface EditorData {
   keys: FrameKey[];
   keep_cam: boolean;        // facecam shots: keys set only the gameplay window, the cam stays
   cam: CamBox | null;       // facecam frame set in the editor (null = the automatic cam crop)
+  split: SplitSize | null;  // window sizes of the cam-on-top layout (null = automatic)
   keep: [number, number][] | null;
   flash: [number, number] | null;
   layout: { out_w: number; out_h: number; fit_y: number; fit_dim: number; screen_layout: ScreenLayout; background: Background; max_aspect: number };
@@ -291,9 +304,9 @@ export const api = {
   editor: (id: string, clipId: string) => request<EditorData>(`${J(id)}/clips/${encodeURIComponent(clipId)}/editor`),
   warmProxy: (id: string, clipId: string) =>
     request<void>(`${J(id)}/clips/${encodeURIComponent(clipId)}/proxy`, { method: "POST", timeoutMs: 300000 }),
-  setFraming: (id: string, clipId: string, keys: FrameKey[], keepCam: boolean, cam: CamBox | null) =>
-    request<{ keys: FrameKey[]; keep_cam: boolean; cam: CamBox | null; rerender: boolean }>(
-      `${J(id)}/clips/${encodeURIComponent(clipId)}/framing`, json("PUT", { keys, keep_cam: keepCam, cam })),
+  setFraming: (id: string, clipId: string, keys: FrameKey[], keepCam: boolean, cam: CamBox | null, split: SplitSize | null) =>
+    request<{ keys: FrameKey[]; keep_cam: boolean; cam: CamBox | null; split: SplitSize | null; rerender: boolean }>(
+      `${J(id)}/clips/${encodeURIComponent(clipId)}/framing`, json("PUT", { keys, keep_cam: keepCam, cam, split })),
   trim: (id: string, clipId: string) => request<TrimData>(`${J(id)}/clips/${encodeURIComponent(clipId)}/trim`),
   setTrim: (id: string, clipId: string, start: number, end: number) =>
     request<{ clip: Clip; dropped_keys: number; rerender: boolean }>(
