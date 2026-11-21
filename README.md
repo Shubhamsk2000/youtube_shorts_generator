@@ -78,6 +78,11 @@ Every AI call goes through `src/common/llm.py`; how each provider is called live
 (Gemini, or any OpenAI-compatible API such as NVIDIA NIM, OpenRouter, Groq, Ollama). Choose the provider per task in
 **`configs/llm.yaml`**: no code changes. The model picker in Studio saves its choice to `configs/llm.local.yaml`.
 
+When a model fails (quota, overload, retired model, refused key) the next one is tried: the task's provider's
+other models and keys first, then every other provider with a key set (`fallback:` in `llm.yaml`). Extra keys for
+one provider go in `.env` as `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`... If every AI fails, picking stops with the
+reason and a Retry; rough offline picks (loudness / transcript rules) only happen with `select.offline_fallback: true`.
+
 ## Layout
 
 ```

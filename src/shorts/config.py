@@ -69,7 +69,7 @@ class SelectCfg(_Strict):
     timeout_s: float = 180.0
     max_retries: int = 4         # per model, on 429/503/timeouts
     min_interval_s: float = 4.0  # spacing between calls (free-tier per-minute limits)
-    offline_fallback: bool = True  # if Gemini is unreachable, pick moments with a heuristic
+    offline_fallback: bool = False  # every AI failed: pick rough moments with a heuristic (off = stop with Retry)
     refine: bool = True          # 2nd Gemini pass: compare all picks, tighten hooks, write on-screen text
     use_heatmap: bool = True     # YouTube "Most replayed" data as a signal (when the video has it)
     use_audio: bool = True       # loudness + reactions (crash, screams, laughter) from the audio as signals

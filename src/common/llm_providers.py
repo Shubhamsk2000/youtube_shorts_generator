@@ -25,9 +25,12 @@ class LLMError(RuntimeError):
 
 
 class Retryable(Exception):
-    def __init__(self, msg: str, wait: float | None = None, switch_model: bool = False, overloaded: bool = False):
+    """switch_model: this model won't answer soon (quota, retired); bad_key: the API key was refused (try the
+    provider's next key, if it has one)."""
+    def __init__(self, msg: str, wait: float | None = None, switch_model: bool = False, overloaded: bool = False,
+                 bad_key: bool = False):
         super().__init__(msg)
-        self.wait, self.switch_model, self.overloaded = wait, switch_model, overloaded
+        self.wait, self.switch_model, self.overloaded, self.bad_key = wait, switch_model, overloaded, bad_key
 
 
 Part = str | tuple[str, bytes]   # text, or (mime type, bytes) for inline audio / video / images
@@ -56,20 +59,36 @@ class ProviderCfg:
     name: str
     kind: str = "gemini"                      # gemini | openai (any OpenAI-compatible endpoint)
     base_url: str | None = None
-    api_key_env: str | None = None            # name of the .env variable that holds the key
+    api_key_env: str | list[str] | None = None  # .env variable(s) with the key; NAME_2, NAME_3... are extra keys
     models: list[str] = field(default_factory=list)
     min_interval_s: float | None = None       # spacing between calls (free tiers); None = caller's value
     json_mode: str = "object"                 # openai kind: object | schema | none
     extra_body: dict = field(default_factory=dict)   # merged into every request (provider-specific options)
     headers: dict = field(default_factory=dict)
 
-    def key(self) -> str:
+    def key_names(self) -> list[str]:
+        envs = [self.api_key_env] if isinstance(self.api_key_env, str) else list(self.api_key_env or [])
+        return list(dict.fromkeys(n for e in envs if e for n in (e, *(f"{e}_{i}" for i in range(2, 10)))))
+
+    def keys(self) -> list[str]:
+        """Every key set for this provider, in order (GEMINI_API_KEY, GEMINI_API_KEY_2, ...). [""] = no key needed."""
         if not self.api_key_env:
-            return ""
-        k = os.getenv(self.api_key_env, "").strip()
-        if not k:
-            raise LLMError(f"{self.api_key_env} is not set (add it to .env) for the '{self.name}' provider")
-        return k
+            return [""]
+        ks = list(dict.fromkeys(k for n in self.key_names() if (k := os.getenv(n, "").strip())))
+        if not ks:
+            first = self.key_names()[0] if self.key_names() else "an API key"
+            raise LLMError(f"{first} is not set (add it to .env) for the '{self.name}' provider")
+        return ks
+
+    def key(self) -> str:
+        return self.keys()[0]
+
+    def has_key(self) -> bool:
+        try:
+            self.keys()
+            return True
+        except LLMError:
+            return False
 
 
 # ------------------------------------------------------------------ HTTP helper
@@ -98,7 +117,12 @@ def _post(url: str, body: dict, headers: dict, timeout_s: float, who: str) -> di
             raise Retryable(f"HTTP {e.code} {err.get('status', '')}".strip(), overloaded=True) from None
         if e.code == 404:
             raise Retryable("model not found", switch_model=True) from None
-        raise LLMError(f"{who} HTTP {e.code}: {msg}") from None   # 400/401/403: retrying won't help
+        if e.code == 410:
+            raise Retryable("model retired by the provider (HTTP 410)", switch_model=True) from None
+        if e.code in (401, 403) or (e.code == 400 and re.search(r"api[ _]?key", msg, re.I)):
+            raise Retryable(f"API key refused (HTTP {e.code}{': ' + msg[:80] if msg else ''})",
+                            switch_model=True, bad_key=True) from None
+        raise LLMError(f"{who} HTTP {e.code}: {msg}") from None   # a bad request: retrying won't help
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
         raise Retryable(f"network: {getattr(e, 'reason', e)}",
                         overloaded=isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in str(e)) from None
@@ -130,7 +154,7 @@ class GeminiProvider:
         base = self.cfg.base_url.rstrip("/") + "/models/{model}:{method}" if self.cfg.base_url else self.API
         return base.format(model=model, method=method)
 
-    def generate(self, model: str, req: Request) -> str:
+    def generate(self, model: str, req: Request, key: str | None = None) -> str:
         body: dict = {
             "contents": [{"role": "user", "parts": _gemini_parts(req.parts)}],
             "generationConfig": {"temperature": req.temperature},
@@ -139,7 +163,7 @@ class GeminiProvider:
             body["generationConfig"].update(responseMimeType="application/json", responseSchema=req.schema)
         if req.system:
             body["systemInstruction"] = {"parts": [{"text": req.system}]}
-        resp = _post(self._url(model), body, {"x-goog-api-key": self.cfg.key(), **self.cfg.headers},
+        resp = _post(self._url(model), body, {"x-goog-api-key": key or self.cfg.key(), **self.cfg.headers},
                      req.timeout_s, "Gemini")
         cands = resp.get("candidates") or []
         if not cands:
@@ -177,7 +201,7 @@ class OpenAICompatProvider:
             raise LLMError(f"provider '{cfg.name}' needs a base_url in configs/llm.yaml")
         self.cfg = cfg
 
-    def generate(self, model: str, req: Request) -> str:
+    def generate(self, model: str, req: Request, key: str | None = None) -> str:
         if req.has_media:
             raise LLMError(f"provider '{self.cfg.name}' can't take audio/video (set media: to gemini)")
         system = req.system or ""
@@ -193,7 +217,7 @@ class OpenAICompatProvider:
             body["response_format"] = {"type": "json_schema", "json_schema": {
                 "name": "answer", "schema": openai_schema(req.schema), "strict": False}}
         headers = dict(self.cfg.headers)
-        if key := self.cfg.key():
+        if key := (key if key is not None else self.cfg.key()):
             headers["Authorization"] = f"Bearer {key}"
         resp = _post(self.cfg.base_url.rstrip("/") + "/chat/completions", body, headers, req.timeout_s, self.cfg.name)
         choices = resp.get("choices") or []
@@ -202,7 +226,11 @@ class OpenAICompatProvider:
         text = (choices[0].get("message") or {}).get("content") or ""
         if not text.strip():
             raise Retryable(f"empty answer (finish reason {choices[0].get('finish_reason')})")
-        return extract_json(text) if req.schema else text
+        if req.schema:
+            text = extract_json(text)
+            if not text:  # a reasoning model that only "thought" (cut off before answering)
+                raise Retryable(f"no answer after its reasoning (finish reason {choices[0].get('finish_reason')})")
+        return text
 
 
 
@@ -234,7 +262,7 @@ def extract_json(text: str) -> str:
         starts = [i for i in (t.find("{"), t.find("[")) if i >= 0]
         if starts:
             t = t[min(starts):]
-    if t[:1] in "{[":
+    if t and t[0] in "{[":
         close = "}" if t[0] == "{" else "]"
         t = t[: t.rfind(close) + 1] or t
     return t

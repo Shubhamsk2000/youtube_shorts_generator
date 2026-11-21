@@ -11,7 +11,16 @@
 #
 # A model chosen in the UI is saved to configs/llm.local.yaml and wins over tasks: below.
 #
+# When every model of a task's provider fails (quota, overload, retired model, refused key), the other providers
+# are tried, in the order listed under providers:. `fallback: auto` = every other provider whose key is set;
+# a list (e.g. [gemini]) = only those; `none` = never switch provider.
+#
+# Several keys for one provider: GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3... in .env. The next key is
+# used when one runs out of quota or is refused (quota is counted per key and model).
+#
 # Task names: shorts.select, shorts.refine
+
+fallback: auto
 
 default:
   provider: gemini
@@ -38,7 +47,11 @@ providers:
     base_url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
     # every model listed here shows up in Studio's model picker (Clips panel); the first is the default
-    models: [nvidia/nemotron-3.5-super-vl-120b-a12b, mistralai/mistral-large-4-1t-a52b, deepseek-ai/deepseek-v4.1-flash]
+    # Tested 2026-11-21 on a real 20-min window (180 s limit): nemotron-3.5-super 94 s / 13 picks, minimax-m3.1-flash
+    # 65 s / 20 picks, nemotron-3-ultra 150 s / 14 picks (best scores, but close to the time limit). Timed out:
+    # mistral-large-4, kimi-k3.1-pro, glm-5.3-flash, step-5-preview, gemma-4-31b, muse-glimmer-30b.
+    # Retired (HTTP 410): deepseek-v4.1-flash.
+    models: [nvidia/nemotron-3.5-super-vl-120b-a12b, minimaxai/minimax-m3.1-flash, nvidia/nemotron-3-ultra-550b-a55b]
     min_interval_s: 2
 
   # OpenRouter: one key, many models (some free, ids ending in :free).
