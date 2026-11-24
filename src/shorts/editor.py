@@ -90,7 +90,7 @@ def view(job_dir: Path, meta: VideoMeta, c: Clip, cfg: Config) -> dict:
             "duration_s": cfg.hook.duration_s,
             "size": cfg.hook.size, "max_chars_per_line": cfg.hook.max_chars_per_line,
         },
-        "captions": {"enabled": cfg.captions.enabled, "position": cfg.captions.position, "size": cfg.captions.size},
+        "captions": captions.preview(job_dir, cfg, meta, c),
     }
 
 

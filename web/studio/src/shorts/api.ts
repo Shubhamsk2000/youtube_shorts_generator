@@ -202,6 +202,28 @@ export interface CamView {
   game?: number[];          // sized: the gameplay window on the output [x, y, w, h]
 }
 
+/** The captions as the render burns them in, on the clip's own (uncut) timeline: seconds from the clip start. */
+export interface CaptionLine {
+  start: number;
+  end: number;
+  y: number | null;         // the line's centre, fraction of the height; null = bottom edge at `position`
+  words: { text: string; start: number; end: number; emphasis: boolean }[];
+}
+
+export interface EditorCaptions {
+  enabled: boolean;
+  position: number;         // default line: bottom edge, fraction of the height
+  size: number;             // px on 1080x1920
+  font: string;
+  text_color: string;
+  highlight_color: string;  // the word being spoken
+  emphasis_color: string;
+  outline: number;
+  shadow: number;
+  pop_scale: number;
+  lines: CaptionLine[];
+}
+
 export interface EditorData {
   fps: number;
   n_frames: number;
@@ -218,7 +240,7 @@ export interface EditorData {
   flash: [number, number] | null;
   layout: { out_w: number; out_h: number; fit_y: number; fit_dim: number; screen_layout: ScreenLayout; background: Background; max_aspect: number };
   hook: { enabled: boolean; auto: boolean; text: string; position: number; y: number | null; duration_s: number; size: number; max_chars_per_line: number };
-  captions: { enabled: boolean; position: number; size: number };
+  captions: EditorCaptions;
   clip: Clip;
   prev: string | null;
   next: string | null;

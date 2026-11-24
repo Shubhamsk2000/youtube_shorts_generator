@@ -111,6 +111,33 @@ def build_clip(job_dir: Path, cfg: Config, t: Transcript, meta: VideoMeta, c: Cl
     if not lines and not hook:
         p.unlink(missing_ok=True)
         return keep, flash, 0
+    plan, seam, line_y = _placer(job_dir, cfg, meta, c, keep, lead)
+
+    hook_min_y = None
+    if hook and plan is not None:  # keep the hook clear of the facecam (corner or top panel) while it shows
+        spans = [(0, int(pacing.unmap(min(cfg.hook.duration_s, c.duration), keep) * plan.fps) + 1)]
+        if flash:  # the cold open plays first, from the payoff's frames
+            spans.append((int(flash[0] * plan.fps), int(flash[1] * plan.fps) + 1))
+        bottoms = []
+        for sh in plan.shots:
+            if not any(sh.start < e and s < sh.end for s, e in spans):
+                continue
+            if (b := pip_bottom(sh, plan.src_w, plan.src_h, cfg.reframe, H)) is not None:
+                bottoms.append(b)
+            elif (y := seam(sh)) is not None:  # below the caption line that sits on the seam
+                bottoms.append(y + round(cc.size * 0.6))
+        hook_min_y = max(bottoms) if bottoms else None
+    text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead, hook_min_y=hook_min_y, hook_y=c.hook_y)
+    if not p.exists() or p.read_text() != text:  # unchanged files keep their render cache valid
+        p.write_text(text)
+    return keep, flash, len(lines)
+
+
+def _placer(job_dir: Path, cfg: Config, meta: VideoMeta, c: Clip, keep: list[pacing.Span] | None, lead: float):
+    """(framing plan, seam(shot), line_y(start on the output timeline)): where the caption line of each moment
+    goes, shared by the burned-in captions and the editor's live preview."""
+    cc = cfg.captions
+    cv = canvas(cfg, W, H, c)
     plan = framing.load_plan(job_dir, c, cfg, meta)
     win_aspect = cv.win[2] / cv.win[3]
 
@@ -136,24 +163,57 @@ def build_clip(job_dir: Path, cfg: Config, t: Transcript, meta: VideoMeta, c: Cl
             return default
         return avoid_y(visible_text_boxes(plan, fi, cfg.reframe), cc)
 
-    hook_min_y = None
-    if hook and plan is not None:  # keep the hook clear of the facecam (corner or top panel) while it shows
-        spans = [(0, int(pacing.unmap(min(cfg.hook.duration_s, c.duration), keep) * plan.fps) + 1)]
-        if flash:  # the cold open plays first, from the payoff's frames
-            spans.append((int(flash[0] * plan.fps), int(flash[1] * plan.fps) + 1))
-        bottoms = []
-        for sh in plan.shots:
-            if not any(sh.start < e and s < sh.end for s, e in spans):
-                continue
-            if (b := pip_bottom(sh, plan.src_w, plan.src_h, cfg.reframe, H)) is not None:
-                bottoms.append(b)
-            elif (y := seam(sh)) is not None:  # below the caption line that sits on the seam
-                bottoms.append(y + round(cc.size * 0.6))
-        hook_min_y = max(bottoms) if bottoms else None
-    text = to_ass(lines, cc, hook, cfg.hook, line_y, lead=lead, hook_min_y=hook_min_y, hook_y=c.hook_y)
-    if not p.exists() or p.read_text() != text:  # unchanged files keep their render cache valid
-        p.write_text(text)
-    return keep, flash, len(lines)
+    return plan, seam, line_y
+
+
+_transcripts: dict[Path, tuple[float, Transcript]] = {}
+
+
+def _transcript(job_dir: Path) -> Transcript:
+    """transcript.json, kept in memory while unchanged (a day-long stream's is ~12 MB)."""
+    p = job_dir / "transcript.json"
+    mt = p.stat().st_mtime
+    hit = _transcripts.get(p)
+    if hit and hit[0] == mt:
+        return hit[1]
+    t = load_json(Transcript, p)
+    _transcripts.clear()  # one job open in the editor at a time: keep just that one
+    _transcripts[p] = (mt, t)
+    return t
+
+
+def preview(job_dir: Path, cfg: Config, meta: VideoMeta, c: Clip) -> dict:
+    """The captions as they will be burned in, on the clip's own (uncut) timeline, for the editor's live
+    preview: same lines, same word timing, same position per line. Line times are clip seconds, y is the
+    line's centre as a fraction of the height (None = the default position: bottom edge at `position`)."""
+    cfg = with_job_layout(cfg, job_dir)
+    cc = cfg.captions
+    style = {"enabled": cc.enabled, "position": cc.position, "size": cc.size, "font": cc.font,
+             "text_color": cc.text_color, "highlight_color": cc.highlight_color,
+             "emphasis_color": cc.emphasis_color, "outline": cc.outline, "shadow": cc.shadow,
+             "pop_scale": cc.pop_scale, "lines": []}
+    if not cc.enabled or not (job_dir / "transcript.json").exists():
+        return style
+    keep, flash = pacing.load_edits(job_dir, c)
+    if not cfg.pacing.enabled:
+        keep = None
+    if not cfg.cold_open.enabled:
+        flash = None
+    lead = flash[1] - flash[0] if flash else 0.0
+    lines = build_lines(edit_words(clip_words(_transcript(job_dir), c, cc), keep, c.duration, cc, lead), cc)
+    _, _, line_y = _placer(job_dir, cfg, meta, c, keep, lead)
+
+    def back(x: float) -> float:  # output timeline -> clip seconds (what the editor's player shows)
+        return round(pacing.unmap(max(0.0, x - lead), keep), 3)
+
+    out = []
+    for ln in lines:
+        y = line_y(ln.start)
+        out.append({"start": back(ln.start), "end": back(ln.end), "y": None if y is None else round(y / H, 4),
+                    "words": [{"text": w.text, "start": back(w.start), "end": back(w.end), "emphasis": w.emphasis}
+                              for w in ln.words]})
+    style["lines"] = out
+    return style
 
 
 def refresh_clip(job_dir: Path, cfg: Config, c: Clip) -> None:

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type PointerEvent as RPointerEvent } from "react";
-import type { EditorData } from "../api";
+import type { EditorCaptions, EditorData } from "../api";
 import { FILL, clamp, type Win } from "./frame";
 
 export type PreviewOpts = {
@@ -8,6 +8,7 @@ export type PreviewOpts = {
   showHook: boolean;
   hookY: number;        // banner's vertical centre, fraction of the height
   hookAlways?: boolean; // show it past its first seconds (while it's being placed)
+  captions?: boolean;   // draw the captions (default on)
 };
 
 /** Where the hook banner was drawn (fractions of the height), for dragging it. */
@@ -107,7 +108,77 @@ function drawCamLayout(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, d
   }
 }
 
-/** One frame of the short: the window (full screen, or full width over blur), hook banner, guides. */
+const capFont = (px: number) => `900 ${px}px Inter, "Geist", system-ui, sans-serif`;
+
+/** The caption line on screen at clip time t, as captions.to_ass burns it in: the spoken word in the highlight
+ * colour and a little bigger, AI-flagged words in the emphasis colour, black outline + soft shadow. */
+export function drawCaptions(ctx: CanvasRenderingContext2D, c: EditorCaptions, t: number, W: number, H: number) {
+  const line = c.lines?.find((l) => t >= l.start && t < l.end); // lines: missing from a server older than this page
+  if (!line || !line.words.length) return;
+  const k = H / 1920;
+  const size = c.size * k;
+  let active = 0;
+  for (let i = 1; i < line.words.length; i++) if (line.words[i].start <= t) active = i;
+  const pop = c.pop_scale * (line.words[active].emphasis ? 1.06 : 1);
+  ctx.font = capFont(size);
+  const space = ctx.measureText(" ").width;
+  const words = line.words.map((w, i) => ({ ...w, i, s: i === active ? pop : 1, w: ctx.measureText(w.text).width * (i === active ? pop : 1) }));
+  // wrap like libass inside the style's 70 px side margins
+  const maxW = W - 140 * k;
+  const rows: (typeof words)[] = [];
+  let cur: typeof words = [];
+  let curW = 0;
+  for (const w of words) {
+    const add = (cur.length ? space : 0) + w.w;
+    if (cur.length && curW + add > maxW) {
+      rows.push(cur);
+      cur = [];
+      curW = 0;
+    }
+    cur.push(w);
+    curW += (cur.length > 1 ? space : 0) + w.w;
+  }
+  if (cur.length) rows.push(cur);
+  const lh = size * 1.12;
+  const blockH = lh * rows.length;
+  const cy = line.y != null ? line.y * H : c.position * H - blockH / 2; // default: bottom edge at `position`
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineJoin = "round";
+  ctx.miterLimit = 2;
+  rows.forEach((row, r) => {
+    const rowW = row.reduce((a, w) => a + w.w, 0) + space * (row.length - 1);
+    let x = W / 2 - rowW / 2;
+    const y = cy - blockH / 2 + lh * (r + 0.5);
+    for (const w of row) {
+      const cx = x + w.w / 2;
+      const color = w.i === active ? c.highlight_color : w.emphasis ? c.emphasis_color : c.text_color;
+      ctx.save();
+      ctx.translate(cx, y);
+      ctx.scale(w.s, w.s);
+      ctx.font = capFont(size);
+      if (c.shadow > 0) {
+        const off = c.shadow * k / w.s;
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.strokeStyle = "rgba(0,0,0,0.6)";
+        ctx.lineWidth = (2 * c.outline * k) / w.s;
+        ctx.strokeText(w.text, off, off);
+        ctx.fillText(w.text, off, off);
+      }
+      if (c.outline > 0) {
+        ctx.strokeStyle = "#000";
+        ctx.lineWidth = (2 * c.outline * k) / w.s;
+        ctx.strokeText(w.text, 0, 0);
+      }
+      ctx.fillStyle = color;
+      ctx.fillText(w.text, 0, 0);
+      ctx.restore();
+      x += w.w + space;
+    }
+  });
+}
+
+/** One frame of the short: the window (full screen, or full width over blur), captions, hook banner, guides. */
 export function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement | null, d: EditorData, win: Win, t: number, o: PreviewOpts): HookBox | null {
   const W = ctx.canvas.width;
   const H = ctx.canvas.height;
@@ -132,6 +203,8 @@ export function drawFrame(ctx: CanvasRenderingContext2D, video: HTMLVideoElement
     const y = clamp(d.layout.fit_y * H - bandH / 2, 0, H - bandH);
     ctx.drawImage(video, left, 0, cw, vh, 0, y, W, bandH);
   }
+
+  if (d.captions.enabled && o.captions !== false) drawCaptions(ctx, d.captions, t, W, H);
 
   const hook = d.hook;
   let box: HookBox | null = null;

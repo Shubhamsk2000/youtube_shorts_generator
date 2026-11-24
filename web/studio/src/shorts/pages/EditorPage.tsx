@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
-  ArrowLeft, Check, ChevronLeft, ChevronRight, Diamond, Eye, Keyboard, LoaderCircle, Lock, Pause, Play, Redo2,
+  ArrowLeft, Captions, Check, ChevronLeft, ChevronRight, Diamond, Eye, Keyboard, LoaderCircle, Lock, Pause, Play, Redo2,
   RotateCcw, ScanFace, SkipBack, SkipForward, Undo2, X,
 } from "lucide-react";
 import { useConfirm, useToast, ErrorBoundary } from "@kit/feedback";
@@ -99,6 +99,7 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
   const [skipPauses, setSkipPauses] = useStored("editor.skipPauses", true);
   const [showFaces, setShowFaces] = useStored("editor.faces", false);
   const [safe, setSafe] = useStored("editor.safe", false);
+  const [showCaps, setShowCaps] = useStored("editor.captions", true);
   const [tab, setTab] = useState<"live" | "rendered">("live");
 
   const fps = d.fps;
@@ -567,10 +568,18 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
                 ))}
               </div>
               {tab === "live" && (
+                <span className="flex items-center">
+                {d.captions.enabled && (
+                  <button onClick={() => setShowCaps(!showCaps)} className={cx("inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs transition", showCaps ? "text-accent" : "text-muted hover:text-fg")}
+                    title="The captions exactly as they are burned in: check they say what is said">
+                    <Captions className="size-3.5" /> Captions
+                  </button>
+                )}
                 <button onClick={() => setSafe(!safe)} className={cx("inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs transition", safe ? "text-accent" : "text-muted hover:text-fg")}
                   title="Where the Shorts app draws its buttons and text (approximate), and the caption line">
                   <Eye className="size-3.5" /> Safe zones
                 </button>
+                </span>
               )}
             </div>
             <div className="mx-auto max-w-[300px]">
@@ -578,6 +587,7 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
                 <Preview
                   draw={(ctx) => drawFrame(ctx, video.current, d, win, t, {
                     safe, hookText: previewText, showHook: hookShown, hookY: hookY ?? d.hook.position, hookAlways: placing,
+                    captions: showCaps,
                   })}
                   onHookDrag={hookShown ? (y, phase) => {
                     if (phase === "start") pause();
@@ -592,7 +602,11 @@ function Editor({ jobId, d, reload, setData }: { jobId: string; d: EditorData; r
               )}
             </div>
             <p className="mt-2 text-center text-[11px] text-faint">
-              {tab === "live" ? "Approximate: captions and exact layouts show in the rendered preview" : dirty ? "Shows the last saved framing" : "The real render"}
+              {tab === "live"
+                ? d.captions.enabled && showCaps && d.captions.lines && !d.captions.lines.length
+                  ? "Nothing is said in this clip: no captions"
+                  : "Live: captions as they render; exact layout in Rendered"
+                : dirty ? "Shows the last saved framing" : "The real render"}
             </p>
           </div>
 
