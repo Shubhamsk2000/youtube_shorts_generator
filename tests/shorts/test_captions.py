@@ -85,3 +85,34 @@ def test_money_and_numbers_are_emphasised():
     out = clip_words(t, clip, CC)
     assert [w.text for w in out if w.emphasis] == ["$10,000", "100"]
     assert not any(w.emphasis for w in clip_words(t, clip, CaptionCfg(emphasize_numbers=False)))
+
+
+def test_editor_preview_is_the_burned_in_captions_on_the_clip_timeline(tmp_path):
+    """The editor plays the uncut clip: its captions are the render's lines, with removed pauses mapped back."""
+    from shorts.config import Config
+    from shorts.models import VideoMeta, save_json
+    from shorts.stages import captions, pacing
+
+    words = [Word(text="Hello", start=100.0, end=100.4, prob=1), Word(text="world.", start=100.5, end=100.9, prob=1),
+             Word(text="Again", start=103.0, end=103.4, prob=1)]
+    t = Transcript(language="en", model="x", duration=200,
+                   sentences=[Sentence(id=0, start=100, end=103.4, text="Hello world. Again", words=words)])
+    save_json(t, tmp_path / "transcript.json")
+    meta = VideoMeta(id="v", title="t", duration=200, width=1920, height=1080, fps=30, file="v.mp4")
+    save_json(meta, tmp_path / "meta.json")
+    clip = Clip(id="p", rank=1, start=100.0, end=104.0, start_sentence=0, end_sentence=0, title="t", hook="h",
+                reason="r", scores=ClipScores(hook=5, standalone=5, payoff=5, energy=5), score=5, text="")
+    keep = [(0.0, 1.2), (2.8, 4.0)]   # the 1.6 s pause is cut in the render
+    pacing.save_edits(tmp_path, clip, keep)
+    cfg = Config()
+    p = captions.preview(tmp_path, cfg, meta, clip)
+    assert p["enabled"] and p["highlight_color"] == cfg.captions.highlight_color
+    got = [[w["text"] for w in ln["words"]] for ln in p["lines"]]
+    assert got == [["HELLO", "WORLD"], ["AGAIN"]]
+    again = p["lines"][1]["words"][0]
+    assert abs(again["start"] - 3.0) < 1e-3          # where the editor's player says it
+    burned = build_lines(captions.edit_words(clip_words(t, clip, cfg.captions), keep, clip.duration,
+                                             cfg.captions), cfg.captions)
+    assert abs(burned[1].words[0].start - 1.4) < 1e-3  # where the render burns it (pause removed)
+    assert abs(pacing.unmap(burned[1].words[0].start, keep) - again["start"]) < 1e-3
+    assert all(ln["y"] is None for ln in p["lines"])   # no framing plan: the default position

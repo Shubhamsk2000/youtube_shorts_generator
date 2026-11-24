@@ -153,10 +153,13 @@ def ensure(job_dir: Path, meta: VideoMeta, cfg: Config, clips: list[Clip],
     report = report or (lambda fraction=None, message=None: None)
     idx = load_index(job_dir)
     todo = [c for c in clips if not ((e := idx.clips.get(c.id)) and (sources_dir(job_dir) / e.file).exists()
-                                     and covers(e, c))]
+                                     and covers(e, c) and trusted(job_dir, e, c))]
     if not todo:
         return 0, 0
     sources_dir(job_dir).mkdir(exist_ok=True)
+    for c in todo:
+        if c.id in idx.clips:  # its video is replaced: what was analysed / rendered from the old one goes too
+            forget_derived(job_dir, c)
     full = full_source(job_dir, meta)
     fetcher = None if full else RangeFetcher(meta, cfg)
     if fetcher and not meta.source_url:
@@ -178,6 +181,25 @@ def ensure(job_dir: Path, meta: VideoMeta, cfg: Config, clips: list[Clip],
         save_index(job_dir, idx)  # after every clip: an interruption keeps what is done
     report(1.0, None)
     return len(todo), approx
+
+
+def trusted(job_dir: Path, e: SourceEntry, c: Clip) -> bool:
+    """A file placed by estimate is only kept for a silent clip (nothing to measure). Jobs made before every
+    spoken clip was measured could keep a guess that was minutes off: the footage of another moment under
+    this clip's captions. Those are fetched again."""
+    if e.aligned or e.how != "download":
+        return True
+    wav = job_dir / "audio.wav"
+    return not wav.exists() or _rms_db(read_wav(wav, c.start, c.end)) < -50
+
+
+def forget_derived(job_dir: Path, c: Clip) -> None:
+    """The face analysis and preview made from a clip's old video file (its frames are no longer these)."""
+    from .reframe import plan_path
+    from .render import CLIPS_DIR
+    plan_path(job_dir, c).unlink(missing_ok=True)
+    for f in (job_dir / CLIPS_DIR).glob(f"{c.id}-*.mp4"):
+        f.unlink(missing_ok=True)
 
 
 def cleanup_source(job_dir: Path, meta: VideoMeta, cfg: Config, sel: Selection) -> int:
@@ -258,25 +280,34 @@ class RangeFetcher:
         err = _calib_error(idx.calib, c.start)
         fragmented = dl.is_fragmented(self.info())
 
-        if fragmented and not silent:
-            # cheap first: the audio around the clip, wide enough for any drift, to measure the error
-            reach = min(PROBE_MAX_S, max(PROBE_MIN_S, PROBE_DRIFT * c.start))
-            if idx.calib:
-                reach = min(reach, PROBE_MIN_S + 0.001 * min(abs(c.start - t) for t, _ in idx.calib))
-            probe = sdir / f"{c.id}.probe"
+        def probe(reach: float) -> float | None:
+            """Download just the audio around the clip (±reach) and measure the error. None: not found."""
+            p = sdir / f"{c.id}.probe"
             try:
-                got, r0 = dl.download_range(self.info(), self.cfg, a - err - reach, b - err + reach, probe,
+                got, r0 = dl.download_range(self.info(), self.cfg, a - err - reach, b - err + reach, p,
                                             audio_only=True)
                 found = locate(ref, decode_audio(got))
             finally:
                 for f in sdir.glob(f"{c.id}.probe*"):
                     f.unlink(missing_ok=True)
-            if found:
-                err = (c.start - found[0]) - r0
-                idx.calib.append([round(c.start, 2), round(err, 3)])
+            if not found:
+                return None
+            measured = (c.start - found[0]) - r0
+            idx.calib.append([round(c.start, 2), round(measured, 3)])
+            return measured
+
+        wide = False  # the widest probe (PROBE_MAX_S) has been tried for this clip
+        if fragmented and not silent:
+            # cheap first: the audio around the clip, wide enough for any drift, to measure the error
+            reach = min(PROBE_MAX_S, max(PROBE_MIN_S, PROBE_DRIFT * c.start))
+            if idx.calib:
+                reach = min(reach, PROBE_MIN_S + 0.001 * min(abs(c.start - t) for t, _ in idx.calib))
+            wide = reach >= PROBE_MAX_S
+            if (m := probe(reach)) is not None:
+                err = m
 
         e = None
-        for attempt in range(MAX_ATTEMPTS):
+        for attempt in range(MAX_ATTEMPTS + 1):
             margin = MARGIN_S * (attempt + 1) + (0 if fragmented else 2)
             tmp = sdir / f"{c.id}.part.mkv"
             est = (b - a + 2 * margin) * dl.bytes_per_s(self.info())
@@ -288,16 +319,31 @@ class RangeFetcher:
                 offset, score = c.start - found[0], found[1]
                 e = SourceEntry(file=f"{c.id}.mkv", offset=round(offset, 4), duration=round(dur, 4),
                                 score=round(score, 3), how="download")
-                if fragmented:
-                    idx.calib.append([round(c.start, 2), round(offset - r0, 3)])
-                    err = offset - r0
-            else:  # silent (or no match): trust the estimate; the margin absorbs a small error
+                idx.calib.append([round(c.start, 2), round(offset - r0, 3)])
+                err = offset - r0
+            elif silent:  # nothing to match: trust the estimate; the margin absorbs a small error
                 e = SourceEntry(file=f"{c.id}.mkv", offset=round(r0 + err, 4), duration=round(dur, 4),
                                 aligned=False, how="download")
+            else:
+                # The clip's speech isn't in what came back: the download is somewhere else entirely (e.g. the
+                # served video and the transcript's audio are minutes apart). Never keep a guess: it would show
+                # other footage under these captions. Search wide around it, then download again, corrected.
+                got.unlink(missing_ok=True)
+                if wide:
+                    break
+                wide = True
+                if (m := probe(PROBE_MAX_S)) is None:
+                    break
+                err = m
+                continue
             if e.offset <= a + 0.05 and e.offset + e.duration >= b - 0.05 or not e.aligned:
                 got.replace(sdir / e.file)
                 return e
             got.unlink(missing_ok=True)  # measured, but it doesn't cover the clip: ask again, corrected
+        if e is None:
+            raise SourceError(f"The video at {_hms(a)}–{_hms(b)} doesn't match the transcript's audio (searched "
+                              f"±{PROBE_MAX_S / 60:.0f} min): the clip can't be placed. Try Retry; if it keeps "
+                              f"failing, the source changed since it was transcribed: start the project again")
         raise SourceError(f"Couldn't fetch video covering {_hms(a)}–{_hms(b)} after {MAX_ATTEMPTS} tries")
 
 

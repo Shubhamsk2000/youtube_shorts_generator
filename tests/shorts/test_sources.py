@@ -399,6 +399,70 @@ def test_fetch_measures_where_the_download_really_starts(tmp_path, monkeypatch, 
     assert len(fake.calls) == 2
 
 
+def _shifted_job(tmp_path, monkeypatch, shift: float, total: float, fragmented: bool):
+    """A remote whose clock runs `shift` s behind the transcript audio (transcript = remote + shift)."""
+    remote = tmp_path / "remote.mp4"
+    audio = make_video(remote, total, seed=7)
+    write_wav(tmp_path / "audio.wav", np.concatenate([np.zeros(int(shift * sr.SR), np.float32), audio]))
+    meta = job(tmp_path, total + shift, mode="clips")
+    fake = FakeRemote(remote, shift)
+    monkeypatch.setattr(dl, "download_range", fake.download_range)
+    monkeypatch.setattr(dl, "is_fragmented", lambda info: fragmented)
+    monkeypatch.setattr(dl, "bytes_per_s", lambda info: 1e5)
+    monkeypatch.setattr(sr.RangeFetcher, "info", lambda self: {})
+    return meta, fake
+
+
+@needs_ffmpeg
+def test_ordinary_video_minutes_off_is_searched_wide_and_placed(tmp_path, monkeypatch):
+    """A finished stream served as an ordinary video, 150 s away from the audio the transcript was made from
+    (seen on a 24 h stream): the first download misses the clip's speech; never keep that guess."""
+    meta, fake = _shifted_job(tmp_path, monkeypatch, 150.0, 500.0, fragmented=False)
+    c = clip(300.0, 320.0, "w")
+    assert sr.ensure(tmp_path, meta, Config(), [c]) == (1, 0)
+    e = sr.load_index(tmp_path).clips["w"]
+    assert e.aligned and sr.covers(e, c)
+    assert abs(e.offset - (fake.calls[-1][0] // 2 * 2 + 150.0)) < 0.05
+    assert [call[2] for call in fake.calls] == [False, True, False]  # miss, wide audio search, right download
+    # the next clip uses the measured error: one download, straight away
+    fake.calls.clear()
+    c2 = clip(340.0, 355.0, "w2")
+    assert sr.ensure(tmp_path, meta, Config(), [c2]) == (1, 0)
+    assert len(fake.calls) == 1 and sr.load_index(tmp_path).clips["w2"].aligned
+
+
+@needs_ffmpeg
+def test_speech_that_is_nowhere_in_the_video_fails_instead_of_guessing(tmp_path, monkeypatch):
+    meta, _ = _shifted_job(tmp_path, monkeypatch, 0.0, 60.0, fragmented=False)
+    other = speechlike(60.0, seed=99)  # the transcript's audio is from something else entirely
+    write_wav(tmp_path / "audio.wav", other)
+    with pytest.raises(sr.SourceError, match="doesn't match"):
+        sr.ensure(tmp_path, meta, Config(), [clip(20.0, 35.0, "n")])
+    assert "n" not in sr.load_index(tmp_path).clips
+
+
+@needs_ffmpeg
+def test_an_old_guess_under_speech_is_fetched_again(tmp_path, monkeypatch):
+    """Jobs made before every spoken clip was measured: the guessed file, its face analysis and preview go."""
+    meta, _ = _shifted_job(tmp_path, monkeypatch, 0.0, 60.0, fragmented=False)
+    c = clip(20.0, 30.0, "g")
+    sdir = sr.sources_dir(tmp_path)
+    sdir.mkdir()
+    (sdir / "g.mkv").write_bytes(b"old")
+    idx = sr.SourceIndex(clips={"g": sr.SourceEntry(file="g.mkv", offset=10.0, duration=30.0, aligned=False,
+                                                    how="download")})
+    sr.save_index(tmp_path, idx)
+    from shorts.stages.reframe import plan_path
+    plan_path(tmp_path, c).parent.mkdir()
+    plan_path(tmp_path, c).write_text("{}")
+    (tmp_path / "clips").mkdir()
+    (tmp_path / "clips" / "g-abc123.mp4").write_bytes(b"old")
+    assert sr.ensure(tmp_path, meta, Config(), [c]) == (1, 0)
+    assert sr.load_index(tmp_path).clips["g"].aligned
+    assert not plan_path(tmp_path, c).exists() and not (tmp_path / "clips" / "g-abc123.mp4").exists()
+    assert sr.ensure(tmp_path, meta, Config(), [c]) == (0, 0)  # measured now: kept
+
+
 @needs_ffmpeg
 def test_fetch_silent_clip_uses_estimate(tmp_path, monkeypatch):
     remote = tmp_path / "remote.mp4"

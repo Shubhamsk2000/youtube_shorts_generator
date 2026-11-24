@@ -1,7 +1,7 @@
-import { useMemo, useState, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   Check, CheckCheck, CircleAlert, Clock, Copy, Crop, Download, FileArchive, Flame, FolderOpen, LoaderCircle, Pencil,
-  Play, RefreshCw, Sparkles, Square, Undo2, X,
+  Play, RefreshCw, Sparkles, Square, Undo2, Volume2, VolumeX, X,
 } from "lucide-react";
 import { useConfirm, useToast } from "@kit/feedback";
 import { Kbd, Select } from "@kit/ui";
@@ -552,14 +552,34 @@ function Empty({ failed }: { failed: boolean }) {
   );
 }
 
+const SOUND_KEY = "clips.sound";
+const soundOn = () => {
+  try {
+    return localStorage.getItem(SOUND_KEY) === "true";
+  } catch {
+    return false;
+  }
+};
+
 /** A still of the preview; the video is only loaded while the card is hovered (or focused), and released after.
- * A video per card would hold one of the browser's 6 connections each and stall the rest of the app. */
+ * A video per card would hold one of the browser's 6 connections each and stall the rest of the app.
+ * Muted unless the speaker is switched on (remembered for every card; read when a card starts playing). */
 function CardPreview({ url, thumb }: { url: string; thumb: string | null }) {
   const [hover, setHover] = useState(false);
   const [playing, setPlaying] = useState(false);
+  const [sound, setSound] = useState(false);
+  const video = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    const v = video.current;
+    if (!v) return;
+    v.muted = !sound;
+    // unmuted autoplay can be refused before the first click on the page: play muted instead
+    v.play().catch(() => { v.muted = true; setSound(false); void v.play().catch(() => {}); });
+  }, [hover, sound]);
+  const start = () => { setSound(soundOn()); setHover(true); };
   return (
-    <div className="absolute inset-0" onMouseEnter={() => setHover(true)} onMouseLeave={() => { setHover(false); setPlaying(false); }}
-      onFocus={() => setHover(true)} onBlur={() => { setHover(false); setPlaying(false); }}>
+    <div className="absolute inset-0" onMouseEnter={start} onMouseLeave={() => { setHover(false); setPlaying(false); }}
+      onFocus={start} onBlur={() => { setHover(false); setPlaying(false); }}>
       {thumb ? (
         <img src={thumb} alt="" loading="lazy" decoding="async" draggable={false}
           className={cx("absolute inset-0 size-full object-cover transition-opacity duration-200", playing && "opacity-0")} />
@@ -567,8 +587,22 @@ function CardPreview({ url, thumb }: { url: string; thumb: string | null }) {
         <div className="absolute inset-0 grid place-items-center bg-black"><Play className="size-6 text-white/40" /></div>
       )}
       {hover && (
-        <video src={url} muted loop autoPlay playsInline preload="auto" onPlaying={() => setPlaying(true)}
+        <video ref={video} src={url} muted loop playsInline preload="auto" onPlaying={() => setPlaying(true)}
           className="absolute inset-0 size-full" />
+      )}
+      {hover && (
+        <button type="button" aria-label={sound ? "Mute previews" : "Play previews with sound"} aria-pressed={sound}
+          title={sound ? "Mute previews" : "Sound on (for every preview)"}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const on = !sound;
+            try { localStorage.setItem(SOUND_KEY, String(on)); } catch { /* private mode */ }
+            setSound(on);
+          }}
+          className="absolute top-2 right-2 grid size-8 place-items-center rounded-full bg-black/65 text-white backdrop-blur transition hover:bg-black/80">
+          {sound ? <Volume2 className="size-4" /> : <VolumeX className="size-4" />}
+        </button>
       )}
     </div>
   );
